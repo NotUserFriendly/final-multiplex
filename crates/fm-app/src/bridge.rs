@@ -35,18 +35,33 @@ pub fn install(appsink: &gstreamer_app::AppSink, store: FrameStore) {
                     .map_err(|_| gstreamer::FlowError::Error)?;
 
                 let caps = sample.caps().ok_or(gstreamer::FlowError::Error)?;
-                let s = caps.structure(0).ok_or(gstreamer::FlowError::Error)?;
-                let width: i32 =
-                    s.get("width").map_err(|_| gstreamer::FlowError::Error)?;
-                let height: i32 =
-                    s.get("height").map_err(|_| gstreamer::FlowError::Error)?;
+                let info = gstreamer_video::VideoInfo::from_caps(caps)
+                    .map_err(|_| gstreamer::FlowError::Error)?;
+                let width = info.width();
+                let height = info.height();
+                // Stride can exceed width*4 when GStreamer aligns rows to a
+                // memory boundary. Copy row-by-row in that case so the packed
+                // RGBA output iced expects has no gap bytes between rows.
+                let stride = info.stride()[0] as usize;
+                let row_bytes = width as usize * 4; // RGBA = 4 bytes/pixel
 
                 let buffer =
                     sample.buffer().ok_or(gstreamer::FlowError::Error)?;
                 let map = buffer
                     .map_readable()
                     .map_err(|_| gstreamer::FlowError::Error)?;
-                let rgba = map.as_slice().to_vec();
+                let src = map.as_slice();
+                let rgba = if stride == row_bytes {
+                    src[..row_bytes * height as usize].to_vec()
+                } else {
+                    let mut packed =
+                        Vec::with_capacity(row_bytes * height as usize);
+                    for row in 0..height as usize {
+                        let start = row * stride;
+                        packed.extend_from_slice(&src[start..start + row_bytes]);
+                    }
+                    packed
+                };
                 drop(map);
 
                 *store.lock().unwrap() = Some(FrameData {

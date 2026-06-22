@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceMetrics {
     pub source_id: String,
-    /// Frames received from the ingest path per second.
+    /// Frames entering the compositor from this source's processing chain
+    /// (post-decode, post-scale) per second. In Phase 1 this is a BUFFER probe
+    /// on the capsfilter source pad feeding the compositor. Out-of-process
+    /// adapters (Phase 2+) will report true ingest rate here instead.
     pub fps_in: f64,
-    /// Frames delivered to the compositor per second.
+    /// Frames emitted by the compositor into the appsink per second.
     pub fps_out: f64,
     /// Cumulative dropped frames since pipeline start.
     pub dropped_frames: u64,

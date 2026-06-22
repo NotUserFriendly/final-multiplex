@@ -57,10 +57,11 @@ impl OutputCounter {
 
 /// Collects always-on per-source counters via GStreamer pad probes (ADR-0008).
 ///
-/// - `fps_in`: BUFFER probes on each compositor sink pad.
+/// - `fps_in`: BUFFER probes on each capsfilter source pad (post-scale, entering
+///   the compositor) — not true ingest rate; see `SourceMetrics::fps_in`.
 /// - `fps_out`: BUFFER probe on the appsink's sink pad (compositor output rate).
 /// - `dropped_frames`: incremented when a QoS event signals a drop on a
-///   compositor sink pad.
+///   capsfilter source pad.
 pub struct MetricsCollector {
     per_source: Arc<Mutex<HashMap<String, SourceCounter>>>,
     output: Arc<Mutex<OutputCounter>>,
@@ -75,7 +76,7 @@ impl MetricsCollector {
         let output: Arc<Mutex<OutputCounter>> =
             Arc::new(Mutex::new(OutputCounter::new()));
 
-        // ── fps_in: compositor sink pad BUFFER probes ──────────────────────
+        // ── fps_in: capsfilter src pad BUFFER probes (post-scale, pre-compositor) ──
         for (id, pads) in pipeline.source_pads() {
             let counters = per_source.clone();
             let id_clone = id.clone();

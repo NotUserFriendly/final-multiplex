@@ -31,30 +31,11 @@ replaceable seam.
 Windows-tested), so it's the pre-vetted pivot if the iced display path proves too costly.
 The engine is toolkit-agnostic, so a switch costs only the UI layer.
 
-### Bridge implementation (Phase 1)
-
-The bridge is `crates/fm-app/src/bridge.rs` + `crates/fm-app/src/video.rs`:
-
-- `AppSink` callback writes decoded RGBA frames into `Arc<Mutex<Option<Arc<FrameData>>>>`.
-  The UI thread does a reference-count bump to take the latest frame with no pixel copy.
-  A `generation` counter lets the GPU upload step skip frames that haven't changed.
-- Display uses iced's `shader` widget (`iced::widget::shader::Program` /
-  `iced::widget::shader::Primitive`). `GpuState` (implementing `shader::Pipeline`) holds a
-  persistent `wgpu::Texture`; `queue.write_texture` overwrites pixel data in-place each
-  frame instead of allocating a new texture.
-
-The original approach (`iced::widget::image::Handle::from_rgba`) was tried first and
-discarded: it destroys and recreates the GPU texture on every frame, causing a
-delete→re-upload gap (flickering) and a partial-upload race with the render command
-(horizontal combing artifacts). The persistent-texture path resolved both.
-
 ## Consequences
 
 - We own the display bridge by design — it's the replaceable connector and decouples us
   from the stale community crates.
 - Pin the iced version; expect occasional migration work.
 - Don't depend on `playbin`-based player crates.
-- The texture-copy path risk (flagged as the Phase-1 exit check in PLAN.md) has been
-  validated: no flickering or combing at 30 fps with a 1280×720 composited grid.
-  A 1080p sustained-throughput check (with the fps/dropped-frames counters) remains
-  the formal Phase 1 exit gate.
+- The texture-copy path (esp. on Windows) is the risk to validate early — tracked as a
+  Phase-1 exit check in PLAN.md.

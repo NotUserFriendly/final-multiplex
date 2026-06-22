@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fm-app`: iced `App` skeleton + `bridge` module stub for the appsink→texture
   path (ADR-0006).
 
+### Changed
+### Deprecated
+### Removed
 ### Fixed
 - `bridge`: RGBA row copy now reads stride from `VideoInfo::from_caps` and
   copies row-by-row when stride > width×4, preventing corrupted frames on
@@ -46,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the capsfilter source pads that feed them — the only side where GStreamer
   guarantees reliable offset behaviour. Eliminates startup warnings and makes
   per-source offset sliders actually take effect.
+### Security
 
 <!--
 Move items out of [Unreleased] into a versioned section on release, e.g.:

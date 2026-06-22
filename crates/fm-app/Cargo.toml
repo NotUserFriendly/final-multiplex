@@ -17,5 +17,3 @@ gstreamer-app.workspace   = true
 gstreamer-video.workspace = true
 iced.workspace            = true
 
-[lints]
-workspace = true

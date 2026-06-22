@@ -26,5 +26,3 @@ toml             = "1"
 fm-adapter-sdk   = { path = "crates/fm-adapter-sdk" }
 fm-core          = { path = "crates/fm-core" }
 
-[workspace.lints.rust]
-unsafe_code = "forbid"

@@ -43,7 +43,16 @@ pub struct SourceConfig {
     /// Initial per-source pad offset in milliseconds (ADR-0004).
     #[serde(default)]
     pub offset_ms: i64,
+    /// Linear volume applied to this source's audiomixer sink pad.
+    /// 0.0 = silent, 1.0 = unity gain, >1.0 amplifies. Defaults to 1.0.
+    /// Static: read once at pipeline build; not adjustable at runtime.
+    ///
+    /// Example: `volume = 0.5`
+    #[serde(default = "default_volume")]
+    pub volume: f64,
 }
+
+fn default_volume() -> f64 { 1.0 }
 
 pub fn load(path: &std::path::Path) -> Result<SceneConfig, Box<dyn std::error::Error + Send + Sync>> {
     let text = std::fs::read_to_string(path)?;

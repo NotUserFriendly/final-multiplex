@@ -1,0 +1,22 @@
+[grid]
+columns = 2
+width   = 1280
+height  = 720
+fps     = 30
+
+[[source]]
+id     = "brain"
+uri    = "file:///home/locad/Downloads/Brain_Implosion_Energy_Drink_EXT.mp4"
+volume = 1.0
+
+[[source]]
+id  = "m2-480p"
+uri = "file:///home/locad/Downloads/m2-res_480p_1.mp4"
+
+[[source]]
+id  = "nirnroot"
+uri = "file:///home/locad/Downloads/nirnroot.mov"
+
+[[source]]
+id  = "go3"
+uri = "file:///home/locad/Downloads/go3.mp4"

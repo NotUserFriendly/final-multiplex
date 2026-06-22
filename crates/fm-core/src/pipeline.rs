@@ -184,6 +184,7 @@ impl Pipeline {
 
             let acaps_src = acaps.static_pad("src").ok_or("acaps: no src pad")?;
             acaps_src.link(&mix_sink)?;
+            mix_sink.set_property("volume", source.volume);
 
             // Apply initial pad offset on the source pads (ms → ns, signed).
             // gst_pad_set_offset only works reliably on source pads; the

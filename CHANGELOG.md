@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fm-app`: iced `App` skeleton + `bridge` module stub for the appsink→texture
   path (ADR-0006).
 
+### Added
+- Per-source static volume via `volume` field in `[[source]]` config blocks
+  (linear scale: 0.0 silent, 1.0 unity, >1.0 amplifies). Applied to the
+  `audiomixer` sink pad at pipeline build; omitting the field defaults to 1.0.
+
 ### Changed
 ### Deprecated
 ### Removed

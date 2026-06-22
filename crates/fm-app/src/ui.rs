@@ -148,7 +148,7 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(33)).map(|_| Message::Tick)
+        iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
     }
 }
 

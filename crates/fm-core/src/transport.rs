@@ -36,9 +36,9 @@ impl Transport {
         Ok(())
     }
 
-    /// Shift one source's audio and video together by adjusting both its
-    /// compositor and audiomixer sink pad offsets (`gst_pad_set_offset`).
-    /// No seek required; the change takes effect on the next buffer (ADR-0004).
+    /// Shift one source's audio and video together by adjusting the
+    /// `gst_pad_set_offset` on its capsfilter source pads (ADR-0004).
+    /// No seek required; the change takes effect on the next buffer.
     pub fn set_source_offset(&self, source_id: &str, offset_ms: i64) -> Result<()> {
         let pads = self
             .pipeline
@@ -46,8 +46,8 @@ impl Transport {
             .get(source_id)
             .ok_or_else(|| format!("unknown source id: {source_id}"))?;
         let offset_ns = offset_ms * 1_000_000;
-        pads.compositor_sink.set_offset(offset_ns);
-        pads.audiomixer_sink.set_offset(offset_ns);
+        pads.video_src.set_offset(offset_ns);
+        pads.audio_src.set_offset(offset_ns);
         Ok(())
     }
 

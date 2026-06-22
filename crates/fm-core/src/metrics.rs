@@ -80,7 +80,7 @@ impl MetricsCollector {
             let counters = per_source.clone();
             let id_clone = id.clone();
 
-            pads.compositor_sink.add_probe(
+            pads.video_src.add_probe(
                 gstreamer::PadProbeType::BUFFER,
                 move |_pad, _info| {
                     counters
@@ -93,11 +93,11 @@ impl MetricsCollector {
                 },
             );
 
-            // ── dropped_frames: QoS events on compositor sink pads ─────────
+            // ── dropped_frames: QoS events travelling upstream ─────────────
             let counters_qos = per_source.clone();
             let id_qos = id.clone();
 
-            pads.compositor_sink.add_probe(
+            pads.video_src.add_probe(
                 gstreamer::PadProbeType::EVENT_UPSTREAM,
                 move |_pad, info| {
                     if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {

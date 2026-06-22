@@ -4,11 +4,16 @@ use crate::config::SceneConfig;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Compositor and audiomixer sink pad references for a single source.
-/// Held by `Pipeline` so `Transport` can apply per-source offsets (ADR-0004).
+/// Source-side pad references for a single source.
+///
+/// `gst_pad_set_offset` only works reliably on **source** pads, so we store
+/// the `capsfilter:src` pads that feed the compositor and audiomixer rather
+/// than the mixer sink pads themselves (ADR-0004).
 pub struct SourcePads {
-    pub compositor_sink: gstreamer::Pad,
-    pub audiomixer_sink: gstreamer::Pad,
+    /// `vcaps_{id}:src` — the source pad feeding `compositor:sink_N`.
+    pub video_src: gstreamer::Pad,
+    /// `acaps_{id}:src` — the source pad feeding `audiomixer:sink_N`.
+    pub audio_src: gstreamer::Pad,
 }
 
 /// The in-core GStreamer pipeline (Phase 1).
@@ -173,16 +178,18 @@ impl Pipeline {
             let acaps_src = acaps.static_pad("src").ok_or("acaps: no src pad")?;
             acaps_src.link(&mix_sink)?;
 
-            // Apply initial pad offset (ms → ns, signed; ADR-0004).
+            // Apply initial pad offset on the source pads (ms → ns, signed).
+            // gst_pad_set_offset only works reliably on source pads; the
+            // compositor/audiomixer sink pads are the wrong side of the link.
             let offset_ns = source.offset_ms * 1_000_000;
-            comp_sink.set_offset(offset_ns);
-            mix_sink.set_offset(offset_ns);
+            vcaps_src.set_offset(offset_ns);
+            acaps_src.set_offset(offset_ns);
 
             source_pads.insert(
                 source.id.clone(),
                 SourcePads {
-                    compositor_sink: comp_sink,
-                    audiomixer_sink: mix_sink,
+                    video_src: vcaps_src,
+                    audio_src: acaps_src,
                 },
             );
 

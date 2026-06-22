@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 ### Removed
 ### Fixed
+- `bridge` + `video`: replaced `iced::widget::image::Handle::from_rgba` (which
+  destroys and recreates the GPU texture on every frame) with a persistent
+  `wgpu::Texture` updated in-place via `queue.write_texture`. Eliminates the
+  delete→re-upload gap that caused per-frame flickering and the partial-upload
+  race that produced horizontal combing artifacts.
 - `bridge`: RGBA row copy now reads stride from `VideoInfo::from_caps` and
   copies row-by-row when stride > width×4, preventing corrupted frames on
   odd tile widths where GStreamer pads rows to an alignment boundary.

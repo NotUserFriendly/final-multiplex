@@ -58,12 +58,13 @@ impl Pipeline {
                 .build()?;
         comp_capsfilter.set_property("caps", &output_caps);
 
-        // max-buffers=2 + drop=true → always exposes the latest frame; sync=false
-        // lets GStreamer push frames as fast as they arrive without blocking on the
-        // pipeline clock, so the UI bridge is never a bottleneck.
+        // sync=true so the compositor respects the pipeline clock (playback at
+        // the configured fps, not decode speed). drop=true + max_buffers=2 means
+        // a frame that arrives while the UI is still holding the mutex is dropped
+        // rather than stalling the pipeline — the bridge never becomes a bottleneck.
         let appsink = gstreamer_app::AppSink::builder()
             .name("appsink")
-            .sync(false)
+            .sync(true)
             .max_buffers(2)
             .drop(true)
             .build();
@@ -118,6 +119,12 @@ impl Pipeline {
             let vconv: gstreamer::Element = gstreamer::ElementFactory::make("videoconvert")
                 .name(format!("vconv_{}", source.id))
                 .build()?;
+            // deinterlace passes progressive content through unchanged and
+            // converts interlaced fields to progressive frames, preventing
+            // the comb-tooth stripe artefact on interlaced sources.
+            let vdeint: gstreamer::Element = gstreamer::ElementFactory::make("deinterlace")
+                .name(format!("vdeint_{}", source.id))
+                .build()?;
             let vscale: gstreamer::Element = gstreamer::ElementFactory::make("videoscale")
                 .name(format!("vscale_{}", source.id))
                 .build()?;
@@ -151,8 +158,8 @@ impl Pipeline {
                     .build(),
             );
 
-            pipeline.add_many([&vconv, &vscale, &vcaps, &aconv, &aresamp, &acaps])?;
-            gstreamer::Element::link_many([&vconv, &vscale, &vcaps])?;
+            pipeline.add_many([&vconv, &vdeint, &vscale, &vcaps, &aconv, &aresamp, &acaps])?;
+            gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps])?;
             gstreamer::Element::link_many([&aconv, &aresamp, &acaps])?;
 
             // ── Compositor sink pad (tile position + looping) ──────────────

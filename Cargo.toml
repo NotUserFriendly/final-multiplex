@@ -22,6 +22,8 @@ iced             = { version = "0.14", features = ["image", "tokio"] }
 # Config / serialisation
 serde            = { version = "1", features = ["derive"] }
 toml             = "1"
+# wgpu — explicit dep so video.rs can name its types directly
+wgpu             = "27"
 # Internal crates
 fm-adapter-sdk   = { path = "crates/fm-adapter-sdk" }
 fm-core          = { path = "crates/fm-core" }

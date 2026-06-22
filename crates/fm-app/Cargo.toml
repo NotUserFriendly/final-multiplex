@@ -16,4 +16,5 @@ gstreamer.workspace       = true
 gstreamer-app.workspace   = true
 gstreamer-video.workspace = true
 iced.workspace            = true
+wgpu.workspace            = true
 

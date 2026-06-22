@@ -1,5 +1,6 @@
 mod bridge;
 mod ui;
+mod video;
 
 fn boot() -> ui::App {
     let config_path = std::env::args()

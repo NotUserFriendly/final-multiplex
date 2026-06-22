@@ -51,12 +51,16 @@ pub fn install(appsink: &gstreamer_app::AppSink, store: FrameStore) {
                     .map_readable()
                     .map_err(|_| gstreamer::FlowError::Error)?;
                 let src = map.as_slice();
+                let h = height as usize;
+                let expected = stride * (h.saturating_sub(1)) + row_bytes;
+                if src.len() < expected {
+                    return Err(gstreamer::FlowError::Error);
+                }
                 let rgba = if stride == row_bytes {
-                    src[..row_bytes * height as usize].to_vec()
+                    src[..row_bytes * h].to_vec()
                 } else {
-                    let mut packed =
-                        Vec::with_capacity(row_bytes * height as usize);
-                    for row in 0..height as usize {
+                    let mut packed = Vec::with_capacity(row_bytes * h);
+                    for row in 0..h {
                         let start = row * stride;
                         packed.extend_from_slice(&src[start..start + row_bytes]);
                     }

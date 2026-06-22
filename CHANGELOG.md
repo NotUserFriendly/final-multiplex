@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 1 in-core compositor: `Pipeline::build` wires N `uridecodebin` sources
+  through `videoconvert`/`videoscale`/`audioconvert`/`audioresample` chains into
+  GStreamer `compositor` + `audiomixer`; output goes to `appsink` (video) and
+  `autoaudiosink` (audio). Equal-split tile grid computed from `scene.toml`.
+- `Transport`: play / pause / `seek_all` / `set_source_offset` (pad offset on
+  both compositor and audiomixer sink pads, shifting A/V together — ADR-0004).
+  Dedicated bus-loop thread handles EOS → seek-to-zero for continuous looping.
+- `MetricsCollector`: BUFFER pad probes on compositor sink pads (`fps_in`) and
+  appsink sink pad (`fps_out`); QoS upstream events counted as `dropped_frames`
+  (ADR-0008 always-on tier).
+- `bridge`: `AppSink` new-sample callback writes RGBA frames into a
+  `Arc<Mutex<Option<FrameData>>>` store; `latest_handle` converts to
+  `iced::widget::image::Handle` for the UI (ADR-0006 appsink→texture seam).
+- `fm-app` UI: tile grid video display, Play/Pause button, per-source offset
+  sliders (−5000 ms … +5000 ms) with live fps/dropped metrics readout; 60 fps
+  `iced::time::every` subscription drives the frame and metrics refresh.
+- Scene loaded from a TOML file (path from `argv[1]` or `scene.toml`).
 - Cargo workspace with three crates: `fm-adapter-sdk`, `fm-core`, `fm-app`
   (binary `final-multiplex`).
 - `fm-adapter-sdk`: `SourceMetrics` schema and `IngestState` enum (ADR-0008);

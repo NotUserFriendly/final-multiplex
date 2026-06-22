@@ -1,24 +1,224 @@
+use std::collections::HashMap;
+use gstreamer::prelude::*;
 use crate::config::SceneConfig;
 
-/// The in-core GStreamer pipeline for Phase 1.
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Compositor and audiomixer sink pad references for a single source.
+/// Held by `Pipeline` so `Transport` can apply per-source offsets (ADR-0004).
+pub struct SourcePads {
+    pub compositor_sink: gstreamer::Pad,
+    pub audiomixer_sink: gstreamer::Pad,
+}
+
+/// The in-core GStreamer pipeline (Phase 1).
 ///
-/// Topology: N × (uridecodebin → [videoconvert → compositor sink pad]
-///                              + [audioconvert → audiomixer sink pad])
-///           compositor → appsink (video to UI bridge, ADR-0006)
-///           audiomixer  → autoaudiosink
+/// Topology per source:
+///   uridecodebin ─► videoconvert ─► videoscale ─► capsfilter(tile RGBA) ─► compositor
+///                ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
 ///
-/// The master clock lives here; per-source pad offsets are set via
-/// `Transport::set_source_offset`, not here (ADR-0004).
+/// compositor ─► capsfilter(output RGBA) ─► appsink  (→ UI bridge, ADR-0006)
+/// audiomixer ─► audioconvert ─► audioresample ─► autoaudiosink
 pub struct Pipeline {
     inner: gstreamer::Pipeline,
-    /// Exposes the composited video frames to the UI bridge (ADR-0006).
     appsink: gstreamer_app::AppSink,
+    source_pads: HashMap<String, SourcePads>,
 }
 
 impl Pipeline {
-    /// Build the pipeline from `scene`. GStreamer must be initialised before calling.
-    pub fn build(_scene: &SceneConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        todo!("Phase 1: construct compositor + audiomixer pipeline from SceneConfig")
+    pub fn build(scene: &SceneConfig) -> Result<Self> {
+        gstreamer::init()?;
+
+        let pipeline = gstreamer::Pipeline::new();
+
+        // ── Output video path ──────────────────────────────────────────────
+        let compositor: gstreamer::Element = gstreamer::ElementFactory::make("compositor")
+            .name("compositor")
+            .build()?;
+        compositor.set_property_from_str("background", "black");
+
+        let output_caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("width", scene.grid.width as i32)
+            .field("height", scene.grid.height as i32)
+            .field(
+                "framerate",
+                gstreamer::Fraction::new(scene.grid.fps as i32, 1),
+            )
+            .build();
+
+        let comp_capsfilter: gstreamer::Element =
+            gstreamer::ElementFactory::make("capsfilter")
+                .name("comp_capsfilter")
+                .build()?;
+        comp_capsfilter.set_property("caps", &output_caps);
+
+        // max-buffers=2 + drop=true → always exposes the latest frame; sync=false
+        // lets GStreamer push frames as fast as they arrive without blocking on the
+        // pipeline clock, so the UI bridge is never a bottleneck.
+        let appsink = gstreamer_app::AppSink::builder()
+            .name("appsink")
+            .sync(false)
+            .max_buffers(2)
+            .drop(true)
+            .build();
+
+        // ── Output audio path ──────────────────────────────────────────────
+        let audiomixer: gstreamer::Element =
+            gstreamer::ElementFactory::make("audiomixer")
+                .name("audiomixer")
+                .build()?;
+        let aconv_out: gstreamer::Element =
+            gstreamer::ElementFactory::make("audioconvert")
+                .name("aconv_out")
+                .build()?;
+        let aresamp_out: gstreamer::Element =
+            gstreamer::ElementFactory::make("audioresample")
+                .name("aresamp_out")
+                .build()?;
+        let autoaudiosink: gstreamer::Element =
+            gstreamer::ElementFactory::make("autoaudiosink")
+                .name("autoaudiosink")
+                .build()?;
+
+        pipeline.add(&compositor)?;
+        pipeline.add(&comp_capsfilter)?;
+        pipeline.add(&appsink)?;
+        pipeline.add(&audiomixer)?;
+        pipeline.add(&aconv_out)?;
+        pipeline.add(&aresamp_out)?;
+        pipeline.add(&autoaudiosink)?;
+
+        compositor.link(&comp_capsfilter)?;
+        comp_capsfilter.link(&appsink)?;
+        gstreamer::Element::link_many([&audiomixer, &aconv_out, &aresamp_out, &autoaudiosink])?;
+
+        // ── Per-source elements ────────────────────────────────────────────
+        let n = scene.source.len() as u32;
+        if n == 0 {
+            return Err("scene.toml has no [[source]] entries".into());
+        }
+        let cols = scene.grid.columns.max(1).min(n);
+        let rows = (n + cols - 1) / cols;
+        let tile_w = (scene.grid.width / cols) as i32;
+        let tile_h = (scene.grid.height / rows) as i32;
+
+        let mut source_pads: HashMap<String, SourcePads> = HashMap::new();
+
+        for (idx, source) in scene.source.iter().enumerate() {
+            let xpos = ((idx as u32 % cols) * tile_w as u32) as i32;
+            let ypos = ((idx as u32 / cols) * tile_h as u32) as i32;
+
+            // ── Video conversion chain ─────────────────────────────────────
+            let vconv: gstreamer::Element = gstreamer::ElementFactory::make("videoconvert")
+                .name(format!("vconv_{}", source.id))
+                .build()?;
+            let vscale: gstreamer::Element = gstreamer::ElementFactory::make("videoscale")
+                .name(format!("vscale_{}", source.id))
+                .build()?;
+            let vcaps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
+                .name(format!("vcaps_{}", source.id))
+                .build()?;
+            vcaps.set_property(
+                "caps",
+                &gstreamer::Caps::builder("video/x-raw")
+                    .field("format", "RGBA")
+                    .field("width", tile_w)
+                    .field("height", tile_h)
+                    .build(),
+            );
+
+            // ── Audio conversion chain ─────────────────────────────────────
+            let aconv: gstreamer::Element = gstreamer::ElementFactory::make("audioconvert")
+                .name(format!("aconv_{}", source.id))
+                .build()?;
+            let aresamp: gstreamer::Element = gstreamer::ElementFactory::make("audioresample")
+                .name(format!("aresamp_{}", source.id))
+                .build()?;
+            let acaps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
+                .name(format!("acaps_{}", source.id))
+                .build()?;
+            acaps.set_property(
+                "caps",
+                &gstreamer::Caps::builder("audio/x-raw")
+                    .field("rate", 48_000i32)
+                    .field("channels", 2i32)
+                    .build(),
+            );
+
+            pipeline.add_many([&vconv, &vscale, &vcaps, &aconv, &aresamp, &acaps])?;
+            gstreamer::Element::link_many([&vconv, &vscale, &vcaps])?;
+            gstreamer::Element::link_many([&aconv, &aresamp, &acaps])?;
+
+            // ── Compositor sink pad (tile position + looping) ──────────────
+            let comp_sink = compositor
+                .request_pad_simple("sink_%u")
+                .ok_or("could not request compositor sink pad")?;
+            comp_sink.set_property("xpos", xpos);
+            comp_sink.set_property("ypos", ypos);
+            comp_sink.set_property("width", tile_w);
+            comp_sink.set_property("height", tile_h);
+            // Repeat the last frame when a source loops (keeps the tile alive
+            // during the seek-back gap produced by the EOS→seek loop strategy).
+            comp_sink.set_property("repeat-after-eos", true);
+
+            let vcaps_src = vcaps.static_pad("src").ok_or("vcaps: no src pad")?;
+            vcaps_src.link(&comp_sink)?;
+
+            // ── Audiomixer sink pad ────────────────────────────────────────
+            let mix_sink = audiomixer
+                .request_pad_simple("sink_%u")
+                .ok_or("could not request audiomixer sink pad")?;
+
+            let acaps_src = acaps.static_pad("src").ok_or("acaps: no src pad")?;
+            acaps_src.link(&mix_sink)?;
+
+            // Apply initial pad offset (ms → ns, signed; ADR-0004).
+            let offset_ns = source.offset_ms * 1_000_000;
+            comp_sink.set_offset(offset_ns);
+            mix_sink.set_offset(offset_ns);
+
+            source_pads.insert(
+                source.id.clone(),
+                SourcePads {
+                    compositor_sink: comp_sink,
+                    audiomixer_sink: mix_sink,
+                },
+            );
+
+            // ── uridecodebin with dynamic pad wiring ───────────────────────
+            let uri: gstreamer::Element = gstreamer::ElementFactory::make("uridecodebin")
+                .name(format!("uri_{}", source.id))
+                .build()?;
+            uri.set_property("uri", &source.uri);
+            pipeline.add(&uri)?;
+
+            // Capture static sink pads for the callback (Clone = GObject refcount bump).
+            let vconv_sink = vconv.static_pad("sink").ok_or("vconv: no sink pad")?;
+            let aconv_sink = aconv.static_pad("sink").ok_or("aconv: no sink pad")?;
+            let id_for_cb = source.id.clone();
+
+            uri.connect_pad_added(move |_src, pad| {
+                let caps = match pad.current_caps() {
+                    Some(c) => c,
+                    None => pad.query_caps(None),
+                };
+                let Some(s) = caps.structure(0) else { return };
+                let media = s.name();
+
+                if media.starts_with("video/") && !vconv_sink.is_linked() {
+                    if let Err(e) = pad.link(&vconv_sink) {
+                        eprintln!("[fm-core] {id_for_cb}: video pad link failed: {e}");
+                    }
+                } else if media.starts_with("audio/") && !aconv_sink.is_linked() {
+                    if let Err(e) = pad.link(&aconv_sink) {
+                        eprintln!("[fm-core] {id_for_cb}: audio pad link failed: {e}");
+                    }
+                }
+            });
+        }
+
+        Ok(Self { inner: pipeline, appsink, source_pads })
     }
 
     pub fn inner(&self) -> &gstreamer::Pipeline {
@@ -27,5 +227,9 @@ impl Pipeline {
 
     pub fn appsink(&self) -> &gstreamer_app::AppSink {
         &self.appsink
+    }
+
+    pub fn source_pads(&self) -> &HashMap<String, SourcePads> {
+        &self.source_pads
     }
 }

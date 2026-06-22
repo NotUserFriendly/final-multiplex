@@ -45,7 +45,7 @@ pub struct SourceConfig {
     pub offset_ms: i64,
 }
 
-pub fn load(path: &std::path::Path) -> Result<SceneConfig, Box<dyn std::error::Error>> {
+pub fn load(path: &std::path::Path) -> Result<SceneConfig, Box<dyn std::error::Error + Send + Sync>> {
     let text = std::fs::read_to_string(path)?;
     Ok(toml::from_str(&text)?)
 }

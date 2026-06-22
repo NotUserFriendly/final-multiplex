@@ -28,11 +28,11 @@ Secondary: a corp camera wall on integrated hardware. Linux first, Windows next.
 
 Each phase has a deliverable and an exit criterion. Don't start N+1 until N exits.
 
-### Phase 0 — Scaffold  *(in progress)*
+### Phase 0 — Scaffold  *(complete)*
 - **Deliverable:** repo, CLAUDE.md, settings.local.json, .gitignore, licenses, ADRs.
 - **Exit:** project builds empty; stack/license/architecture recorded (ADR-0002..0006).
 
-### Phase 1 — In-core compositor proof
+### Phase 1 — In-core compositor proof  *(in progress)*
 - **Deliverable:** `compositor` + `audiomixer` equal split fed by N looping local-file
   sources, all in-core; master clock + transport (play / pause / seek-all); per-source
   pad offset shifting a source's **audio and video together**; iced UI displaying the

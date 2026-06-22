@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GStreamer `compositor` + `audiomixer`; output goes to `appsink` (video) and
   `autoaudiosink` (audio). Equal-split tile grid computed from `scene.toml`.
 - `Transport`: play / pause / `seek_all` / `set_source_offset` (pad offset on
-  both compositor and audiomixer sink pads, shifting A/V together — ADR-0004).
-  Dedicated bus-loop thread handles EOS → seek-to-zero for continuous looping.
+  the capsfilter source pads feeding compositor/audiomixer, shifting A/V
+  together — ADR-0004). Dedicated bus-loop thread handles EOS → seek-to-zero
+  for continuous looping.
 - `MetricsCollector`: BUFFER pad probes on compositor sink pads (`fps_in`) and
   appsink sink pad (`fps_out`); QoS upstream events counted as `dropped_frames`
   (ADR-0008 always-on tier).
@@ -34,11 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fm-app`: iced `App` skeleton + `bridge` module stub for the appsink→texture
   path (ADR-0006).
 
-### Changed
-### Deprecated
-### Removed
 ### Fixed
-### Security
+- `bridge`: RGBA row copy now reads stride from `VideoInfo::from_caps` and
+  copies row-by-row when stride > width×4, preventing corrupted frames on
+  odd tile widths where GStreamer pads rows to an alignment boundary.
+- `bridge`: bounds-check buffer length against `stride × (h−1) + row_bytes`
+  before slicing; a short/truncated buffer now returns `FlowError::Error`
+  (dropped frame) instead of panicking the streaming thread.
+- `pipeline`: `gst_pad_set_offset` moved from compositor/audiomixer sink pads
+  to the capsfilter source pads that feed them — the only side where GStreamer
+  guarantees reliable offset behaviour. Eliminates startup warnings and makes
+  per-source offset sliders actually take effect.
 
 <!--
 Move items out of [Unreleased] into a versioned section on release, e.g.:

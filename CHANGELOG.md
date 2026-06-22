@@ -15,12 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the capsfilter source pads feeding compositor/audiomixer, shifting A/V
   together — ADR-0004). Dedicated bus-loop thread handles EOS → seek-to-zero
   for continuous looping.
-- `MetricsCollector`: BUFFER pad probes on compositor sink pads (`fps_in`) and
-  appsink sink pad (`fps_out`); QoS upstream events counted as `dropped_frames`
-  (ADR-0008 always-on tier).
-- `bridge`: `AppSink` new-sample callback writes RGBA frames into a
-  `Arc<Mutex<Option<FrameData>>>` store; `latest_handle` converts to
-  `iced::widget::image::Handle` for the UI (ADR-0006 appsink→texture seam).
+- `MetricsCollector`: BUFFER pad probes on capsfilter source pads (`fps_in`)
+  and appsink sink pad (`fps_out`); QoS upstream events counted as
+  `dropped_frames` (ADR-0008 always-on tier).
+- `bridge` + `video`: `AppSink` callback writes RGBA frames as `Arc<FrameData>`
+  into a `Arc<Mutex<Option<Arc<FrameData>>>>` store; the UI reads the latest
+  frame via a reference-count bump. Display uses a persistent `wgpu::Texture`
+  updated in-place via `queue.write_texture` through iced's `shader` widget
+  (ADR-0006 appsink→texture seam, ADR-0009).
 - `fm-app` UI: tile grid video display, Play/Pause button, per-source offset
   sliders (−5000 ms … +5000 ms) with live fps/dropped metrics readout; 60 fps
   `iced::time::every` subscription drives the frame and metrics refresh.
@@ -34,8 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skeletons with documented `todo!()` stubs for Phase 1 implementation.
 - `fm-app`: iced `App` skeleton + `bridge` module stub for the appsink→texture
   path (ADR-0006).
-
-### Added
 - Per-source static volume via `volume` field in `[[source]]` config blocks
   (linear scale: 0.0 silent, 1.0 unity, >1.0 amplifies). Applied to the
   `audiomixer` sink pad at pipeline build; omitting the field defaults to 1.0.

@@ -14,6 +14,7 @@ use serde::Deserialize;
 /// id        = "clip-a"
 /// uri       = "file:///path/to/clip.mp4"
 /// offset_ms = 0
+/// volume    = 1.0
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct SceneConfig {

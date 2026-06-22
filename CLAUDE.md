@@ -27,4 +27,8 @@
 - Config: TOML via `serde` + the `toml` crate — ADR-0007.
 - Per-source metrics schema lives in the adapter SDK crate; telemetry rides the control
   channel, not the media path — ADR-0008.
-- (Test / build / lint commands — fill in once the workspace exists.)
+- Build: `cargo build`
+- Check (no link): `cargo check --workspace`
+- Lint: `cargo clippy --workspace`
+- Test: `cargo test --workspace`
+- Format: `cargo fmt --check` (CI gate) / `cargo fmt` (apply)

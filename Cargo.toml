@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/fm-adapter-sdk",
+    "crates/fm-core",
+    "crates/fm-app",
+]
+resolver = "2"
+
+[workspace.package]
+version  = "0.1.0"
+edition  = "2021"
+license  = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# GStreamer
+gstreamer        = "0.25"
+gstreamer-app    = "0.25"
+gstreamer-audio  = "0.25"
+gstreamer-video  = "0.25"
+# UI
+iced             = "0.14"
+# Config / serialisation
+serde            = { version = "1", features = ["derive"] }
+toml             = "1"
+# Internal crates
+fm-adapter-sdk   = { path = "crates/fm-adapter-sdk" }
+fm-core          = { path = "crates/fm-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

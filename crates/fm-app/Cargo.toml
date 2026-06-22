@@ -1,0 +1,21 @@
+[package]
+name        = "fm-app"
+description = "iced UI and appsink→texture bridge for Final Multiplex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "final-multiplex"
+path = "src/main.rs"
+
+[dependencies]
+fm-adapter-sdk.workspace  = true
+fm-core.workspace         = true
+gstreamer.workspace       = true
+gstreamer-app.workspace   = true
+gstreamer-video.workspace = true
+iced.workspace            = true
+
+[lints]
+workspace = true

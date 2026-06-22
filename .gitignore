@@ -1,0 +1,38 @@
+# --- Claude Code ---
+# Personal, per-machine permissions. Keeps your mid-session "allow" approvals
+# out of git so they never show as diffs or cause merge conflicts.
+.claude/settings.local.json
+
+# --- Rust / Cargo ---
+/target/
+**/*.rs.bk
+# Cargo.lock: COMMIT it for an application/binary (so leave it tracked).
+# Only ignore it if this becomes a library crate — then uncomment:
+# Cargo.lock
+
+# Coverage / profiling artifacts
+*.profraw
+*.profdata
+
+# --- Editor / IDE ---
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS cruft (Linux + Windows) ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Secrets (mirrors the deny rules in settings.local.json) ---
+.env
+.env.*
+/secrets/
+
+# --- Local media scratch ---
+# Don't commit test clips, stream dumps, or recordings.
+# Put intentional sample assets in e.g. /assets/ and they'll still be tracked.
+/media/
+/recordings/

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+_2026-06-21 22:45 −0500 · `37a9c69`_
+
 - Cargo workspace with three crates: `fm-adapter-sdk`, `fm-core`, `fm-app`
   (binary `final-multiplex`).
 - `fm-adapter-sdk`: `SourceMetrics` schema and `IngestState` enum (ADR-0008);

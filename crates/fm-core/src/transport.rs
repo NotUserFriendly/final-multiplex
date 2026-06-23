@@ -84,6 +84,9 @@ pub fn run_bus_loop(pipeline: gstreamer::Pipeline, audio_levels: AudioStore) {
                 ) {
                     eprintln!("[fm-core] loop seek failed: {e}");
                 }
+                // Clear stale levels so meters return to floor while sources
+                // restart; new level messages refill the store after seek.
+                audio_levels.lock().unwrap().clear();
             }
             MessageView::Error(err) => {
                 eprintln!(

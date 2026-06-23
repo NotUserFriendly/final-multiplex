@@ -38,20 +38,24 @@ impl Transport {
         Ok(())
     }
 
-    /// Seek one source to an absolute position in its file (video sync tool).
-    ///
-    /// Uses ACCURATE so the seek always lands at exactly the requested frame.
-    /// KEY_UNIT snaps to the nearest keyframe, which is often frame 0 for short
-    /// offsets, causing an apparent reset to the beginning. GStreamer sets the
-    /// new segment base to the current pipeline running time, so no pad-offset
-    /// compensation is needed — frames arrive at the compositor on time.
+    /// Shift one source's audio and video together by adjusting the
+    /// `gst_pad_set_offset` on its capsfilter source pads (ADR-0004).
+    /// The offset is a compositor-timeline shift: a positive value delays when
+    /// the source's content appears relative to t=0; negative makes it lead.
+    /// No seek is issued, so the offset is source-agnostic and unaffected by
+    /// file duration or seekability — it survives the Phase-2 RTSP boundary.
     pub fn set_source_offset(&self, source_id: &str, offset_ms: i64) -> Result<()> {
-        let target = gstreamer::ClockTime::from_mseconds(offset_ms.max(0) as u64);
-        if let Some(uri_elem) = self.pipeline.uri_elements().get(source_id) {
-            uri_elem.seek_simple(
-                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::ACCURATE,
-                target,
-            )?;
+        let pads = self
+            .pipeline
+            .source_pads()
+            .get(source_id)
+            .ok_or_else(|| format!("unknown source id: {source_id}"))?;
+        let offset_ns = offset_ms * 1_000_000;
+        if let Some(ref p) = pads.video_src {
+            p.set_offset(offset_ns);
+        }
+        if let Some(ref p) = pads.audio_src {
+            p.set_offset(offset_ns);
         }
         Ok(())
     }
@@ -87,12 +91,22 @@ pub fn run_bus_loop(pipeline: gstreamer::Pipeline, audio_levels: AudioStore) {
         use gstreamer::MessageView;
         match msg.view() {
             MessageView::Eos(..) => {
+                // Snapshot state before seeking: a FLUSH seek internally
+                // cycles through PLAYING to pre-roll the new position, so a
+                // pipeline that was PAUSED ends up PLAYING without this guard.
+                let was_paused = pipeline.current_state() == gstreamer::State::Paused;
+
                 if let Err(e) = pipeline.seek_simple(
                     gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
                     gstreamer::ClockTime::ZERO,
                 ) {
                     eprintln!("[fm-core] loop seek failed: {e}");
                 }
+
+                if was_paused {
+                    let _ = pipeline.set_state(gstreamer::State::Paused);
+                }
+
                 // Clear stale levels so meters return to floor while sources
                 // restart; new level messages refill the store after seek.
                 audio_levels.lock().unwrap().clear();

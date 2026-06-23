@@ -59,8 +59,6 @@ pub struct Pipeline {
     /// `audiomixer` sink pad per source, keyed by source id.
     /// Separate from the offset-carrying `audio_src` pads (ADR-0004).
     mixer_sink_pads: HashMap<String, gstreamer::Pad>,
-    /// `uridecodebin` element per source — used for seek-based offset.
-    uri_elements: HashMap<String, gstreamer::Element>,
 }
 
 impl Pipeline {
@@ -165,7 +163,6 @@ impl Pipeline {
 
         let mut source_pads: HashMap<String, SourcePads> = HashMap::new();
         let mut mixer_sink_pads: HashMap<String, gstreamer::Pad> = HashMap::new();
-        let mut uri_elements: HashMap<String, gstreamer::Element> = HashMap::new();
 
         for (idx, source) in scene.source.iter().enumerate() {
             let (has_video, has_audio) = stream_caps[idx];
@@ -180,6 +177,7 @@ impl Pipeline {
 
             let xpos = ((idx as u32 % cols) * tile_w as u32) as i32;
             let ypos = ((idx as u32 / cols) * tile_h as u32) as i32;
+            let offset_ns = source.offset_ms * 1_000_000;
 
             // ── Video chain (only when probe confirmed video) ──────────────
             let mut vcaps_src: Option<gstreamer::Pad> = None;
@@ -225,6 +223,7 @@ impl Pipeline {
                 comp_sink.set_property("repeat-after-eos", true);
 
                 let vs = vcaps.static_pad("src").ok_or("vcaps: no src pad")?;
+                vs.set_offset(offset_ns);
                 vs.link(&comp_sink)?;
 
                 vconv_sink_for_cb = Some(vconv.static_pad("sink").ok_or("vconv: no sink pad")?);
@@ -265,6 +264,7 @@ impl Pipeline {
                     .ok_or("could not request audiomixer sink pad")?;
 
                 let as_ = acaps.static_pad("src").ok_or("acaps: no src pad")?;
+                as_.set_offset(offset_ns);
                 as_.link(&mix_sink)?;
                 mix_sink.set_property("volume", source.volume);
                 mixer_sink_pads.insert(source.id.clone(), mix_sink);
@@ -290,7 +290,6 @@ impl Pipeline {
 
             let id_for_cb = source.id.clone();
 
-            uri_elements.insert(source.id.clone(), uri.clone());
             uri.connect_pad_added(move |_src, pad| {
                 let caps = match pad.current_caps() {
                     Some(c) => c,
@@ -324,7 +323,6 @@ impl Pipeline {
             appsink,
             source_pads,
             mixer_sink_pads,
-            uri_elements,
         })
     }
 
@@ -342,9 +340,5 @@ impl Pipeline {
 
     pub fn mixer_sink_pads(&self) -> &HashMap<String, gstreamer::Pad> {
         &self.mixer_sink_pads
-    }
-
-    pub fn uri_elements(&self) -> &HashMap<String, gstreamer::Element> {
-        &self.uri_elements
     }
 }

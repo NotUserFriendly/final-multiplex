@@ -74,21 +74,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output at 1080p (ADR-0006 risk item).
 
 ### Changed
-- Per-source offset is now seek-based (moves the file read head) rather than
-  compositor-timestamp-based (`gst_pad_set_offset`). The old approach shifted
-  when frames appeared on the compositor timeline without changing what content
-  was shown; the new approach causes the video to visibly jump to the requested
-  position, as expected from a multi-camera sync tool. Uses `ACCURATE` seek flag
-  so the position is exact rather than snapping to the nearest keyframe.
-- Offset range changed from ±60 s to 0–600 s (10 minutes). Negative offsets
-  are not meaningful for file-position seeks and are now rejected at all entry
-  points (text input, steppers, config load).
 - Window opens at the correct size for the configured grid aspect ratio so
   no black bars are visible on launch.
 ### Deprecated
 ### Removed
 - Per-source offset sliders replaced by editable text box + stepper buttons.
 ### Fixed
+- Per-source offset inconsistency: seeks past a source's file duration silently
+  returned `Ok` but parked the element at its last frame, triggering an immediate
+  EOS loop reset that reset all source positions — appearing as "nothing happens"
+  or "resets to beginning." Reverted to `gst_pad_set_offset` on the capsfilter
+  source pads (ADR-0004). The pad-offset approach is a compositor-timeline shift
+  (no file seek issued) so it is source-agnostic, unaffected by file duration or
+  seekability, and survives the Phase-2 RTSP boundary. Pad offset properties
+  persist across EOS loop seeks as they are pad-level properties, not pipeline state.
 - `transport`: audio level meters now light up correctly. The GStreamer `level`
   plugin posts peak/rms values as `G_TYPE_VALUE_ARRAY` (`GValueArray`), not
   `GST_TYPE_ARRAY`. The previous `get::<gstreamer::Array>()` call silently

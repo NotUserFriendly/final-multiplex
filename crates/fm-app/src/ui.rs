@@ -6,8 +6,8 @@ use iced::{Background, Color, Element, Length, Subscription, Task};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MIN_OFFSET_MS: i32 = 0;
-const MAX_OFFSET_MS: i32 = 600_000;
+const MIN_OFFSET_MS: i32 = -60_000;
+const MAX_OFFSET_MS: i32 = 60_000;
 pub(crate) const CHROME_H: f32 = 50.0;
 
 struct SourceRow {
@@ -456,15 +456,6 @@ fn try_init(
 
     let transport = fm_core::transport::Transport::new(pipeline);
     transport.play()?;
-
-    // Apply initial seek-based offsets from config. Give the pipeline a moment
-    // to reach PLAYING before seeking, so the event lands on a live element.
-    std::thread::sleep(Duration::from_millis(500));
-    for s in &scene.source {
-        if s.offset_ms != 0 {
-            let _ = transport.set_source_offset(&s.id, s.offset_ms);
-        }
-    }
 
     let audio_store = metrics.audio_store();
     std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe, audio_store));

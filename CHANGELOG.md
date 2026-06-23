@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 ### Removed
 ### Fixed
+- `transport`: audio level meters now light up correctly. The GStreamer `level`
+  plugin posts peak/rms values as `G_TYPE_VALUE_ARRAY` (`GValueArray`), not
+  `GST_TYPE_ARRAY`. The previous `get::<gstreamer::Array>()` call silently
+  returned `Err` on every message, so `parse_level_array` always returned
+  `DB_FLOOR` and no segments lit.
+- `transport`: audio level meters now return to floor when sources finish and
+  loop. On EOS the `level` element stops emitting messages, leaving the last
+  values frozen in the `AudioStore`. The EOS handler now clears the store after
+  the seek-to-zero so meters read silent during the loop-back gap.
 - `video` / `ui`: resizing the window no longer stretches the video.
   The vertex shader now applies a per-frame letterbox/pillarbox scale
   uniform (written via `queue.write_buffer` every prepare call) so the

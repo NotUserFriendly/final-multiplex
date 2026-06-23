@@ -13,10 +13,11 @@ license  = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # GStreamer
-gstreamer        = "0.25"
-gstreamer-app    = "0.25"
-gstreamer-audio  = "0.25"
-gstreamer-video  = "0.25"
+gstreamer         = "0.25"
+gstreamer-app     = "0.25"
+gstreamer-audio   = "0.25"
+gstreamer-video   = "0.25"
+gstreamer-pbutils = "0.25"
 # UI
 iced             = { version = "0.14", features = ["image", "tokio"] }
 # Config / serialisation

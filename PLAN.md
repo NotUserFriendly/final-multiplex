@@ -83,3 +83,12 @@ Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources
 
 - shm payload: raw frames vs encoded — bandwidth vs isolation. Decide at Phase 2.
 - Source-adapter SDK crate shape: finalize when Phase 2 makes the contract concrete.
+- Runtime decode failure / stall resilience: the current `GstDiscoverer` pre-probe
+  skips sources with no readable streams (empty, wrong-format, network-timeout) before
+  the pipeline is built. A source whose container headers are valid but whose encoded
+  payload fails at decode time will still stall the compositor — uridecodebin errors
+  at runtime, leaving an aggregator pad with no data flowing. Fix requires a runtime
+  mechanism in the bus-error handler to detect the failing source, flush its aggregator
+  pad, and keep the remaining sources playing. Needs investigation into why earlier
+  attempts (EOS injection + `release_request_pad`, `force-live` + `ignore-inactive-pads`)
+  did not reliably unblock the aggregator.

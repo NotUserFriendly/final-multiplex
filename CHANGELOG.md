@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 ### Removed
 ### Fixed
+- `pipeline`: corrupt or unreadable sources (empty file, wrong format, network
+  timeout) no longer stall the compositor. A `GstDiscoverer` pre-probe runs for
+  each source before the pipeline is built; sources with no detectable streams
+  are skipped entirely — no uridecodebin, no aggregator pads, no error event that
+  could block the pipeline's async state change. Sources confirmed as video-only
+  get a compositor pad but no audiomixer pad; the idle audio chain is not added,
+  preventing a dangling unlinked chain in the pipeline. Remaining sources continue
+  playing normally with their tiles composited; a skipped source's tile shows the
+  compositor background colour (black by default).
+- `SourcePads` fields are now `Option<gstreamer::Pad>` to reflect that a source
+  may have video, audio, both, or neither; `set_source_offset` and metrics probes
+  skip absent pads gracefully.
 - `bridge` + `video`: replaced `iced::widget::image::Handle::from_rgba` (which
   destroys and recreates the GPU texture on every frame) with a persistent
   `wgpu::Texture` updated in-place via `queue.write_texture`. Eliminates the

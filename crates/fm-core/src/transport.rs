@@ -1,5 +1,5 @@
-use gstreamer::prelude::*;
 use crate::pipeline::Pipeline;
+use gstreamer::prelude::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -27,8 +27,7 @@ impl Transport {
 
     /// Seek every source to `position_ms` on the master clock simultaneously.
     pub fn seek_all(&self, position_ms: i64) -> Result<()> {
-        let pos =
-            gstreamer::ClockTime::from_mseconds(position_ms.max(0) as u64);
+        let pos = gstreamer::ClockTime::from_mseconds(position_ms.max(0) as u64);
         self.pipeline.inner().seek_simple(
             gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
             pos,
@@ -46,8 +45,12 @@ impl Transport {
             .get(source_id)
             .ok_or_else(|| format!("unknown source id: {source_id}"))?;
         let offset_ns = offset_ms * 1_000_000;
-        pads.video_src.set_offset(offset_ns);
-        pads.audio_src.set_offset(offset_ns);
+        if let Some(ref p) = pads.video_src {
+            p.set_offset(offset_ns);
+        }
+        if let Some(ref p) = pads.audio_src {
+            p.set_offset(offset_ns);
+        }
         Ok(())
     }
 

@@ -7,10 +7,11 @@ license.workspace = true
 
 [dependencies]
 fm-adapter-sdk.workspace  = true
-gstreamer.workspace       = true
-gstreamer-app.workspace   = true
-gstreamer-audio.workspace = true
-gstreamer-video.workspace = true
+gstreamer.workspace         = true
+gstreamer-app.workspace     = true
+gstreamer-audio.workspace   = true
+gstreamer-video.workspace   = true
+gstreamer-pbutils.workspace = true
 serde.workspace           = true
 toml.workspace            = true
 

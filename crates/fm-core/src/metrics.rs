@@ -1,9 +1,9 @@
+use crate::pipeline::Pipeline;
+use fm_adapter_sdk::metrics::{IngestState, SourceMetrics};
+use gstreamer::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use gstreamer::prelude::*;
-use fm_adapter_sdk::metrics::{IngestState, SourceMetrics};
-use crate::pipeline::Pipeline;
 
 struct SourceCounter {
     frames_since_reset: u64,
@@ -41,7 +41,11 @@ struct OutputCounter {
 
 impl OutputCounter {
     fn new() -> Self {
-        Self { frames_since_reset: 0, fps: 0.0, last_reset: Instant::now() }
+        Self {
+            frames_since_reset: 0,
+            fps: 0.0,
+            last_reset: Instant::now(),
+        }
     }
 
     fn on_buffer(&mut self) {
@@ -73,17 +77,15 @@ impl MetricsCollector {
     pub fn attach(pipeline: &Pipeline) -> Self {
         let per_source: Arc<Mutex<HashMap<String, SourceCounter>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let output: Arc<Mutex<OutputCounter>> =
-            Arc::new(Mutex::new(OutputCounter::new()));
+        let output: Arc<Mutex<OutputCounter>> = Arc::new(Mutex::new(OutputCounter::new()));
 
         // ── fps_in: capsfilter src pad BUFFER probes (post-scale, pre-compositor) ──
         for (id, pads) in pipeline.source_pads() {
             let counters = per_source.clone();
             let id_clone = id.clone();
 
-            pads.video_src.add_probe(
-                gstreamer::PadProbeType::BUFFER,
-                move |_pad, _info| {
+            if let Some(ref video_src) = pads.video_src {
+                video_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, _info| {
                     counters
                         .lock()
                         .unwrap()
@@ -91,41 +93,38 @@ impl MetricsCollector {
                         .or_insert_with(SourceCounter::new)
                         .on_buffer();
                     gstreamer::PadProbeReturn::Ok
-                },
-            );
+                });
 
-            // ── dropped_frames: QoS events travelling upstream ─────────────
-            let counters_qos = per_source.clone();
-            let id_qos = id.clone();
+                // ── dropped_frames: QoS events travelling upstream ─────────────
+                let counters_qos = per_source.clone();
+                let id_qos = id.clone();
 
-            pads.video_src.add_probe(
-                gstreamer::PadProbeType::EVENT_UPSTREAM,
-                move |_pad, info| {
-                    if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
-                        if ev.type_() == gstreamer::EventType::Qos {
-                            counters_qos
-                                .lock()
-                                .unwrap()
-                                .entry(id_qos.clone())
-                                .or_insert_with(SourceCounter::new)
-                                .dropped += 1;
+                video_src.add_probe(
+                    gstreamer::PadProbeType::EVENT_UPSTREAM,
+                    move |_pad, info| {
+                        if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
+                            if ev.type_() == gstreamer::EventType::Qos {
+                                counters_qos
+                                    .lock()
+                                    .unwrap()
+                                    .entry(id_qos.clone())
+                                    .or_insert_with(SourceCounter::new)
+                                    .dropped += 1;
+                            }
                         }
-                    }
-                    gstreamer::PadProbeReturn::Ok
-                },
-            );
+                        gstreamer::PadProbeReturn::Ok
+                    },
+                );
+            } // end if let Some(video_src)
         }
 
         // ── fps_out: appsink sink pad BUFFER probe ─────────────────────────
         if let Some(sink_pad) = pipeline.appsink().static_pad("sink") {
             let output_clone = output.clone();
-            sink_pad.add_probe(
-                gstreamer::PadProbeType::BUFFER,
-                move |_pad, _info| {
-                    output_clone.lock().unwrap().on_buffer();
-                    gstreamer::PadProbeReturn::Ok
-                },
-            );
+            sink_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, _info| {
+                output_clone.lock().unwrap().on_buffer();
+                gstreamer::PadProbeReturn::Ok
+            });
         }
 
         Self { per_source, output }

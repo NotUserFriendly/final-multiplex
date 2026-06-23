@@ -93,9 +93,26 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
     This is per-*source* fit *inside the compositor*. Different layer — don't conflate.
 
 ### Phase 5 — Manual audio sync (prerecorded)
-- **Deliverable:** visible per-source waveform; drag to set the per-source offset (which
-  already exists and moves A/V together from Phase 1); "play all" honors it.
-- **Exit:** two deliberately desynced clips can be aligned by eye/ear via the waveform.
+- **Deliverable:** visible per-source waveform; drag to align a source against the others;
+  "play all" honors it. There are **two distinct alignment tools here, not one** — keep
+  them separate:
+  - **Sync offset (the Phase-1 pad offset):** shifts *when* a source presents on the
+    shared timeline, in small amounts, for A/V alignment. Source-agnostic (a pad offset
+    downstream of ingest), so it works for live sources too and survives the Phase-2
+    boundary. Its visual feedback is **inherently asymmetric**: delaying a source
+    (+offset) shows a brief freeze while presentation catches up; nudging back toward live
+    (−offset) is smooth with no visible jump — a pad offset can only ever present
+    already-decoded (older) frames, never frames the decoder hasn't produced yet. This is
+    correct behavior for a sync primitive, *not* a defect. Do **not** pair it with a seek
+    to force symmetric feedback: that reintroduces the file-seek path (and the
+    double-offset bug hit in debugging) and breaks for live sources.
+  - **Scrub (seek):** jumps *where in the file* a source is playing, in large amounts, to
+    navigate a clip. Gives symmetric, immediate visual jumps in both directions — but only
+    works for seekable sources (local files), so it **does not exist for RTSP/YouTube**.
+    Build it as its own control, explicitly separate from the sync offset; the waveform
+    drag is its natural input.
+- **Exit:** two deliberately desynced clips can be aligned by eye/ear — fine alignment via
+  the sync offset, coarse navigation via the scrub.
 
 ### Later
 Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources.
@@ -113,6 +130,13 @@ Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources
   this path has not been reproduced or verified since the fix. The Phase-2 process
   boundary makes it moot for out-of-process sources (a dead adapter can't stall the core),
   so revisit only if it surfaces for an in-core source.
+- **Scrub control timing:** the scrub (per-source file seek, symmetric jumps) is slated
+  for Phase 5 alongside the waveform, but the desire for it surfaced in Phase 1 — the
+  sync offset's asymmetric feedback (no visible jump when nudging back toward live) reads
+  as "nothing happened" to a user expecting an immediate undo. The sync offset is working
+  as designed; the symmetric-jump expectation is the scrub's job. Slated Phase 5; pull
+  earlier only if it becomes real friction before then, and keep it a *separate* control
+  from the sync offset regardless.
 - **Live volume control:** volume is currently static (set once on the audiomixer sink
   pad at build; mute is a live toggle on that same pad). If/when live volume *sliders* are
   wanted, decide then: keep adjusting the audiomixer sink-pad `volume`, or add a dedicated

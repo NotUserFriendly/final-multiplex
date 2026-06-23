@@ -44,6 +44,10 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
   one tile by a known number of milliseconds visibly shifts its A/V and stays shifted;
   the same scene reproduces from the config file. Validate the texture-copy path holds
   frame rate at 1080p (the iced risk flagged in ADR-0006), measured via those counters.
+- **Also shipped (beyond the exit bar):** per-source static volume in config; in-core
+  per-source audio level meters with three-tone display + runtime mute; editable
+  per-source offset (typed entry + ms/second steppers, sliders removed); per-tile
+  control/debug overlays with the video display region locked to the output aspect ratio.
 - **Why first:** proves the differentiator with zero IPC risk (ADR-0005 sequencing).
 
 ### Phase 2 — Process boundary + RTSP
@@ -66,10 +70,27 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 > whole scene is **driven from a config file**. This is the end of Phase 3, not Phase 1.
 > After this, the next goal is a Windows build before adding Phase 4+.
 
-### Phase 4 — Focus mode
+### Phase 4 — Focus mode + per-source fit
 - **Deliverable:** focus layout (one large tile, others arranged around it); switch
-  between equal split and focus at runtime.
-- **Exit:** runtime toggle works without restarting sources.
+  between equal split and focus at runtime. **Per-source fit mode**: each source can be
+  set to *letterbox* (current default — preserve aspect, bars fill the leftover space),
+  *stretch to fit* (fill the tile, ignore aspect), or *zoom to fit* (fill the tile,
+  preserve aspect, crop the overflow).
+- **Exit:** runtime toggle between equal-split and focus works without restarting sources;
+  a source's fit mode can be changed at runtime and takes effect immediately.
+- **Design notes:**
+  - Fit mode is a per-source property of the **compositor sink pad**, set at runtime —
+    the same runtime sink-pad geometry control focus mode needs, which is why the two
+    live together. Today's per-source sizing is computed once at build from the grid;
+    this phase makes it a live, per-source choice. Build that control once, here.
+  - **Zoom != stretch in difficulty.** Stretch is a pad-property change (sink pad
+    width/height = tile, no aspect constraint). Zoom (fill + crop, preserve aspect)
+    generally needs a `videocrop`/`aspectratiocrop` element per source, or compositor
+    pad properties that may not cover true crop — a real design question to settle in
+    this phase, not a one-line toggle.
+  - **Distinct from the Phase-1 UI aspect-lock.** That locks the *whole composited
+    output's* display region to the output aspect ratio in the UI (so overlays align).
+    This is per-*source* fit *inside the compositor*. Different layer — don't conflate.
 
 ### Phase 5 — Manual audio sync (prerecorded)
 - **Deliverable:** visible per-source waveform; drag to set the per-source offset (which
@@ -81,14 +102,25 @@ Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources
 
 ## Open questions
 
-- shm payload: raw frames vs encoded — bandwidth vs isolation. Decide at Phase 2.
-- Source-adapter SDK crate shape: finalize when Phase 2 makes the contract concrete.
-- Runtime decode failure / stall resilience: the current `GstDiscoverer` pre-probe
-  skips sources with no readable streams (empty, wrong-format, network-timeout) before
-  the pipeline is built. A source whose container headers are valid but whose encoded
-  payload fails at decode time will still stall the compositor — uridecodebin errors
-  at runtime, leaving an aggregator pad with no data flowing. Fix requires a runtime
-  mechanism in the bus-error handler to detect the failing source, flush its aggregator
-  pad, and keep the remaining sources playing. Needs investigation into why earlier
-  attempts (EOS injection + `release_request_pad`, `force-live` + `ignore-inactive-pads`)
-  did not reliably unblock the aggregator.
+- **shm payload:** raw frames vs encoded — bandwidth vs isolation. Decide at Phase 2.
+- **Source-adapter SDK crate shape:** finalize when Phase 2 makes the contract concrete.
+- **Runtime decode failure / stall resilience:** the build-time stall is **resolved** —
+  a mixed scene (good sources plus a corrupt or video-only source) previously stalled the
+  whole multiplex at "waiting for first frame"; good sources now play while unusable ones
+  are skipped (mechanism lives in code + CHANGELOG). **Residual, untested:** a source
+  whose container headers are valid but whose *encoded payload* fails at decode time
+  passes the `GstDiscoverer` pre-probe and could still stall the compositor at runtime —
+  this path has not been reproduced or verified since the fix. The Phase-2 process
+  boundary makes it moot for out-of-process sources (a dead adapter can't stall the core),
+  so revisit only if it surfaces for an in-core source.
+- **Live volume control:** volume is currently static (set once on the audiomixer sink
+  pad at build; mute is a live toggle on that same pad). If/when live volume *sliders* are
+  wanted, decide then: keep adjusting the audiomixer sink-pad `volume`, or add a dedicated
+  `volume` element per source (a cleaner handle for automation / ducking / fades). Mute
+  alone did not force this choice.
+- **Audio level measurement location (Phase 2):** level is measured in-core today (a
+  `level` element per source, before the mixer). When audio goes out-of-process, decide
+  whether the core keeps measuring post-`shmsrc` or the adapter measures and reports on
+  the control channel. ADR-0008 says per-source telemetry originates in the adapter, but
+  level is a cheap post-decode measurement that's simplest taken at one core-side spot —
+  resolve when the Phase-2 contract is concrete.

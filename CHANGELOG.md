@@ -74,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output at 1080p (ADR-0006 risk item).
 
 ### Changed
+- Per-source offset is now seek-based (moves the file read head) rather than
+  compositor-timestamp-based (`gst_pad_set_offset`). The old approach shifted
+  when frames appeared on the compositor timeline without changing what content
+  was shown; the new approach causes the video to visibly jump to the requested
+  position, as expected from a multi-camera sync tool. Uses `ACCURATE` seek flag
+  so the position is exact rather than snapping to the nearest keyframe.
+- Offset range changed from ±60 s to 0–600 s (10 minutes). Negative offsets
+  are not meaningful for file-position seeks and are now rejected at all entry
+  points (text input, steppers, config load).
+- Window opens at the correct size for the configured grid aspect ratio so
+  no black bars are visible on launch.
 ### Deprecated
 ### Removed
 - Per-source offset sliders replaced by editable text box + stepper buttons.

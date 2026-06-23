@@ -38,21 +38,20 @@ impl Transport {
         Ok(())
     }
 
-    /// Shift one source's audio and video together by adjusting the
-    /// `gst_pad_set_offset` on its capsfilter source pads (ADR-0004).
-    /// No seek required; the change takes effect on the next buffer.
+    /// Seek one source to an absolute position in its file (video sync tool).
+    ///
+    /// Uses ACCURATE so the seek always lands at exactly the requested frame.
+    /// KEY_UNIT snaps to the nearest keyframe, which is often frame 0 for short
+    /// offsets, causing an apparent reset to the beginning. GStreamer sets the
+    /// new segment base to the current pipeline running time, so no pad-offset
+    /// compensation is needed — frames arrive at the compositor on time.
     pub fn set_source_offset(&self, source_id: &str, offset_ms: i64) -> Result<()> {
-        let pads = self
-            .pipeline
-            .source_pads()
-            .get(source_id)
-            .ok_or_else(|| format!("unknown source id: {source_id}"))?;
-        let offset_ns = offset_ms * 1_000_000;
-        if let Some(ref p) = pads.video_src {
-            p.set_offset(offset_ns);
-        }
-        if let Some(ref p) = pads.audio_src {
-            p.set_offset(offset_ns);
+        let target = gstreamer::ClockTime::from_mseconds(offset_ms.max(0) as u64);
+        if let Some(uri_elem) = self.pipeline.uri_elements().get(source_id) {
+            uri_elem.seek_simple(
+                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::ACCURATE,
+                target,
+            )?;
         }
         Ok(())
     }

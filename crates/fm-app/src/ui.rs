@@ -6,8 +6,9 @@ use iced::{Background, Color, Element, Length, Subscription, Task};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MAX_OFFSET_MS: i32 = 60_000;
-const CHROME_H: f32 = 50.0;
+const MIN_OFFSET_MS: i32 = 0;
+const MAX_OFFSET_MS: i32 = 600_000;
+pub(crate) const CHROME_H: f32 = 50.0;
 
 struct SourceRow {
     id: String,
@@ -114,7 +115,7 @@ impl App {
                 if let Some(src) = self.sources.get_mut(index) {
                     src.offset_buf = text.clone();
                     if let Ok(ms) = text.trim().parse::<i32>() {
-                        src.offset_ms = ms.clamp(-MAX_OFFSET_MS, MAX_OFFSET_MS);
+                        src.offset_ms = ms.clamp(MIN_OFFSET_MS, MAX_OFFSET_MS);
                         if let Some(t) = &self.transport {
                             let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
                         }
@@ -127,7 +128,7 @@ impl App {
                     src.offset_ms = src
                         .offset_ms
                         .saturating_add(delta)
-                        .clamp(-MAX_OFFSET_MS, MAX_OFFSET_MS);
+                        .clamp(MIN_OFFSET_MS, MAX_OFFSET_MS);
                     src.offset_buf = src.offset_ms.to_string();
                     if let Some(t) = &self.transport {
                         let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
@@ -438,7 +439,9 @@ fn try_init(
         .iter()
         .map(|s| SourceRow {
             id: s.id.clone(),
-            offset_ms: s.offset_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            offset_ms: s
+                .offset_ms
+                .clamp(MIN_OFFSET_MS as i64, MAX_OFFSET_MS as i64) as i32,
             offset_buf: s.offset_ms.to_string(),
             muted: false,
             display_name: uri_display_name(&s.uri),
@@ -453,6 +456,16 @@ fn try_init(
 
     let transport = fm_core::transport::Transport::new(pipeline);
     transport.play()?;
+
+    // Apply initial seek-based offsets from config. Give the pipeline a moment
+    // to reach PLAYING before seeking, so the event lands on a live element.
+    std::thread::sleep(Duration::from_millis(500));
+    for s in &scene.source {
+        if s.offset_ms != 0 {
+            let _ = transport.set_source_offset(&s.id, s.offset_ms);
+        }
+    }
+
     let audio_store = metrics.audio_store();
     std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe, audio_store));
 

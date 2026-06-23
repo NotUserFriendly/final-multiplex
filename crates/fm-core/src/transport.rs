@@ -120,19 +120,20 @@ pub fn run_bus_loop(pipeline: gstreamer::Pipeline, audio_levels: AudioStore) {
     }
 }
 
-/// Extract the max value across all channels from a GStreamer Array field in
-/// a level message structure. Floors at DB_FLOOR to handle -inf (silence).
+/// Extract the max value across all channels from a level message structure field.
+/// The level plugin posts GValueArray (G_TYPE_VALUE_ARRAY), not GST_TYPE_ARRAY.
+/// Floors at DB_FLOOR to handle -inf (complete silence).
 fn parse_level_array(s: &gstreamer::StructureRef, field: &str) -> f64 {
+    // ValueArray derefs to [Value]; iterate directly.
+    #[allow(deprecated)]
     let raw = s
-        .get::<gstreamer::Array>(field)
+        .get::<gstreamer::glib::ValueArray>(field)
         .ok()
         .and_then(|arr| {
-            arr.as_slice()
-                .iter()
+            arr.iter()
                 .filter_map(|v| v.get::<f64>().ok())
                 .reduce(f64::max)
         })
         .unwrap_or(DB_FLOOR);
-    // -inf means silence; clamp to floor for display.
     raw.max(DB_FLOOR)
 }

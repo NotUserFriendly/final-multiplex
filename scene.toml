@@ -1,25 +1,25 @@
 [grid]
 columns = 2
-width   = 1280
-height  = 720
+width   = 1920
+height  = 1080
 fps     = 30
 
 [[source]]
-id     = "brain"
-uri    = "file:///home/locad/Downloads/Brain_Implosion_Energy_Drink_EXT.mp4"
+id     = "rdt-apr"
+uri    = "file:///home/locad/Downloads/RDT_20260418_092704.mp4"
 volume = 0.15
 
 [[source]]
-id     = "m2-480p"
-uri    = "file:///home/locad/Downloads/m2-res_480p_1.mp4"
+id     = "put-down"
+uri    = "file:///home/locad/Downloads/Put_Down_1.mov"
 volume = 0.15
 
 [[source]]
-id     = "nirnroot"
-uri    = "file:///home/locad/Downloads/nirnroot.mov"
+id     = "xiaoy-1080"
+uri    = "file:///home/locad/Downloads/XiaoYing_Video_1761375427042_1080HD.mp4"
 volume = 0.15
 
 [[source]]
-id     = "go3"
-uri    = "file:///home/locad/Downloads/go3.mp4"
+id     = "like-a-glove"
+uri    = "file:///home/locad/Downloads/Like-a-glove.mp4"
 volume = 0.15

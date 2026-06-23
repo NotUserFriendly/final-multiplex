@@ -1,3 +1,21 @@
+## Definition of done (run before every commit)
+A task is not done until ALL of these are true:
+- [ ] `cargo fmt --check` and `cargo check --workspace` pass
+- [ ] CHANGELOG.md has an entry under `[Unreleased]` if the change is user-visible or alters behavior
+- [ ] No Accepted ADR was edited (see Process rules)
+- [ ] New architectural decision? A new ADR was written, not an edit to an old one
+- [ ] Commit message states what changed and why
+
+## Process rules
+- **ADRs are immutable once `Status: Accepted`.** Never edit the body of an accepted ADR.
+  To change, reverse, or extend a decision, write a NEW ADR that supersedes it and set the
+  old one's status to `Superseded by ADR-XXXX`. The only edit permitted to an accepted ADR
+  is a one-line status change pointing at its successor.
+- **Implementation detail does not go in ADRs.** ADRs capture the decision and its rationale.
+  Code lives in code; what-changed lives in CHANGELOG.md. Link, don't duplicate.
+- When implementation teaches you something that changes a decision, that's a signal to write
+  a new ADR — not to quietly amend the old one.
+
 # Project memory — Final Multiplex
 
 > **Final Multiplex** composites arbitrary video/audio sources into a configurable

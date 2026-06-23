@@ -53,9 +53,13 @@ pub struct SourceConfig {
     pub volume: f64,
 }
 
-fn default_volume() -> f64 { 1.0 }
+fn default_volume() -> f64 {
+    1.0
+}
 
-pub fn load(path: &std::path::Path) -> Result<SceneConfig, Box<dyn std::error::Error + Send + Sync>> {
+pub fn load(
+    path: &std::path::Path,
+) -> Result<SceneConfig, Box<dyn std::error::Error + Send + Sync>> {
     let text = std::fs::read_to_string(path)?;
     Ok(toml::from_str(&text)?)
 }

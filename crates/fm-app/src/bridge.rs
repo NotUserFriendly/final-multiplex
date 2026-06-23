@@ -43,8 +43,7 @@ pub fn install(appsink: &gstreamer_app::AppSink, store: FrameStore) {
                 let stride = info.stride()[0] as usize;
                 let row_bytes = width as usize * 4; // RGBA = 4 bytes/pixel
 
-                let buffer =
-                    sample.buffer().ok_or(gstreamer::FlowError::Error)?;
+                let buffer = sample.buffer().ok_or(gstreamer::FlowError::Error)?;
                 let map = buffer
                     .map_readable()
                     .map_err(|_| gstreamer::FlowError::Error)?;
@@ -70,8 +69,7 @@ pub fn install(appsink: &gstreamer_app::AppSink, store: FrameStore) {
                 drop(map);
 
                 let mut guard = store.lock().unwrap();
-                let generation =
-                    guard.as_ref().map(|f| f.generation + 1).unwrap_or(1);
+                let generation = guard.as_ref().map(|f| f.generation + 1).unwrap_or(1);
                 *guard = Some(Arc::new(FrameData {
                     width: width as u32,
                     height: height as u32,
@@ -89,10 +87,7 @@ pub fn install(appsink: &gstreamer_app::AppSink, store: FrameStore) {
 /// Returns `None` when nothing has changed, keeping the caller's existing
 /// reference alive without any pixel data copy.
 /// `last_gen` is updated on every `Some` return.
-pub fn latest_frame(
-    store: &FrameStore,
-    last_gen: &mut u64,
-) -> Option<Arc<FrameData>> {
+pub fn latest_frame(store: &FrameStore, last_gen: &mut u64) -> Option<Arc<FrameData>> {
     let guard = store.lock().ok()?;
     let frame = guard.as_ref()?;
     if frame.generation == *last_gen {

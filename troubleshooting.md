@@ -41,34 +41,49 @@ unlinked sinks (as they do before pad-added fires for a failed source).
 
 ---
 
-## Attempt 4 — GstDiscoverer pre-probe (current code)
+## Attempt 4 — GstDiscoverer pre-probe, pads filtered but source still in pipeline
 **What:** Before building the pipeline, probe each source with GstDiscoverer
 (2s timeout, parallel threads). Only request compositor pad if has_video,
-only request audiomixer pad if has_audio. Corrupt files → no pads requested.
-No-audio files → comp_sink only.
-**Result:** Probe runs correctly (confirmed in log). Compositor pushes
-stream-start and caps (it's alive). But still "Waiting for first frame."
+only request audiomixer pad if has_audio. Corrupt files → no agg pads requested.
+No-audio files → comp_sink only. All elements (including uridecodebin) still
+added to the pipeline regardless of probe result.
+**Result:** Probe ran correctly (confirmed in log). Compositor pushed
+stream-start and caps (it's alive). Still "Waiting for first frame."
 4-good-sources still works with the same build. Mixed pipeline does not.
 **Learning:** The stall is not the aggregator waiting for a missing pad —
-those pads were never created. Something else in the mixed pipeline blocks
-the compositor from producing frames after it has pushed caps.
+those pads were never created. The corrupt uridecodebin is still in the
+pipeline and errors; this error during the async PAUSED→PLAYING state change
+prevents the pipeline from completing the transition and reaching PLAYING.
+Also: the no-audio source's idle audio chain (aconv→aresamp→acaps with
+unlinked sink and no output) was still in the pipeline unnecessarily.
 
 ---
 
-## What we know
-- 4 good sources: always works
-- Mixed (3 good + corrupt + no-audio, probe-filtered): stalls
-- The compositor has 3 correct pads and has pushed stream-start + caps
-- The audiomixer has 2 correct pads
-- The corrupt uridecodebin is still in the pipeline (but has no agg pads)
-- The no-audio uridecodebin emits a video pad (linked) but no audio pad
-- Pipeline does not appear to enter ERROR state (bus loop keeps running)
+## Attempt 5 — Skip source entirely from the pipeline when probe returns (false, false)
+**What:** If GstDiscoverer returns no video and no audio for a source, don't
+add any elements to the pipeline at all for that source — no uridecodebin,
+no conversion chains, nothing. For sources with only video (no audio), only
+add the video chain; don't add the audio chain. Added STATE_CHANGED bus
+logging and set_state return logging to confirm the pipeline reaches PLAYING.
+**Result:** Pipeline reached PLAYING state. Working sources played normally.
+Corrupt source tile showed compositor background (black). No stall.
+Confirmed with the mixed scene: rdt-apr, no-audio (johnny-bravo), and
+like-a-glove all played; corrupt slot was black.
+**Learning:** The root cause was the corrupt uridecodebin posting a bus ERROR
+during the pipeline's async state change, which blocked the PAUSED→PLAYING
+transition. Removing the element entirely from the pipeline eliminates the
+error event before it can interfere. Secondary issue: idle chains with
+unlinked sinks and no aggregator output were also removed for cleanliness,
+avoiding any NOT_LINKED flow errors propagating back through those chains.
 
 ---
 
-## Next diagnostic steps
-1. Remove corrupt source from scene entirely, test: no-audio + 2 good
-2. If still broken: remove no-audio too, test: 3 good sources
-3. Add STATE_CHANGED bus message logging to see if pipeline reaches PLAYING
-4. Consider: corrupt uridecodebin error may prevent pipeline from reaching
-   PLAYING (async preroll issue in bin state machine)
+## Resolution
+**Fix shipped in commit `6034435`.**
+
+The fix has one known gap: a source whose container headers are valid but
+whose encoded payload fails at runtime (e.g. valid MP4 container wrapping
+corrupt H.264 data) will still stall — GstDiscoverer sees the headers and
+returns `(true, true)`, so the source gets aggregator pads, but uridecodebin
+errors at decode time leaving a pad with no data. This case requires a
+runtime mechanism in the bus-error handler. Noted in PLAN.md Open Questions.

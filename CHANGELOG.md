@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 2 Steps 0–2: process boundary with a dummy adapter.
+  - ADR-0011: shm transport carries raw decoded frames (RGBA video + PCM audio).
+    Resolves the ADR-0005-deferred payload question. Raw = no decode in core, simple
+    adapter contract, higher boundary bandwidth — acceptable on the discrete-GPU target.
+    Encoded remains a future option behind a new ADR if bandwidth becomes the constraint.
+  - Per-source telemetry (ADR-0008) measured adapter-side, reported on the control
+    channel. No new ADR required — this is the ADR-0008 intended path.
+  - `fm-adapter-sdk`: contract module fleshed out with launch arg constants
+    (`contract::args`), boundary caps constants (`VIDEO_CAPS_TEMPLATE`, `AUDIO_CAPS`),
+    `Command` (core → adapter), `AdapterMessage` (adapter → core), and JSON
+    encode/decode helpers. Control channel is line-delimited JSON on stdin/stdout.
+  - `fm-core`: new `net_clock` module wraps `GstNetTimeProvider` (serves the pipeline
+    clock over localhost UDP on an OS-chosen port); new `supervisor` module spawns
+    adapter processes with the contract launch args, reads their stdout for
+    `AdapterMessage` on a per-adapter thread, and restarts dead processes with
+    exponential backoff (`[1, 2, 4, 8, 16, 30]` seconds).
+  - `fm-core/config`: `SourceConfig.uri` is now `Option<String>` (external sources
+    have no URI); new `source_type` field (`file` default, `external` for
+    out-of-process adapters); new optional `adapter` field (binary name/path).
+  - `fm-core/pipeline`: external sources get `shmsrc` elements (one for video, one
+    for audio) wired into the existing compositor/audiomixer chain in place of
+    `uridecodebin`. Pad-offset, mute, and metrics probes work identically to
+    in-core file sources — the Phase-1 compositor chain is unchanged (ADR-0004).
+  - `fm-app`: `Supervisor` is created after `transport.play()` (pipeline clock
+    available), adapters spawned once per external source, Play sent to all adapters
+    immediately. `Tick` polls the supervisor every ~500 ms. `TogglePlay` sends
+    Play/Pause to all adapters in sync with the pipeline state.
+  - `fm-dummy-adapter`: new binary crate. Produces `videotestsrc pattern=ball`
+    (RGBA) + `audiotestsrc` (S16LE 48 kHz stereo) to `shmsink` sockets at the
+    tile dimensions supplied by the supervisor. Slaves to the core's
+    `GstNetTimeProvider` via `GstNetClientClock`. Responds to `Play`/`Pause`/
+    `Shutdown` on stdin; emits `Ready` and `Metrics` on stdout.
+  - `scene-step2.toml`: test scene with 3 local-file sources + 1 external dummy
+    source in a 2×2 grid. Run with `final-multiplex scene-step2.toml`.
 - scene.toml round-trip persistence (ADR-0010): live offset changes are written
   back to the scene file so a tuned scene reproduces from its config on next
   launch. Writes use `toml_edit` for surgical, format-preserving edits —

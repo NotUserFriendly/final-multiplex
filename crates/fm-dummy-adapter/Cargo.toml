@@ -1,0 +1,16 @@
+[package]
+name        = "fm-dummy-adapter"
+description = "Test adapter (videotestsrc/audiotestsrc) for Phase 2 boundary validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fm-dummy-adapter"
+path = "src/main.rs"
+
+[dependencies]
+fm-adapter-sdk.workspace  = true
+gstreamer.workspace       = true
+gstreamer-net.workspace   = true
+serde_json.workspace      = true

@@ -1,4 +1,5 @@
-use crate::config::SceneConfig;
+use crate::config::{SceneConfig, SourceType};
+use crate::supervisor::Supervisor;
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 
@@ -44,11 +45,15 @@ pub struct SourcePads {
     pub audio_src: Option<gstreamer::Pad>,
 }
 
-/// The in-core GStreamer pipeline (Phase 1).
+/// The in-core GStreamer pipeline (Phase 1 + Phase 2).
 ///
-/// Topology per source (only chains for streams confirmed by probe):
+/// File source topology (Phase 1):
 ///   uridecodebin ─► videoconvert ─► deinterlace ─► videoscale ─► capsfilter(tile RGBA) ─► compositor
 ///                ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
+///
+/// External source topology (Phase 2, ADR-0005 / ADR-0011):
+///   shmsrc(video) ─► videoconvert ─► videoscale ─► capsfilter(tile RGBA) ─► compositor
+///   shmsrc(audio) ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
 ///
 /// compositor ─► capsfilter(output RGBA) ─► appsink  (→ UI bridge, ADR-0006)
 /// audiomixer ─► audioconvert ─► audioresample ─► autoaudiosink
@@ -75,12 +80,17 @@ impl Pipeline {
         //
         // A video-only source gets only the video chain; no idle audio chain is
         // left in the pipeline with an unlinked sink.
+        // External sources always have video + audio (the adapter contract
+        // guarantees it); only probe file sources.
         let stream_caps: Vec<(bool, bool)> = {
             let handles: Vec<_> = scene
                 .source
                 .iter()
                 .map(|s| {
-                    let uri = s.uri.clone();
+                    if s.source_type == SourceType::External {
+                        return std::thread::spawn(|| (true, true));
+                    }
+                    let uri = s.uri.clone().unwrap_or_default();
                     std::thread::spawn(move || probe_streams(&uri))
                 })
                 .collect();
@@ -281,41 +291,84 @@ impl Pipeline {
                 },
             );
 
-            // ── uridecodebin with dynamic pad wiring ───────────────────────
-            let uri: gstreamer::Element = gstreamer::ElementFactory::make("uridecodebin")
-                .name(format!("uri_{}", source.id))
-                .build()?;
-            uri.set_property("uri", &source.uri);
-            pipeline.add(&uri)?;
+            // ── Source elements (file vs external) ─────────────────────────
+            match source.source_type {
+                SourceType::File => {
+                    let uri_elem: gstreamer::Element =
+                        gstreamer::ElementFactory::make("uridecodebin")
+                            .name(format!("uri_{}", source.id))
+                            .build()?;
+                    uri_elem.set_property("uri", source.uri.as_deref().unwrap_or(""));
+                    pipeline.add(&uri_elem)?;
 
-            let id_for_cb = source.id.clone();
+                    let id_for_cb = source.id.clone();
+                    uri_elem.connect_pad_added(move |_src, pad| {
+                        let caps = match pad.current_caps() {
+                            Some(c) => c,
+                            None => pad.query_caps(None),
+                        };
+                        let Some(s) = caps.structure(0) else { return };
+                        let media = s.name();
 
-            uri.connect_pad_added(move |_src, pad| {
-                let caps = match pad.current_caps() {
-                    Some(c) => c,
-                    None => pad.query_caps(None),
-                };
-                let Some(s) = caps.structure(0) else { return };
-                let media = s.name();
-
-                if media.starts_with("video/") {
-                    if let Some(ref vconv_sink) = vconv_sink_for_cb {
-                        if !vconv_sink.is_linked() {
-                            if let Err(e) = pad.link(vconv_sink) {
-                                eprintln!("[fm-core] {id_for_cb}: video pad link failed: {e}");
+                        if media.starts_with("video/") {
+                            if let Some(ref vconv_sink) = vconv_sink_for_cb {
+                                if !vconv_sink.is_linked() {
+                                    if let Err(e) = pad.link(vconv_sink) {
+                                        eprintln!("[fm-core] {id_for_cb}: video link failed: {e}");
+                                    }
+                                }
+                            }
+                        } else if media.starts_with("audio/") {
+                            if let Some(ref aconv_sink) = aconv_sink_for_cb {
+                                if !aconv_sink.is_linked() {
+                                    if let Err(e) = pad.link(aconv_sink) {
+                                        eprintln!("[fm-core] {id_for_cb}: audio link failed: {e}");
+                                    }
+                                }
                             }
                         }
+                    });
+                }
+                SourceType::External => {
+                    // shmsrc elements — connect to the adapter's shmsink sockets.
+                    // The adapter must create its sockets before the pipeline goes
+                    // to PLAYING; shmsrc blocks in state-change until they appear
+                    // (up to its timeout property, default 10 s).
+                    let (video_sock, audio_sock) = Supervisor::shm_paths(&source.id);
+
+                    if has_video {
+                        let vshmsrc: gstreamer::Element = gstreamer::ElementFactory::make("shmsrc")
+                            .name(format!("vshmsrc_{}", source.id))
+                            .build()?;
+                        vshmsrc.set_property_from_str("socket-path", &video_sock);
+                        vshmsrc.set_property("is-live", true);
+                        vshmsrc.set_property("do-timestamp", false);
+                        pipeline.add(&vshmsrc)?;
+                        if let Some(ref vconv_sink) = vconv_sink_for_cb {
+                            vshmsrc
+                                .static_pad("src")
+                                .ok_or("vshmsrc: no src pad")?
+                                .link(vconv_sink)?;
+                        }
                     }
-                } else if media.starts_with("audio/") {
-                    if let Some(ref aconv_sink) = aconv_sink_for_cb {
-                        if !aconv_sink.is_linked() {
-                            if let Err(e) = pad.link(aconv_sink) {
-                                eprintln!("[fm-core] {id_for_cb}: audio pad link failed: {e}");
-                            }
+
+                    if has_audio {
+                        let ashmsrc: gstreamer::Element = gstreamer::ElementFactory::make("shmsrc")
+                            .name(format!("ashmsrc_{}", source.id))
+                            .build()?;
+                        ashmsrc.set_property_from_str("socket-path", &audio_sock);
+                        ashmsrc.set_property("is-live", true);
+                        ashmsrc.set_property("do-timestamp", false);
+                        pipeline.add(&ashmsrc)?;
+                        if let Some(ref aconv_sink) = aconv_sink_for_cb {
+                            ashmsrc
+                                .static_pad("src")
+                                .ok_or("ashmsrc: no src pad")?
+                                .link(aconv_sink)?;
                         }
                     }
                 }
-            });
+            }
         }
 
         Ok(Self {

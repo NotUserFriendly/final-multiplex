@@ -72,6 +72,10 @@ impl Transport {
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
+
+    pub fn pipeline_inner(&self) -> &gstreamer::Pipeline {
+        self.pipeline.inner()
+    }
 }
 
 /// Run the GStreamer bus message loop in a dedicated thread.

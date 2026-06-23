@@ -1,5 +1,17 @@
 use serde::Deserialize;
 
+/// How a source's media is delivered to the core.
+#[derive(Debug, Deserialize, Default, PartialEq, Eq, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceType {
+    /// In-process uridecodebin; Phase-1 path. Default.
+    #[default]
+    File,
+    /// Out-of-process adapter; Phase-2+ path. The core spawns `adapter` as a
+    /// subprocess, serves it the net clock, and reads frames from shmsrc.
+    External,
+}
+
 /// Top-level scene declaration, loaded from a TOML file (ADR-0007).
 ///
 /// Minimal example:
@@ -39,16 +51,21 @@ pub struct GridConfig {
 pub struct SourceConfig {
     /// Stable identifier used to address this source in transport/offset calls.
     pub id: String,
-    /// GStreamer-compatible URI (file://, rtsp://, etc.).
-    pub uri: String,
+    /// How this source's media reaches the core.
+    #[serde(default)]
+    pub source_type: SourceType,
+    /// GStreamer-compatible URI (file://, rtsp://, etc.). Required for `file` sources.
+    pub uri: Option<String>,
+    /// Path or name of the adapter binary. Required for `external` sources.
+    /// If just a name (e.g. `"fm-dummy-adapter"`), it must be on `$PATH` or
+    /// alongside the main binary.
+    pub adapter: Option<String>,
     /// Initial per-source pad offset in milliseconds (ADR-0004).
     #[serde(default)]
     pub offset_ms: i64,
     /// Linear volume applied to this source's audiomixer sink pad.
     /// 0.0 = silent, 1.0 = unity gain, >1.0 amplifies. Defaults to 1.0.
     /// Static: read once at pipeline build; not adjustable at runtime.
-    ///
-    /// Example: `volume = 0.5`
     #[serde(default = "default_volume")]
     pub volume: f64,
 }

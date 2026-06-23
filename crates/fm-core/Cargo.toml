@@ -12,6 +12,7 @@ gstreamer-app.workspace     = true
 gstreamer-audio.workspace   = true
 gstreamer-video.workspace   = true
 gstreamer-pbutils.workspace = true
+gstreamer-net.workspace     = true
 serde.workspace           = true
 toml.workspace            = true
 toml_edit.workspace       = true

@@ -3,6 +3,7 @@ members = [
     "crates/fm-adapter-sdk",
     "crates/fm-core",
     "crates/fm-app",
+    "crates/fm-dummy-adapter",
 ]
 resolver = "2"
 
@@ -18,10 +19,12 @@ gstreamer-app     = "0.25"
 gstreamer-audio   = "0.25"
 gstreamer-video   = "0.25"
 gstreamer-pbutils = "0.25"
+gstreamer-net     = "0.25"
 # UI
 iced             = { version = "0.14", features = ["image", "tokio"] }
 # Config / serialisation
 serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
 toml             = "1"
 toml_edit        = "0.25"
 # wgpu — explicit dep so video.rs can name its types directly
@@ -29,4 +32,5 @@ wgpu             = "27"
 # Internal crates
 fm-adapter-sdk   = { path = "crates/fm-adapter-sdk" }
 fm-core          = { path = "crates/fm-core" }
+fm-dummy-adapter = { path = "crates/fm-dummy-adapter" }
 

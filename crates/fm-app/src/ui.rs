@@ -23,6 +23,8 @@ struct SourceRow {
 pub struct App {
     transport: Option<fm_core::transport::Transport>,
     metrics: Option<fm_core::metrics::MetricsCollector>,
+    /// Out-of-process adapter supervisor (Phase 2). None if no external sources.
+    supervisor: Option<fm_core::supervisor::Supervisor>,
     frame_store: bridge::FrameStore,
     current_frame: Option<Arc<FrameData>>,
     frame_gen: u64,
@@ -38,6 +40,8 @@ pub struct App {
     config_persist: Option<fm_core::persist::ConfigPersist>,
     /// Set on every committed offset change; cleared after a 500 ms idle flush.
     last_offset_change: Option<Instant>,
+    /// Tick counter for supervisor polling (poll every ~500 ms at 60 Hz ticks).
+    tick_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -83,8 +87,10 @@ impl App {
                 win_w: 1280.0,
                 win_h: 720.0,
                 error: Some(e.to_string()),
+                supervisor: None,
                 config_persist: None,
                 last_offset_change: None,
+                tick_count: 0,
             },
         }
     }
@@ -92,6 +98,8 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                self.tick_count = self.tick_count.wrapping_add(1);
+
                 if let Some(frame) = bridge::latest_frame(&self.frame_store, &mut self.frame_gen) {
                     self.current_frame = Some(frame);
                 }
@@ -112,15 +120,27 @@ impl App {
                     }
                     self.last_offset_change = None;
                 }
+                // Poll adapter supervisor ~every 500 ms (every 30 ticks at 60 Hz).
+                if self.tick_count % 30 == 0 {
+                    if let Some(sup) = &mut self.supervisor {
+                        sup.poll();
+                    }
+                }
             }
 
             Message::TogglePlay => {
                 if let Some(t) = &self.transport {
                     if self.playing {
                         let _ = t.pause();
+                        if let Some(sup) = &mut self.supervisor {
+                            sup.send_pause_all();
+                        }
                         self.playing = false;
                     } else {
                         let _ = t.play();
+                        if let Some(sup) = &mut self.supervisor {
+                            sup.send_play_all();
+                        }
                         self.playing = true;
                     }
                 }
@@ -475,7 +495,7 @@ fn try_init(
                 .clamp(MIN_OFFSET_MS as i64, MAX_OFFSET_MS as i64) as i32,
             offset_buf: s.offset_ms.to_string(),
             muted: false,
-            display_name: uri_display_name(&s.uri),
+            display_name: uri_display_name(s.uri.as_deref().unwrap_or("")),
         })
         .collect();
 
@@ -490,12 +510,42 @@ fn try_init(
     let transport = fm_core::transport::Transport::new(pipeline);
     transport.play()?;
 
+    // ── Adapter supervisor (Phase 2) ─────────────────────────────────────
+    // Spawn out-of-process adapters for any external sources. Net clock is
+    // created after transport.play() so the pipeline clock is available.
+    let supervisor = if scene
+        .source
+        .iter()
+        .any(|s| s.source_type == fm_core::config::SourceType::External)
+    {
+        let net = fm_core::net_clock::NetClock::new(transport.pipeline_inner())?;
+        let mut sup = fm_core::supervisor::Supervisor::new();
+        let cols_u = scene.grid.columns.max(1).min(scene.source.len() as u32);
+        let rows_u = (scene.source.len() as u32 + cols_u - 1) / cols_u;
+        let tile_w = scene.grid.width / cols_u;
+        let tile_h = scene.grid.height / rows_u;
+        for s in &scene.source {
+            if s.source_type != fm_core::config::SourceType::External {
+                continue;
+            }
+            let binary = s.adapter.as_deref().unwrap_or("fm-dummy-adapter");
+            if let Err(e) = sup.spawn(binary, &s.id, &net, tile_w, tile_h, scene.grid.fps) {
+                eprintln!("[app] failed to spawn adapter for '{}': {e}", s.id);
+            }
+        }
+        sup.send_play_all();
+        Some(sup)
+    } else {
+        None
+    };
+
     let audio_store = metrics.audio_store();
     std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe, audio_store));
 
     Ok(App {
         transport: Some(transport),
         metrics: Some(metrics),
+        supervisor,
         frame_store,
         current_frame: None,
         frame_gen: 0,
@@ -510,5 +560,6 @@ fn try_init(
         error: None,
         config_persist,
         last_offset_change: None,
+        tick_count: 0,
     })
 }

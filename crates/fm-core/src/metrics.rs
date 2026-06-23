@@ -9,6 +9,8 @@ use std::time::Instant;
 pub struct AudioLevel {
     pub rms_db: f64,
     pub peak_db: f64,
+    /// When this entry was last written; used to detect stale data.
+    pub updated_at: Instant,
 }
 
 /// Shared store for audio levels; cloned into the bus loop thread.
@@ -163,8 +165,13 @@ impl MetricsCollector {
             .map(|c| (c.fps, c.dropped))
             .unwrap_or((0.0, 0));
 
+        // Floor the meter if no level message has arrived in the last 300 ms
+        // (3× the 100 ms default level interval).  This handles individual
+        // source EOS, pause, or error without depending on pipeline-level EOS.
+        let stale = std::time::Duration::from_millis(300);
         let (audio_rms_db, audio_peak_db) = audio
             .get(source_id)
+            .filter(|l| l.updated_at.elapsed() < stale)
             .map(|l| (l.rms_db, l.peak_db))
             .unwrap_or((DB_FLOOR, DB_FLOOR));
 

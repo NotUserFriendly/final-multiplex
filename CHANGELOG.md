@@ -61,10 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GST_TYPE_ARRAY`. The previous `get::<gstreamer::Array>()` call silently
   returned `Err` on every message, so `parse_level_array` always returned
   `DB_FLOOR` and no segments lit.
-- `transport`: audio level meters now return to floor when sources finish and
-  loop. On EOS the `level` element stops emitting messages, leaving the last
-  values frozen in the `AudioStore`. The EOS handler now clears the store after
-  the seek-to-zero so meters read silent during the loop-back gap.
+- `transport` / `metrics`: audio level meters now return to floor when a source
+  stops playing. `AudioLevel` entries are timestamped; `snapshot()` treats any
+  entry older than 300 ms (3× the 100 ms `level` interval) as stale and floors
+  the meter. This handles individual source EOS, sources of unequal length,
+  pause, and error without depending on pipeline-level EOS timing.
 - `video` / `ui`: resizing the window no longer stretches the video.
   The vertex shader now applies a per-frame letterbox/pillarbox scale
   uniform (written via `queue.write_buffer` every prepare call) so the

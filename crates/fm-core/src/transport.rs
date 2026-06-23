@@ -2,6 +2,7 @@ use crate::metrics::{AudioLevel, AudioStore};
 use crate::pipeline::Pipeline;
 use fm_adapter_sdk::metrics::DB_FLOOR;
 use gstreamer::prelude::*;
+use std::time::Instant;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -109,10 +110,14 @@ pub fn run_bus_loop(pipeline: gstreamer::Pipeline, audio_levels: AudioStore) {
                             if let Some(id) = name.strip_prefix("alevel_") {
                                 let rms_db = parse_level_array(s, "rms");
                                 let peak_db = parse_level_array(s, "peak");
-                                audio_levels
-                                    .lock()
-                                    .unwrap()
-                                    .insert(id.to_string(), AudioLevel { rms_db, peak_db });
+                                audio_levels.lock().unwrap().insert(
+                                    id.to_string(),
+                                    AudioLevel {
+                                        rms_db,
+                                        peak_db,
+                                        updated_at: Instant::now(),
+                                    },
+                                );
                             }
                         }
                     }

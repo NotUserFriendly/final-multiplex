@@ -136,13 +136,16 @@ impl App {
         // ── Per-source offset + metrics ───────────────────────────────────
         let mut sources_col = column![].spacing(6);
         for (i, (id, offset)) in self.offsets_ms.iter().enumerate() {
-            let metrics_line = self
+            let (metrics_line, peak_db) = self
                 .source_metrics
                 .get(i)
                 .map(|m| {
-                    format!(
-                        "in {:.1} fps  out {:.1} fps  dropped {}",
-                        m.fps_in, m.fps_out, m.dropped_frames
+                    (
+                        format!(
+                            "in {:.1} fps  out {:.1} fps  dropped {}",
+                            m.fps_in, m.fps_out, m.dropped_frames
+                        ),
+                        m.audio_peak_db,
                     )
                 })
                 .unwrap_or_default();
@@ -155,6 +158,7 @@ impl App {
                 })
                 .width(Length::Fixed(280.0)),
                 text(format!("{:+} ms", offset)).width(Length::Fixed(80.0)),
+                audio_meter(peak_db),
                 text(metrics_line),
             ]
             .spacing(8)
@@ -173,6 +177,43 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
     }
+}
+
+/// LED-style segmented audio level meter spanning DB_FLOOR → 0 dBFS.
+/// ~20 cells; green below -12 dB, yellow -12…-3 dB, red ≥ -3 dB.
+fn audio_meter(peak_db: f64) -> Element<'static, Message> {
+    const SEGMENTS: usize = 20;
+    const DB_LOW: f64 = -12.0;
+    const DB_CLIP: f64 = -3.0;
+    use fm_adapter_sdk::metrics::DB_FLOOR;
+
+    let cells: Vec<Element<'static, Message>> = (0..SEGMENTS)
+        .map(|i| {
+            let threshold = DB_FLOOR + (i + 1) as f64 * (-DB_FLOOR / SEGMENTS as f64);
+            let zone = if threshold >= DB_CLIP {
+                Color::from_rgb(0.8, 0.1, 0.1)
+            } else if threshold >= DB_LOW {
+                Color::from_rgb(0.8, 0.7, 0.0)
+            } else {
+                Color::from_rgb(0.1, 0.7, 0.1)
+            };
+            let color = if peak_db >= threshold {
+                zone
+            } else {
+                Color::from_rgb(0.1, 0.1, 0.1)
+            };
+            container(text(""))
+                .width(Length::Fixed(6.0))
+                .height(Length::Fixed(14.0))
+                .style(move |_: &iced::Theme| container::Style {
+                    background: Some(Background::Color(color)),
+                    ..Default::default()
+                })
+                .into()
+        })
+        .collect();
+
+    row(cells).spacing(1).into()
 }
 
 fn try_init(
@@ -201,7 +242,8 @@ fn try_init(
 
     let transport = fm_core::transport::Transport::new(pipeline);
     transport.play()?;
-    std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe));
+    let audio_store = metrics.audio_store();
+    std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe, audio_store));
 
     Ok(App {
         transport: Some(transport),

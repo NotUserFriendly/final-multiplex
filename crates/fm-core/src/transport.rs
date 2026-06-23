@@ -1,4 +1,6 @@
+use crate::metrics::{AudioLevel, AudioStore};
 use crate::pipeline::Pipeline;
+use fm_adapter_sdk::metrics::DB_FLOOR;
 use gstreamer::prelude::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -62,9 +64,11 @@ impl Transport {
 /// Run the GStreamer bus message loop in a dedicated thread.
 ///
 /// EOS causes a seek back to t=0 so local-file sources loop continuously.
+/// Parses `level` element messages and writes audio RMS/peak into `audio_levels`
+/// so `MetricsCollector::snapshot` can read them.
 /// The loop exits on a terminal error; otherwise it blocks until the pipeline
 /// transitions to NULL state.
-pub fn run_bus_loop(pipeline: gstreamer::Pipeline) {
+pub fn run_bus_loop(pipeline: gstreamer::Pipeline, audio_levels: AudioStore) {
     let bus = match pipeline.bus() {
         Some(b) => b,
         None => return,
@@ -94,7 +98,41 @@ pub fn run_bus_loop(pipeline: gstreamer::Pipeline) {
             MessageView::Warning(warn) => {
                 eprintln!("[fm-core] warning: {}", warn.error());
             }
+            MessageView::Element(elem) => {
+                if let Some(s) = elem.structure() {
+                    if s.name() == "level" {
+                        if let Some(src) = msg.src() {
+                            let name = src.name();
+                            if let Some(id) = name.strip_prefix("alevel_") {
+                                let rms_db = parse_level_array(s, "rms");
+                                let peak_db = parse_level_array(s, "peak");
+                                audio_levels
+                                    .lock()
+                                    .unwrap()
+                                    .insert(id.to_string(), AudioLevel { rms_db, peak_db });
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// Extract the max value across all channels from a GStreamer Array field in
+/// a level message structure. Floors at DB_FLOOR to handle -inf (silence).
+fn parse_level_array(s: &gstreamer::StructureRef, field: &str) -> f64 {
+    let raw = s
+        .get::<gstreamer::Array>(field)
+        .ok()
+        .and_then(|arr| {
+            arr.as_slice()
+                .iter()
+                .filter_map(|v| v.get::<f64>().ok())
+                .reduce(f64::max)
+        })
+        .unwrap_or(DB_FLOOR);
+    // -inf means silence; clamp to floor for display.
+    raw.max(DB_FLOOR)
 }

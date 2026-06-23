@@ -237,6 +237,10 @@ impl Pipeline {
                 let aresamp: gstreamer::Element = gstreamer::ElementFactory::make("audioresample")
                     .name(format!("aresamp_{}", source.id))
                     .build()?;
+                let alevel: gstreamer::Element = gstreamer::ElementFactory::make("level")
+                    .name(format!("alevel_{}", source.id))
+                    .build()?;
+                alevel.set_property("post-messages", true);
                 let acaps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
                     .name(format!("acaps_{}", source.id))
                     .build()?;
@@ -248,8 +252,8 @@ impl Pipeline {
                         .build(),
                 );
 
-                pipeline.add_many([&aconv, &aresamp, &acaps])?;
-                gstreamer::Element::link_many([&aconv, &aresamp, &acaps])?;
+                pipeline.add_many([&aconv, &aresamp, &alevel, &acaps])?;
+                gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
 
                 let mix_sink = audiomixer
                     .request_pad_simple("sink_%u")

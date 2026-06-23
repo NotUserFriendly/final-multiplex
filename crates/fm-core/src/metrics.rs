@@ -1,9 +1,18 @@
 use crate::pipeline::Pipeline;
-use fm_adapter_sdk::metrics::{IngestState, SourceMetrics};
+use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Per-source audio level snapshot written by the bus-loop `level` handler.
+pub struct AudioLevel {
+    pub rms_db: f64,
+    pub peak_db: f64,
+}
+
+/// Shared store for audio levels; cloned into the bus loop thread.
+pub type AudioStore = Arc<Mutex<HashMap<String, AudioLevel>>>;
 
 struct SourceCounter {
     frames_since_reset: u64,
@@ -66,9 +75,11 @@ impl OutputCounter {
 /// - `fps_out`: BUFFER probe on the appsink's sink pad (compositor output rate).
 /// - `dropped_frames`: incremented when a QoS event signals a drop on a
 ///   capsfilter source pad.
+/// - `audio_levels`: populated by the bus-loop thread from GStreamer `level` messages.
 pub struct MetricsCollector {
     per_source: Arc<Mutex<HashMap<String, SourceCounter>>>,
     output: Arc<Mutex<OutputCounter>>,
+    audio_levels: AudioStore,
 }
 
 impl MetricsCollector {
@@ -127,18 +138,35 @@ impl MetricsCollector {
             });
         }
 
-        Self { per_source, output }
+        let audio_levels: AudioStore = Arc::new(Mutex::new(HashMap::new()));
+
+        Self {
+            per_source,
+            output,
+            audio_levels,
+        }
+    }
+
+    /// Clone of the audio level store for the bus-loop thread.
+    pub fn audio_store(&self) -> AudioStore {
+        self.audio_levels.clone()
     }
 
     /// Snapshot always-on counters for one source (~1 Hz poll cadence).
     pub fn snapshot(&self, source_id: &str) -> SourceMetrics {
         let per = self.per_source.lock().unwrap();
         let out = self.output.lock().unwrap();
+        let audio = self.audio_levels.lock().unwrap();
 
         let (fps_in, dropped) = per
             .get(source_id)
             .map(|c| (c.fps, c.dropped))
             .unwrap_or((0.0, 0));
+
+        let (audio_rms_db, audio_peak_db) = audio
+            .get(source_id)
+            .map(|l| (l.rms_db, l.peak_db))
+            .unwrap_or((DB_FLOOR, DB_FLOOR));
 
         SourceMetrics {
             source_id: source_id.to_string(),
@@ -149,6 +177,8 @@ impl MetricsCollector {
             offset_vs_master_ms: 0,
             state: IngestState::Running,
             reconnect_count: 0,
+            audio_rms_db,
+            audio_peak_db,
         }
     }
 }

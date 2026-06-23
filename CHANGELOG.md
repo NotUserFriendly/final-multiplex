@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-source audio level meters in the UI. A GStreamer `level` element
+  (`alevel_{id}`, `post-messages=true`) is inserted into each source's audio
+  chain (`aconv → aresamp → level → acaps → audiomixer`). The bus loop parses
+  the per-channel RMS and peak arrays (max across channels) and stores them in a
+  shared `AudioStore`. `MetricsCollector::snapshot` exposes `audio_rms_db` and
+  `audio_peak_db` on `SourceMetrics` (floored to `DB_FLOOR = -60.0 dBFS` when
+  no data). Each source row in the UI shows a 20-segment LED-style meter driven
+  by `audio_peak_db`: green < −12 dB, yellow −12…−3 dB, red ≥ −3 dB.
 - Phase 1 in-core compositor: `Pipeline::build` wires N `uridecodebin` sources
   through `videoconvert`/`videoscale`/`audioconvert`/`audioresample` chains into
   GStreamer `compositor` + `audiomixer`; output goes to `appsink` (video) and

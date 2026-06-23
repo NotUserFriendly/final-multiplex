@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (linear scale: 0.0 silent, 1.0 unity, >1.0 amplifies). Applied to the
   `audiomixer` sink pad at pipeline build; omitting the field defaults to 1.0.
 
+### Validated
+- Phase 1 exit gate: 4-source 1920×1080 @ 30 fps scene sustained with
+  fps_out ≈ 30 (sub-frame jitter only) and dropped_frames near zero.
+  Confirms the `queue.write_texture` path does not bottleneck the compositor
+  output at 1080p (ADR-0006 risk item).
+
 ### Changed
 ### Deprecated
 ### Removed

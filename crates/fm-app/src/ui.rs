@@ -1,23 +1,23 @@
-use std::sync::Arc;
-use std::time::Duration;
-use iced::widget::{button, column, container, row, shader, slider, text};
-use iced::{Element, Length, Subscription, Task};
-use fm_adapter_sdk::metrics::SourceMetrics;
 use crate::bridge::{self, FrameData};
 use crate::video::VideoProg;
+use fm_adapter_sdk::metrics::SourceMetrics;
+use iced::widget::{button, column, container, row, shader, slider, text};
+use iced::{Background, Color, Element, Length, Subscription, Task};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct App {
-    transport:      Option<fm_core::transport::Transport>,
-    metrics:        Option<fm_core::metrics::MetricsCollector>,
-    frame_store:    bridge::FrameStore,
-    current_frame:  Option<Arc<FrameData>>,
-    frame_gen:      u64,
-    playing:        bool,
-    source_ids:     Vec<String>,
+    transport: Option<fm_core::transport::Transport>,
+    metrics: Option<fm_core::metrics::MetricsCollector>,
+    frame_store: bridge::FrameStore,
+    current_frame: Option<Arc<FrameData>>,
+    frame_gen: u64,
+    playing: bool,
+    source_ids: Vec<String>,
     /// (source_id, offset_ms) — matches scene order.
-    offsets_ms:     Vec<(String, i32)>,
+    offsets_ms: Vec<(String, i32)>,
     source_metrics: Vec<SourceMetrics>,
-    error:          Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,16 +33,16 @@ impl App {
         match try_init(config_path, frame_store.clone()) {
             Ok(state) => state,
             Err(e) => Self {
-                transport:      None,
-                metrics:        None,
+                transport: None,
+                metrics: None,
                 frame_store,
-                current_frame:  None,
-                frame_gen:      0,
-                playing:        false,
-                source_ids:     Vec::new(),
-                offsets_ms:     Vec::new(),
+                current_frame: None,
+                frame_gen: 0,
+                playing: false,
+                source_ids: Vec::new(),
+                offsets_ms: Vec::new(),
                 source_metrics: Vec::new(),
-                error:          Some(e.to_string()),
+                error: Some(e.to_string()),
             },
         }
     }
@@ -50,9 +50,7 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
-                if let Some(frame) =
-                    bridge::latest_frame(&self.frame_store, &mut self.frame_gen)
-                {
+                if let Some(frame) = bridge::latest_frame(&self.frame_store, &mut self.frame_gen) {
                     self.current_frame = Some(frame);
                 }
                 if let Some(metrics) = &self.metrics {
@@ -99,13 +97,27 @@ impl App {
         }
 
         // ── Video display — persistent wgpu texture, no Handle churn ──────
+        // The black container provides the letterbox/pillarbox bar colour;
+        // the shader scales the quad to maintain aspect ratio within its bounds.
+        let black_bg = |_: &iced::Theme| container::Style {
+            background: Some(Background::Color(Color::BLACK)),
+            ..Default::default()
+        };
         let video: Element<Message> = if self.current_frame.is_some() {
-            shader(VideoProg { frame: self.current_frame.clone() })
+            container(
+                shader(VideoProg {
+                    frame: self.current_frame.clone(),
+                })
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+                .height(Length::Fill),
+            )
+            .style(black_bg)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
         } else {
             container(text("Waiting for first frame…"))
+                .style(black_bg)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x(Length::Fill)
@@ -114,23 +126,34 @@ impl App {
         };
 
         // ── Transport controls ─────────────────────────────────────────────
-        let play_label = if self.playing { "⏸  Pause" } else { "▶  Play" };
+        let play_label = if self.playing {
+            "⏸  Pause"
+        } else {
+            "▶  Play"
+        };
         let transport_row = row![button(play_label).on_press(Message::TogglePlay)].spacing(8);
 
         // ── Per-source offset + metrics ───────────────────────────────────
         let mut sources_col = column![].spacing(6);
         for (i, (id, offset)) in self.offsets_ms.iter().enumerate() {
-            let metrics_line = self.source_metrics.get(i).map(|m| {
-                format!(
-                    "in {:.1} fps  out {:.1} fps  dropped {}",
-                    m.fps_in, m.fps_out, m.dropped_frames
-                )
-            }).unwrap_or_default();
+            let metrics_line = self
+                .source_metrics
+                .get(i)
+                .map(|m| {
+                    format!(
+                        "in {:.1} fps  out {:.1} fps  dropped {}",
+                        m.fps_in, m.fps_out, m.dropped_frames
+                    )
+                })
+                .unwrap_or_default();
 
             let row_widget = row![
                 text(format!("{id}")).width(Length::Fixed(100.0)),
-                slider(-5000..=5000, *offset, move |v| Message::SetOffset { index: i, ms: v })
-                    .width(Length::Fixed(280.0)),
+                slider(-5000..=5000, *offset, move |v| Message::SetOffset {
+                    index: i,
+                    ms: v
+                })
+                .width(Length::Fixed(280.0)),
                 text(format!("{:+} ms", offset)).width(Length::Fixed(80.0)),
                 text(metrics_line),
             ]
@@ -158,17 +181,21 @@ fn try_init(
 ) -> Result<App, Box<dyn std::error::Error + Send + Sync>> {
     let scene = fm_core::config::load(config_path)?;
 
-    let source_ids: Vec<String> =
-        scene.source.iter().map(|s| s.id.clone()).collect();
+    let source_ids: Vec<String> = scene.source.iter().map(|s| s.id.clone()).collect();
     let offsets_ms: Vec<(String, i32)> = scene
         .source
         .iter()
-        .map(|s| (s.id.clone(), s.offset_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32))
+        .map(|s| {
+            (
+                s.id.clone(),
+                s.offset_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            )
+        })
         .collect();
 
-    let pipeline  = fm_core::pipeline::Pipeline::build(&scene)?;
-    let metrics   = fm_core::metrics::MetricsCollector::attach(&pipeline);
-    let bus_pipe  = pipeline.inner().clone();
+    let pipeline = fm_core::pipeline::Pipeline::build(&scene)?;
+    let metrics = fm_core::metrics::MetricsCollector::attach(&pipeline);
+    let bus_pipe = pipeline.inner().clone();
 
     bridge::install(pipeline.appsink(), frame_store.clone());
 
@@ -177,15 +204,15 @@ fn try_init(
     std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe));
 
     Ok(App {
-        transport:      Some(transport),
-        metrics:        Some(metrics),
+        transport: Some(transport),
+        metrics: Some(metrics),
         frame_store,
-        current_frame:  None,
-        frame_gen:      0,
-        playing:        true,
+        current_frame: None,
+        frame_gen: 0,
+        playing: true,
         source_ids,
         offsets_ms,
         source_metrics: Vec::new(),
-        error:          None,
+        error: None,
     })
 }

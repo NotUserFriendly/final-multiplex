@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (linear scale: 0.0 silent, 1.0 unity, >1.0 amplifies). Applied to the
   `audiomixer` sink pad at pipeline build; omitting the field defaults to 1.0.
 
+### Fixed
+- `video` / `ui`: resizing the window no longer stretches the video.
+  The vertex shader now applies a per-frame letterbox/pillarbox scale
+  uniform (written via `queue.write_buffer` every prepare call) so the
+  composited output is always drawn at its native aspect ratio.  The
+  shader widget is wrapped in a black container so the bar areas are
+  filled rather than transparent.
+
 ### Validated
 - Phase 1 exit gate: 4-source 1920×1080 @ 30 fps scene sustained with
   fps_out ≈ 30 (sub-frame jitter only) and dropped_frames near zero.

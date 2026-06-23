@@ -4,7 +4,7 @@ use fm_adapter_sdk::metrics::SourceMetrics;
 use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MIN_OFFSET_MS: i32 = -60_000;
 const MAX_OFFSET_MS: i32 = 60_000;
@@ -35,6 +35,9 @@ pub struct App {
     win_w: f32,
     win_h: f32,
     error: Option<String>,
+    config_persist: Option<fm_core::persist::ConfigPersist>,
+    /// Set on every committed offset change; cleared after a 500 ms idle flush.
+    last_offset_change: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +83,8 @@ impl App {
                 win_w: 1280.0,
                 win_h: 720.0,
                 error: Some(e.to_string()),
+                config_persist: None,
+                last_offset_change: None,
             },
         }
     }
@@ -97,6 +102,16 @@ impl App {
                         .map(|s| metrics.snapshot(&s.id))
                         .collect();
                 }
+                // Debounced persist: flush 500 ms after the last committed offset change.
+                if self
+                    .last_offset_change
+                    .map_or(false, |t| t.elapsed() > Duration::from_millis(500))
+                {
+                    if let Some(p) = &mut self.config_persist {
+                        let _ = p.flush();
+                    }
+                    self.last_offset_change = None;
+                }
             }
 
             Message::TogglePlay => {
@@ -112,6 +127,7 @@ impl App {
             }
 
             Message::OffsetEdit { index, text } => {
+                let mut persist_change: Option<(String, i64)> = None;
                 if let Some(src) = self.sources.get_mut(index) {
                     src.offset_buf = text.clone();
                     if let Ok(ms) = text.trim().parse::<i32>() {
@@ -119,11 +135,19 @@ impl App {
                         if let Some(t) = &self.transport {
                             let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
                         }
+                        persist_change = Some((src.id.clone(), src.offset_ms as i64));
                     }
+                }
+                if let Some((id, ms)) = persist_change {
+                    if let Some(p) = &mut self.config_persist {
+                        p.set_source_offset(&id, ms);
+                    }
+                    self.last_offset_change = Some(Instant::now());
                 }
             }
 
             Message::OffsetStep { index, delta } => {
+                let mut persist_change: Option<(String, i64)> = None;
                 if let Some(src) = self.sources.get_mut(index) {
                     src.offset_ms = src
                         .offset_ms
@@ -133,6 +157,13 @@ impl App {
                     if let Some(t) = &self.transport {
                         let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
                     }
+                    persist_change = Some((src.id.clone(), src.offset_ms as i64));
+                }
+                if let Some((id, ms)) = persist_change {
+                    if let Some(p) = &mut self.config_persist {
+                        p.set_source_offset(&id, ms);
+                    }
+                    self.last_offset_change = Some(Instant::now());
                 }
             }
 
@@ -448,6 +479,8 @@ fn try_init(
         })
         .collect();
 
+    let config_persist = fm_core::persist::ConfigPersist::load(config_path).ok();
+
     let pipeline = fm_core::pipeline::Pipeline::build(&scene)?;
     let metrics = fm_core::metrics::MetricsCollector::attach(&pipeline);
     let bus_pipe = pipeline.inner().clone();
@@ -475,5 +508,7 @@ fn try_init(
         win_w: 1280.0,
         win_h: 720.0,
         error: None,
+        config_persist,
+        last_offset_change: None,
     })
 }

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- scene.toml round-trip persistence (ADR-0010): live offset changes are written
+  back to the scene file so a tuned scene reproduces from its config on next
+  launch. Writes use `toml_edit` for surgical, format-preserving edits —
+  comments, key ordering, and alignment are unchanged; only the affected value
+  is rewritten. Writes are debounced (500 ms idle after last change) so rapid
+  steppers do not thrash the file. Writes are atomic: temp file in the same
+  directory then renamed over the original, so an interrupted write cannot
+  corrupt the scene. `ConfigPersist::Drop` flushes any pending dirty state on
+  clean exit. `toml_edit` is surfaced as a direct `fm-core` dependency (it was
+  already present transitively via `toml`). Scope: `offset_ms`; structure is
+  "persist field X for source id Y" so volume drops in later without rework.
 - Per-tile overlay controls: all per-source controls (title, filename,
   offset steppers, level meter, mute, fps readout) now live in a semi-
   transparent overlay anchored to the bottom-left of each video tile.

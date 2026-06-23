@@ -8,6 +8,7 @@ fps     = 30
 id     = "rdt-apr"
 uri    = "file:///home/locad/Downloads/RDT_20260418_092704.mp4"
 volume = 0.15
+offset_ms = -1000
 
 [[source]]
 id     = "put-down"
@@ -18,6 +19,7 @@ volume = 0.15
 id     = "xiaoy-1080"
 uri    = "file:///home/locad/Downloads/XiaoYing_Video_1761375427042_1080HD.mp4"
 volume = 0.15
+offset_ms = -1000
 
 [[source]]
 id     = "like-a-glove"

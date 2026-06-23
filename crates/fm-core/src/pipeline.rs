@@ -56,6 +56,9 @@ pub struct Pipeline {
     inner: gstreamer::Pipeline,
     appsink: gstreamer_app::AppSink,
     source_pads: HashMap<String, SourcePads>,
+    /// `audiomixer` sink pad per source, keyed by source id.
+    /// Separate from the offset-carrying `audio_src` pads (ADR-0004).
+    mixer_sink_pads: HashMap<String, gstreamer::Pad>,
 }
 
 impl Pipeline {
@@ -159,6 +162,7 @@ impl Pipeline {
         let tile_h = (scene.grid.height / rows) as i32;
 
         let mut source_pads: HashMap<String, SourcePads> = HashMap::new();
+        let mut mixer_sink_pads: HashMap<String, gstreamer::Pad> = HashMap::new();
 
         for (idx, source) in scene.source.iter().enumerate() {
             let (has_video, has_audio) = stream_caps[idx];
@@ -263,6 +267,7 @@ impl Pipeline {
                 as_.set_offset(offset_ns);
                 as_.link(&mix_sink)?;
                 mix_sink.set_property("volume", source.volume);
+                mixer_sink_pads.insert(source.id.clone(), mix_sink);
 
                 aconv_sink_for_cb = Some(aconv.static_pad("sink").ok_or("aconv: no sink pad")?);
                 acaps_src = Some(as_);
@@ -317,6 +322,7 @@ impl Pipeline {
             inner: pipeline,
             appsink,
             source_pads,
+            mixer_sink_pads,
         })
     }
 
@@ -330,5 +336,9 @@ impl Pipeline {
 
     pub fn source_pads(&self) -> &HashMap<String, SourcePads> {
         &self.source_pads
+    }
+
+    pub fn mixer_sink_pads(&self) -> &HashMap<String, gstreamer::Pad> {
+        &self.mixer_sink_pads
     }
 }

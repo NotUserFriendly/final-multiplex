@@ -57,6 +57,15 @@ impl Transport {
         Ok(())
     }
 
+    /// Mute or unmute a source's audiomixer sink pad.
+    /// Independent of the configured volume; muting/unmuting does not alter it.
+    pub fn set_source_mute(&self, source_id: &str, muted: bool) -> Result<()> {
+        if let Some(pad) = self.pipeline.mixer_sink_pads().get(source_id) {
+            pad.set_property("mute", muted);
+        }
+        Ok(())
+    }
+
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }

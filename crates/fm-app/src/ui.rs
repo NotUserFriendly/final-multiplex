@@ -1,10 +1,23 @@
 use crate::bridge::{self, FrameData};
 use crate::video::VideoProg;
 use fm_adapter_sdk::metrics::SourceMetrics;
-use iced::widget::{button, column, container, row, shader, slider, text};
+use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
 use std::sync::Arc;
 use std::time::Duration;
+
+const MAX_OFFSET_MS: i32 = 60_000;
+const CHROME_H: f32 = 50.0;
+
+struct SourceRow {
+    id: String,
+    offset_ms: i32,
+    /// Live editing buffer; only committed to offset_ms on valid parse.
+    offset_buf: String,
+    muted: bool,
+    /// Truncated uri basename for display.
+    display_name: String,
+}
 
 pub struct App {
     transport: Option<fm_core::transport::Transport>,
@@ -13,10 +26,13 @@ pub struct App {
     current_frame: Option<Arc<FrameData>>,
     frame_gen: u64,
     playing: bool,
-    source_ids: Vec<String>,
-    /// (source_id, offset_ms) — matches scene order.
-    offsets_ms: Vec<(String, i32)>,
+    sources: Vec<SourceRow>,
     source_metrics: Vec<SourceMetrics>,
+    grid_cols: u32,
+    grid_rows: u32,
+    grid_ar: f32,
+    win_w: f32,
+    win_h: f32,
     error: Option<String>,
 }
 
@@ -24,7 +40,23 @@ pub struct App {
 pub enum Message {
     Tick,
     TogglePlay,
-    SetOffset { index: usize, ms: i32 },
+    /// Typed text in an offset box; commits on valid parse.
+    OffsetEdit {
+        index: usize,
+        text: String,
+    },
+    /// Stepper button: saturating add delta (ms), clamp to ±MAX_OFFSET_MS.
+    OffsetStep {
+        index: usize,
+        delta: i32,
+    },
+    ToggleMute {
+        index: usize,
+    },
+    Resized {
+        width: f32,
+        height: f32,
+    },
 }
 
 impl App {
@@ -39,9 +71,13 @@ impl App {
                 current_frame: None,
                 frame_gen: 0,
                 playing: false,
-                source_ids: Vec::new(),
-                offsets_ms: Vec::new(),
+                sources: Vec::new(),
                 source_metrics: Vec::new(),
+                grid_cols: 1,
+                grid_rows: 1,
+                grid_ar: 16.0 / 9.0,
+                win_w: 1280.0,
+                win_h: 720.0,
                 error: Some(e.to_string()),
             },
         }
@@ -55,9 +91,9 @@ impl App {
                 }
                 if let Some(metrics) = &self.metrics {
                     self.source_metrics = self
-                        .source_ids
+                        .sources
                         .iter()
-                        .map(|id| metrics.snapshot(id))
+                        .map(|s| metrics.snapshot(&s.id))
                         .collect();
                 }
             }
@@ -74,13 +110,43 @@ impl App {
                 }
             }
 
-            Message::SetOffset { index, ms } => {
-                if let Some((id, current)) = self.offsets_ms.get_mut(index) {
-                    *current = ms;
-                    if let Some(t) = &self.transport {
-                        let _ = t.set_source_offset(id, ms as i64);
+            Message::OffsetEdit { index, text } => {
+                if let Some(src) = self.sources.get_mut(index) {
+                    src.offset_buf = text.clone();
+                    if let Ok(ms) = text.trim().parse::<i32>() {
+                        src.offset_ms = ms.clamp(-MAX_OFFSET_MS, MAX_OFFSET_MS);
+                        if let Some(t) = &self.transport {
+                            let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
+                        }
                     }
                 }
+            }
+
+            Message::OffsetStep { index, delta } => {
+                if let Some(src) = self.sources.get_mut(index) {
+                    src.offset_ms = src
+                        .offset_ms
+                        .saturating_add(delta)
+                        .clamp(-MAX_OFFSET_MS, MAX_OFFSET_MS);
+                    src.offset_buf = src.offset_ms.to_string();
+                    if let Some(t) = &self.transport {
+                        let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
+                    }
+                }
+            }
+
+            Message::ToggleMute { index } => {
+                if let Some(src) = self.sources.get_mut(index) {
+                    src.muted = !src.muted;
+                    if let Some(t) = &self.transport {
+                        let _ = t.set_source_mute(&src.id, src.muted);
+                    }
+                }
+            }
+
+            Message::Resized { width, height } => {
+                self.win_w = width;
+                self.win_h = height;
             }
         }
         Task::none()
@@ -96,14 +162,19 @@ impl App {
                 .into();
         }
 
-        // ── Video display — persistent wgpu texture, no Handle churn ──────
-        // The black container provides the letterbox/pillarbox bar colour;
-        // the shader scales the quad to maintain aspect ratio within its bounds.
+        // ── Compute video display dimensions locked to output aspect ratio ──
+        // The container is black (letterbox/pillarbox bars); the video Stack
+        // inside is sized exactly to the grid AR so tile overlays align.
+        let avail_h = (self.win_h - CHROME_H).max(1.0);
+        let video_w = (avail_h * self.grid_ar).min(self.win_w);
+        let video_h = video_w / self.grid_ar;
+
+        // ── Layer 0: video shader ──────────────────────────────────────────
         let black_bg = |_: &iced::Theme| container::Style {
             background: Some(Background::Color(Color::BLACK)),
             ..Default::default()
         };
-        let video: Element<Message> = if self.current_frame.is_some() {
+        let video_layer: Element<Message> = if self.current_frame.is_some() {
             container(
                 shader(VideoProg {
                     frame: self.current_frame.clone(),
@@ -125,58 +196,167 @@ impl App {
                 .into()
         };
 
-        // ── Transport controls ─────────────────────────────────────────────
+        // ── Layer 1: per-tile overlay grid ─────────────────────────────────
+        let overlay_layer = self.tile_overlay_grid();
+
+        // Stack + centre in black surround
+        let video_area = container(
+            stack([video_layer, overlay_layer])
+                .width(Length::Fixed(video_w))
+                .height(Length::Fixed(video_h)),
+        )
+        .style(black_bg)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+
+        // ── Chrome: master Play/Pause only ─────────────────────────────────
         let play_label = if self.playing {
             "⏸  Pause"
         } else {
             "▶  Play"
         };
-        let transport_row = row![button(play_label).on_press(Message::TogglePlay)].spacing(8);
+        let chrome =
+            container(row![button(play_label).on_press(Message::TogglePlay)].spacing(8)).padding(8);
 
-        // ── Per-source offset + metrics ───────────────────────────────────
-        let mut sources_col = column![].spacing(6);
-        for (i, (id, offset)) in self.offsets_ms.iter().enumerate() {
-            let (metrics_line, peak_db) = self
-                .source_metrics
-                .get(i)
-                .map(|m| {
-                    (
-                        format!(
-                            "in {:.1} fps  out {:.1} fps  dropped {}",
-                            m.fps_in, m.fps_out, m.dropped_frames
-                        ),
-                        m.audio_peak_db,
-                    )
-                })
-                .unwrap_or_default();
-
-            let row_widget = row![
-                text(format!("{id}")).width(Length::Fixed(100.0)),
-                slider(-5000..=5000, *offset, move |v| Message::SetOffset {
-                    index: i,
-                    ms: v
-                })
-                .width(Length::Fixed(280.0)),
-                text(format!("{:+} ms", offset)).width(Length::Fixed(80.0)),
-                audio_meter(peak_db),
-                text(metrics_line),
-            ]
-            .spacing(8)
-            .align_y(iced::alignment::Vertical::Center);
-
-            sources_col = sources_col.push(row_widget);
-        }
-
-        column![
-            video,
-            container(column![transport_row, sources_col].spacing(8)).padding(10),
-        ]
-        .into()
+        column![video_area, chrome].into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
+            iced::event::listen_with(on_window_event),
+        ])
     }
+
+    // ── Tile overlay helpers ───────────────────────────────────────────────
+
+    fn tile_overlay_grid(&self) -> Element<'_, Message> {
+        let mut col_children: Vec<Element<'_, Message>> = Vec::new();
+
+        for row_idx in 0..self.grid_rows {
+            let mut row_children: Vec<Element<'_, Message>> = Vec::new();
+
+            for col_idx in 0..self.grid_cols {
+                let src_idx = (row_idx * self.grid_cols + col_idx) as usize;
+                let cell: Element<Message> = if src_idx < self.sources.len() {
+                    self.tile_overlay(src_idx)
+                } else {
+                    // Empty transparent cell to fill the grid.
+                    container(text(""))
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .into()
+                };
+                row_children.push(cell);
+            }
+
+            col_children.push(
+                row(row_children)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(1))
+                    .into(),
+            );
+        }
+
+        column(col_children)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn tile_overlay(&self, i: usize) -> Element<'_, Message> {
+        let src = &self.sources[i];
+        let (metrics_line, peak_db) = self
+            .source_metrics
+            .get(i)
+            .map(|m| {
+                (
+                    format!(
+                        "in {:.1} fps  out {:.1} fps  dropped {}",
+                        m.fps_in, m.fps_out, m.dropped_frames
+                    ),
+                    m.audio_peak_db,
+                )
+            })
+            .unwrap_or_default();
+
+        // Offset controls: [−1s] [−10ms] [ text box ] [+10ms] [+1s]
+        let offset_row = row![
+            button("−1s").on_press(Message::OffsetStep {
+                index: i,
+                delta: -1000
+            }),
+            button("−10").on_press(Message::OffsetStep {
+                index: i,
+                delta: -10
+            }),
+            text_input("0", &src.offset_buf)
+                .on_input(move |s| Message::OffsetEdit { index: i, text: s })
+                .width(Length::Fixed(60.0)),
+            button("+10").on_press(Message::OffsetStep {
+                index: i,
+                delta: 10
+            }),
+            button("+1s").on_press(Message::OffsetStep {
+                index: i,
+                delta: 1000
+            }),
+        ]
+        .spacing(3)
+        .align_y(iced::alignment::Vertical::Center);
+
+        // Level meter + mute toggle
+        let mute_label = if src.muted { "[M]" } else { "M" };
+        let meter_row = row![
+            audio_meter(peak_db),
+            button(mute_label).on_press(Message::ToggleMute { index: i }),
+        ]
+        .spacing(4)
+        .align_y(iced::alignment::Vertical::Center);
+
+        let control_box = column![
+            text(&src.id).size(13),
+            text(&src.display_name).size(10),
+            offset_row,
+            meter_row,
+            text(metrics_line).size(10),
+        ]
+        .spacing(3);
+
+        let dark_bg = |_: &iced::Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.7))),
+            ..Default::default()
+        };
+
+        // Transparent outer cell; dark control box anchored to bottom-left.
+        container(container(control_box).style(dark_bg).padding(6))
+            .width(Length::FillPortion(1))
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .into()
+    }
+}
+
+// ── Standalone helpers ────────────────────────────────────────────────────────
+
+/// Route window open/resize events to Message::Resized.
+fn on_window_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _id: iced::window::Id,
+) -> Option<Message> {
+    let size = match event {
+        iced::Event::Window(iced::window::Event::Resized(s)) => s,
+        iced::Event::Window(iced::window::Event::Opened { size: s, .. }) => s,
+        _ => return None,
+    };
+    Some(Message::Resized {
+        width: size.width,
+        height: size.height,
+    })
 }
 
 /// LED-style segmented audio level meter spanning DB_FLOOR → 0 dBFS.
@@ -216,21 +396,52 @@ fn audio_meter(peak_db: f64) -> Element<'static, Message> {
     row(cells).spacing(1).into()
 }
 
+/// Extract the display filename from a URI, truncated to preserve the extension.
+fn uri_display_name(uri: &str) -> String {
+    let raw = uri.split('/').last().unwrap_or(uri);
+    truncate_preserve_ext(raw, 24)
+}
+
+fn truncate_preserve_ext(name: &str, budget: usize) -> String {
+    if name.chars().count() <= budget {
+        return name.to_string();
+    }
+    if let Some(dot) = name.rfind('.') {
+        let ext = &name[dot..];
+        let stem = &name[..dot];
+        let ext_len = ext.chars().count();
+        let stem_budget = budget.saturating_sub(ext_len + 1);
+        if stem_budget == 0 {
+            return format!("…{ext}");
+        }
+        let truncated: String = stem.chars().take(stem_budget).collect();
+        format!("{truncated}…{ext}")
+    } else {
+        let truncated: String = name.chars().take(budget.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
 fn try_init(
     config_path: &std::path::Path,
     frame_store: bridge::FrameStore,
 ) -> Result<App, Box<dyn std::error::Error + Send + Sync>> {
     let scene = fm_core::config::load(config_path)?;
 
-    let source_ids: Vec<String> = scene.source.iter().map(|s| s.id.clone()).collect();
-    let offsets_ms: Vec<(String, i32)> = scene
+    let n = scene.source.len() as u32;
+    let cols = scene.grid.columns.max(1).min(n.max(1));
+    let rows = (n.max(1) + cols - 1) / cols;
+    let grid_ar = scene.grid.width as f32 / scene.grid.height as f32;
+
+    let sources: Vec<SourceRow> = scene
         .source
         .iter()
-        .map(|s| {
-            (
-                s.id.clone(),
-                s.offset_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-            )
+        .map(|s| SourceRow {
+            id: s.id.clone(),
+            offset_ms: s.offset_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            offset_buf: s.offset_ms.to_string(),
+            muted: false,
+            display_name: uri_display_name(&s.uri),
         })
         .collect();
 
@@ -252,9 +463,13 @@ fn try_init(
         current_frame: None,
         frame_gen: 0,
         playing: true,
-        source_ids,
-        offsets_ms,
+        sources,
         source_metrics: Vec::new(),
+        grid_cols: cols,
+        grid_rows: rows,
+        grid_ar,
+        win_w: 1280.0,
+        win_h: 720.0,
         error: None,
     })
 }

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-tile overlay controls: all per-source controls (title, filename,
+  offset steppers, level meter, mute, fps readout) now live in a semi-
+  transparent overlay anchored to the bottom-left of each video tile.
+  The video display region is locked to the output aspect ratio so overlay
+  cells align with compositor tiles without replicating letterbox math.
+  A `tile_rect` layout function computes tile positions from the grid config
+  and source index, structured so a future focus-mode layout swaps the
+  function without touching the overlay code.
+- Editable per-source offset: text box flanked by −10 ms / +10 ms and
+  −1 s / +1 s stepper buttons replace the sliders. The offset string
+  buffer is held separately from the committed i32 value; the box is only
+  overwritten when a stepper fires, not on every keystroke, so mid-edit
+  input is never clobbered. Range extended to ±60 000 ms; both text and
+  stepper paths clamp to this limit.
+- Per-source mute toggle: the audiomixer sink pad per source is stored at
+  pipeline build time; `Transport::set_source_mute` sets the pad's `mute`
+  property at runtime. The configured volume level is retained; mute and
+  volume are independent. A [M] / [M] toggle button appears beside each
+  level meter.
+- Window resize / open events are subscribed so the video display area
+  recomputes its dimensions on every resize.
 - Per-source audio level meters in the UI. A GStreamer `level` element
   (`alevel_{id}`, `post-messages=true`) is inserted into each source's audio
   chain (`aconv → aresamp → level → acaps → audiomixer`). The bus loop parses
@@ -55,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 ### Deprecated
 ### Removed
+- Per-source offset sliders replaced by editable text box + stepper buttons.
 ### Fixed
 - `transport`: audio level meters now light up correctly. The GStreamer `level`
   plugin posts peak/rms values as `G_TYPE_VALUE_ARRAY` (`GValueArray`), not

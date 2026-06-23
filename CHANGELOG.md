@@ -39,7 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-source static volume via `volume` field in `[[source]]` config blocks
   (linear scale: 0.0 silent, 1.0 unity, >1.0 amplifies). Applied to the
   `audiomixer` sink pad at pipeline build; omitting the field defaults to 1.0.
+- Phase 1 exit gate confirmed: 4-source 1920×1080 @ 30 fps scene sustained
+  fps_out ≈ 30 (sub-frame jitter only) and dropped_frames near zero,
+  confirming the `queue.write_texture` path does not bottleneck compositor
+  output at 1080p (ADR-0006 risk item).
 
+### Changed
+### Deprecated
+### Removed
 ### Fixed
 - `video` / `ui`: resizing the window no longer stretches the video.
   The vertex shader now applies a per-frame letterbox/pillarbox scale
@@ -47,17 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composited output is always drawn at its native aspect ratio.  The
   shader widget is wrapped in a black container so the bar areas are
   filled rather than transparent.
-
-### Validated
-- Phase 1 exit gate: 4-source 1920×1080 @ 30 fps scene sustained with
-  fps_out ≈ 30 (sub-frame jitter only) and dropped_frames near zero.
-  Confirms the `queue.write_texture` path does not bottleneck the compositor
-  output at 1080p (ADR-0006 risk item).
-
-### Changed
-### Deprecated
-### Removed
-### Fixed
 - `pipeline`: corrupt or unreadable sources (empty file, wrong format, network
   timeout) no longer stall the compositor. A `GstDiscoverer` pre-probe runs for
   each source before the pipeline is built; sources with no detectable streams

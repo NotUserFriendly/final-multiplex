@@ -481,6 +481,7 @@ impl Supervisor {
             entry.has_video = None;
             entry.has_audio = None;
             entry.is_reconnecting = false;
+            entry.last_frame_at = None;
             entry.last_any_msg_at = None;
             if attempt > 0 {
                 entry.restart_count += 1;

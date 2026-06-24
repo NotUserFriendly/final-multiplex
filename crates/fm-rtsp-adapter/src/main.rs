@@ -170,12 +170,14 @@ fn main() {
         video_chain: None,
         audio_chain: None,
         first_pad_at: None,
-        reconnect_count: 0,
         ready_sent: false,
         post_reconnect_check_at: None,
         last_reported_caps: None,
     }));
 
+    // Separate atomic so Metrics can read reconnect_count without holding `shared`,
+    // avoiding a deadlock if sync_state_with_parent blocks inside pad-added.
+    let reconnect_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let video_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // ── rtspsrc::pad-added → link to decodebin3 ───────────────────────────
@@ -338,12 +340,8 @@ fn main() {
                     let desc = format!("{} ({})", e.error(), e.debug().unwrap_or_default());
                     eprintln!("[rtsp-adapter] GStreamer error: {desc}");
 
-                    let (count, needs_exit) = {
-                        let mut s = shared.lock().unwrap();
-                        s.reconnect_count += 1;
-                        let count = s.reconnect_count;
-                        (count, count > MAX_RECONNECTS)
-                    };
+                    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    let needs_exit = count > MAX_RECONNECTS as u64;
 
                     if needs_exit {
                         emit(AdapterMessage::Error { description: desc });
@@ -352,9 +350,11 @@ fn main() {
                     }
 
                     // Notify core: source dropped, we are recovering (ADR-0013).
-                    emit(AdapterMessage::Reconnecting { attempt: count });
+                    emit(AdapterMessage::Reconnecting {
+                        attempt: count as u32,
+                    });
 
-                    let delay = reconnect_delay_secs(count);
+                    let delay = reconnect_delay_secs(count as u32);
                     eprintln!("[rtsp-adapter] reconnect #{count}/{MAX_RECONNECTS} in {delay}s");
                     std::thread::sleep(Duration::from_secs(delay));
 
@@ -372,12 +372,10 @@ fn main() {
                 MessageView::Eos(_) => {
                     eprintln!("[rtsp-adapter] EOS — restarting source");
 
-                    let count = {
-                        let mut s = shared.lock().unwrap();
-                        s.reconnect_count += 1;
-                        s.reconnect_count
-                    };
-                    emit(AdapterMessage::Reconnecting { attempt: count });
+                    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit(AdapterMessage::Reconnecting {
+                        attempt: count as u32,
+                    });
 
                     let _ = rtspsrc.set_state(gstreamer::State::Null);
                     let _ = decodebin.set_state(gstreamer::State::Null);
@@ -469,7 +467,7 @@ fn main() {
             let fps_in = current_frames.saturating_sub(prev_video_frames) as f64 / elapsed;
             prev_video_frames = current_frames;
 
-            let rc = shared.lock().unwrap().reconnect_count;
+            let rc = reconnect_count.load(Ordering::Relaxed) as u32;
             emit(AdapterMessage::Metrics(SourceMetrics {
                 source_id: source_id.clone(),
                 fps_in,
@@ -494,7 +492,6 @@ struct Shared {
     audio_chain: Option<Chain>,
     /// When the first decoded pad appeared; starts the startup stability timer.
     first_pad_at: Option<Instant>,
-    reconnect_count: u32,
     ready_sent: bool,
     /// Set when a partial restart completes; starts the post-reconnect stability
     /// window for StreamsChanged.  Reset by pad-added (extends window on new pads).

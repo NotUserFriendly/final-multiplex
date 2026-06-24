@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream set (video/audio presence) differs from what was last reported.
 
 ### Fixed
+- `fm-rtsp-adapter`: `reconnect_count` moved to a separate `AtomicU64` so the
+  1 Hz Metrics emit no longer needs the `shared` mutex.  Previously, if a
+  `sync_state_with_parent()` call inside `pad-added` stalled, the `shared`
+  mutex was held for the duration and Metrics could not emit — triggering the
+  silence watchdog spuriously at startup on sources with audio streams.
+- `fm-core/supervisor`: `do_spawn()` now resets `last_frame_at` to `None` on
+  every spawn.  Previously a stale frame timestamp from attempt N was
+  inherited by attempt N+1, causing the 120 s frame watchdog to fire on the
+  fresh process based on the prior process's last frame — an unnecessary
+  kill-restart cycle.
 - `fm-rtsp-adapter`: force TCP-only RTSP transport (`protocols = "tcp"`) — eliminates
   repeated `not-negotiated (-4)` errors from `rtspsrc`'s internal `udpsrc` elements that
   occurred when cameras required TCP but the adapter tried UDP first.

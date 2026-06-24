@@ -33,7 +33,9 @@ const HEALTHY_RUN_SECS: u64 = 60;
 const WATCHDOG_SECS: u64 = 120;
 /// Silence watchdog: kill if the adapter emits no message of any kind for this
 /// long.  Must exceed the ~1 Hz metrics cadence by a large margin.
-const SILENCE_TIMEOUT_SECS: u64 = 30;
+/// 60 s: generous enough to survive GStreamer startup state-machine timing and
+/// a single RTSP connect timeout (~30 s) without spurious fires.
+const SILENCE_TIMEOUT_SECS: u64 = 60;
 /// Wait this long for a graceful Shutdown response before force-killing.
 const TEARDOWN_WINDOW_SECS: u64 = 3;
 

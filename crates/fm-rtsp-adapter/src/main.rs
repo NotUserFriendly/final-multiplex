@@ -175,10 +175,15 @@ fn main() {
         last_reported_caps: None,
     }));
 
-    // Separate atomic so Metrics can read reconnect_count without holding `shared`,
-    // avoiding a deadlock if sync_state_with_parent blocks inside pad-added.
+    // Separate atomics so the main loop (Metrics, reconnect count) never
+    // needs `shared`, avoiding a block if sync_state_with_parent stalls
+    // inside a pad-added callback or reconnect thread.
     let reconnect_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let video_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // Prevents concurrent reconnect attempts when the pipeline generates
+    // multiple Error/EOS messages in quick succession.
+    let reconnecting: Arc<std::sync::atomic::AtomicBool> =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ── rtspsrc::pad-added → link to decodebin3 ───────────────────────────
     {
@@ -349,6 +354,15 @@ fn main() {
                         return;
                     }
 
+                    // If a reconnect thread is already running, skip — the
+                    // pipeline will emit more errors while rtspsrc is in NULL.
+                    if reconnecting
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
+
                     // Notify core: source dropped, we are recovering (ADR-0013).
                     emit(AdapterMessage::Reconnecting {
                         attempt: count as u32,
@@ -356,33 +370,53 @@ fn main() {
 
                     let delay = reconnect_delay_secs(count as u32);
                     eprintln!("[rtsp-adapter] reconnect #{count}/{MAX_RECONNECTS} in {delay}s");
-                    std::thread::sleep(Duration::from_secs(delay));
 
-                    // Partial restart: cycle only rtspsrc + decodebin3,
-                    // leaving the shmsink chains in PLAYING so their sockets
-                    // stay open and the core's shmsrc stays connected.
-                    let _ = rtspsrc.set_state(gstreamer::State::Null);
-                    let _ = decodebin.set_state(gstreamer::State::Null);
-                    let _ = decodebin.sync_state_with_parent();
-                    let _ = rtspsrc.sync_state_with_parent();
-
-                    // Start the post-reconnect stability window for StreamsChanged.
-                    shared.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
+                    // Partial restart in a background thread so the main loop
+                    // continues to emit Metrics.  rtspsrc.sync_state_with_parent()
+                    // can block for the full RTSP connect timeout when the
+                    // network is unreachable; running it off-thread prevents
+                    // the silence watchdog from firing during that window.
+                    let rtspsrc_c = rtspsrc.clone();
+                    let decodebin_c = decodebin.clone();
+                    let shared_c = Arc::clone(&shared);
+                    let reconnecting_c = Arc::clone(&reconnecting);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(delay));
+                        let _ = rtspsrc_c.set_state(gstreamer::State::Null);
+                        let _ = decodebin_c.set_state(gstreamer::State::Null);
+                        let _ = decodebin_c.sync_state_with_parent();
+                        let _ = rtspsrc_c.sync_state_with_parent();
+                        shared_c.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
+                        reconnecting_c.store(false, Ordering::Release);
+                    });
                 }
                 MessageView::Eos(_) => {
                     eprintln!("[rtsp-adapter] EOS — restarting source");
+
+                    if reconnecting
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
 
                     let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
                     emit(AdapterMessage::Reconnecting {
                         attempt: count as u32,
                     });
 
-                    let _ = rtspsrc.set_state(gstreamer::State::Null);
-                    let _ = decodebin.set_state(gstreamer::State::Null);
-                    let _ = decodebin.sync_state_with_parent();
-                    let _ = rtspsrc.sync_state_with_parent();
-
-                    shared.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
+                    let rtspsrc_c = rtspsrc.clone();
+                    let decodebin_c = decodebin.clone();
+                    let shared_c = Arc::clone(&shared);
+                    let reconnecting_c = Arc::clone(&reconnecting);
+                    std::thread::spawn(move || {
+                        let _ = rtspsrc_c.set_state(gstreamer::State::Null);
+                        let _ = decodebin_c.set_state(gstreamer::State::Null);
+                        let _ = decodebin_c.sync_state_with_parent();
+                        let _ = rtspsrc_c.sync_state_with_parent();
+                        shared_c.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
+                        reconnecting_c.store(false, Ordering::Release);
+                    });
                 }
                 MessageView::Warning(w) => {
                     eprintln!("[rtsp-adapter] WARNING: {}", w.error());
@@ -400,34 +434,36 @@ fn main() {
         }
 
         // ── Ready emission (once, at startup) ─────────────────────────────
-        {
+        // Release `shared` before calling emit() so the pad-added callback
+        // can continue building chains without being serialized behind the
+        // stdout write.  Capture all needed values first, then drop the lock.
+        let ready_to_emit: Option<(bool, bool)> = {
             let mut s = shared.lock().unwrap();
-            if !s.ready_sent {
+            if s.ready_sent {
+                None
+            } else {
                 let has_video = s.video_chain.is_some();
                 let has_audio = s.audio_chain.is_some();
                 let stability_ok = s.first_pad_at.map_or(false, |t| {
                     t.elapsed() >= Duration::from_secs(PAD_STABILITY_SECS)
                 });
                 let hard_deadline_passed = Instant::now() >= hard_deadline;
-
                 if stability_ok || hard_deadline_passed {
-                    eprintln!(
-                        "[rtsp-adapter] Ready (video={has_video} audio={has_audio}{})",
-                        if hard_deadline_passed && !stability_ok {
-                            " — hard deadline"
-                        } else {
-                            ""
-                        }
-                    );
-                    emit(AdapterMessage::Ready {
-                        has_video,
-                        has_audio,
-                        protocol_version: PROTOCOL_VERSION,
-                    });
                     s.ready_sent = true;
                     s.last_reported_caps = Some((has_video, has_audio));
+                    Some((has_video, has_audio))
+                } else {
+                    None
                 }
             }
+        }; // ← shared lock released here, before emit()
+        if let Some((has_video, has_audio)) = ready_to_emit {
+            eprintln!("[rtsp-adapter] Ready (video={has_video} audio={has_audio})");
+            emit(AdapterMessage::Ready {
+                has_video,
+                has_audio,
+                protocol_version: PROTOCOL_VERSION,
+            });
         }
 
         // ── Post-reconnect StreamsChanged check ───────────────────────────

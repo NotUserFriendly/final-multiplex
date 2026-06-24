@@ -34,11 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream set (video/audio presence) differs from what was last reported.
 
 ### Fixed
+- `fm-rtsp-adapter`: Ready emission no longer holds the `shared` mutex across the
+  `emit()` call.  Previously, `emit(Ready)` was called while `shared` was locked; if
+  a `pad-added` callback was concurrently building a chain (also holding `shared`),
+  the Ready block and all subsequent Metrics were blocked until pad-added finished —
+  triggering the silence watchdog spuriously at startup on sources with audio.
 - `fm-rtsp-adapter`: `reconnect_count` moved to a separate `AtomicU64` so the
   1 Hz Metrics emit no longer needs the `shared` mutex.  Previously, if a
   `sync_state_with_parent()` call inside `pad-added` stalled, the `shared`
   mutex was held for the duration and Metrics could not emit — triggering the
   silence watchdog spuriously at startup on sources with audio streams.
+- `fm-core/supervisor`: silence watchdog threshold raised from 30 s to 60 s.
+  30 s was too tight when the camera side takes ~20–25 s to deliver RTSP pads,
+  leaving only a 5–10 s margin for Metrics to start flowing.
 - `fm-core/supervisor`: `do_spawn()` now resets `last_frame_at` to `None` on
   every spawn.  Previously a stale frame timestamp from attempt N was
   inherited by attempt N+1, causing the 120 s frame watchdog to fire on the

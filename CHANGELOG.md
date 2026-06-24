@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream set (video/audio presence) differs from what was last reported.
 
 ### Fixed
+- `fm-rtsp-adapter`: `reconnect_count` is now incremented only after the
+  `reconnecting` CAS succeeds.  Previously the counter was incremented before
+  the `compare_exchange` gate, so the burst of ~5 GStreamer Error events that
+  `rtspsrc` emits while tearing down during a reconnect each counted as a
+  genuine reconnect attempt.  With `MAX_RECONNECTS = 8`, an adapter could hit
+  the limit after as few as two real connection drops (8 teardown-burst errors ≈
+  1–2 real reconnects).  The fix gates increment behind the CAS: skipped
+  teardown-burst errors never reach the counter.
 - `fm-core/supervisor`: frame watchdog now also fires when `has_video=true` but
   `last_frame_at` is `None` for `WATCHDOG_SECS`.  Previously, an adapter whose RTSP
   session was established while the camera was at connection capacity (no video

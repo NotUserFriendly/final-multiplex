@@ -345,22 +345,22 @@ fn main() {
                     let desc = format!("{} ({})", e.error(), e.debug().unwrap_or_default());
                     eprintln!("[rtsp-adapter] GStreamer error: {desc}");
 
-                    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    let needs_exit = count > MAX_RECONNECTS as u64;
-
-                    if needs_exit {
-                        emit(AdapterMessage::Error { description: desc });
-                        let _ = pipeline.set_state(gstreamer::State::Null);
-                        return;
-                    }
-
-                    // If a reconnect thread is already running, skip — the
-                    // pipeline will emit more errors while rtspsrc is in NULL.
+                    // Gate on the reconnecting flag BEFORE incrementing the counter.
+                    // rtspsrc generates a burst of errors during its NULL teardown;
+                    // those must not count toward MAX_RECONNECTS.
                     if reconnecting
                         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                         .is_err()
                     {
                         continue;
+                    }
+
+                    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count > MAX_RECONNECTS as u64 {
+                        reconnecting.store(false, Ordering::Release);
+                        emit(AdapterMessage::Error { description: desc });
+                        let _ = pipeline.set_state(gstreamer::State::Null);
+                        return;
                     }
 
                     // Notify core: source dropped, we are recovering (ADR-0013).

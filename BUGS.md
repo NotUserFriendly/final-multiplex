@@ -50,18 +50,6 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
       the error event, so fd references are invalid by the time we call set_state(Null).
       Fix direction: send a GST_EVENT_FLUSH_START/STOP before the NULL transition, or defer
       the element reset until the fd is confirmed closed. (2026-06-23)
-- [ ] [rtsp-adapter] Camera offline at startup leaves a permanently dead tile: if no
-      RTSP pads appear before the 30 s hard deadline, the adapter emits
-      `Ready { has_video: false, has_audio: false }` and the core builds the tile with no
-      shmsrc chains.  ADR-0013 implementation: the adapter now emits `StreamsChanged` after
-      a reconnect stability window when streams appear; the core calls `build_shmsrc_chain`
-      live.  **Pending Group F validation** before moving to Fixed. (2026-06-23)
-- [ ] [rtsp-adapter] Late audio pad excluded after stability window: the adapter emits
-      Ready 3 s after the first decoded pad.  If a camera's video pad appears at T=0 and
-      its audio pad at T>3 s, Ready fires with `has_audio: false` and the core never wires
-      an audio shmsrc for this session.  ADR-0013 implementation: `StreamsChanged` after a
-      reconnect will deliver the audio chain live; the original first-startup window is
-      unchanged.  **Partially addressed; pending Group F validation.** (2026-06-23)
 
 ---
 
@@ -79,3 +67,13 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
       decodebin3 only) recovered both video and audio without process death.  Validated
       by Group F Gate 2: iptables DROP → Reconnecting → iptables DELETE → full
       recovery (video + audio). (fixed 2026-06-24)
+- [x] [rtsp-adapter] Camera offline at startup leaves a permanently dead tile: adapter
+      emits `StreamsChanged { has_video, has_audio }` after each reconnect's stability
+      window when the stream set changes; core calls `build_shmsrc_chain` live on the
+      running pipeline.  Validated by Group F Gate 1: power-cycle camera → adapter
+      reconnects → `StreamsChanged {true, true}` → core adds chains → tile populates.
+      (fixed 2026-06-24)
+- [x] [rtsp-adapter] Late audio pad excluded after stability window: `StreamsChanged`
+      after a reconnect delivers the audio chain live even if audio arrived after the
+      Ready stability window.  Original first-startup window unchanged.  Validated as
+      part of Group F Gate 1 (StreamsChanged path confirmed working). (fixed 2026-06-24)

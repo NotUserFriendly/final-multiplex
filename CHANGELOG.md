@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 2 Steps 0–4 complete.
+  - Step 4: ADR-0012 — adapter SDK contract. Freezes the three wire surfaces
+    (launch args, stream caps, control channel) now that the boundary is proven.
+    Any language that can fork a process and do line-buffered JSON on stdin/stdout
+    can implement an adapter.
 - Phase 2 Steps 0–3: process boundary with crash isolation proven.
   - Step 3: crash isolation gate confirmed — killing the dummy adapter mid-play
     leaves the core running with all other sources unaffected.  The supervisor

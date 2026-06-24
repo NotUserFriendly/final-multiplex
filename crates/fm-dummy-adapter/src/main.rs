@@ -28,7 +28,8 @@ use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -124,6 +125,17 @@ fn main() {
         .unwrap();
     gstreamer::Element::link_many([&vsrc, &vconv, &vscale, &vcaps, &vshmsink]).unwrap();
 
+    // BUFFER probe on vcaps:src counts frames written toward shmsink.
+    // Step 6 boundary throughput counter (ADR-0008).
+    let frame_counter = Arc::new(AtomicU64::new(0));
+    if let Some(vcaps_src) = vcaps.static_pad("src") {
+        let fc = Arc::clone(&frame_counter);
+        vcaps_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+            fc.fetch_add(1, Ordering::Relaxed);
+            gstreamer::PadProbeReturn::Ok
+        });
+    }
+
     let asrc = make("audiotestsrc", "asrc");
     let aconv = make("audioconvert", "aconv");
     let aresamp = make("audioresample", "aresamp");
@@ -194,6 +206,7 @@ fn main() {
     let bus = pipeline.bus().unwrap();
     let mut last_metrics = Instant::now();
     let mut ingest_state = IngestState::Idle;
+    let mut prev_frames: u64 = 0;
 
     loop {
         // Process pending commands.
@@ -235,10 +248,16 @@ fn main() {
 
         // Emit metrics ~1 Hz.
         if last_metrics.elapsed() >= Duration::from_secs(1) {
+            let elapsed = last_metrics.elapsed().as_secs_f64();
             last_metrics = Instant::now();
+
+            let current = frame_counter.load(Ordering::Relaxed);
+            let fps_in = current.saturating_sub(prev_frames) as f64 / elapsed;
+            prev_frames = current;
+
             emit(AdapterMessage::Metrics(SourceMetrics {
                 source_id: source_id.clone(),
-                fps_in: 0.0,
+                fps_in,
                 fps_out: 0.0,
                 dropped_frames: 0,
                 offset_vs_master_ms: 0,

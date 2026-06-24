@@ -33,6 +33,7 @@ use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -140,6 +141,11 @@ fn main() {
         ready_sent: false,
     }));
 
+    // Frame counter incremented by a BUFFER pad probe on the vcaps:src pad
+    // (installed in build_video_chain).  Read by the metrics loop to compute
+    // fps_in — the boundary throughput number from ADR-0008 Step 6.
+    let video_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // ── rtspsrc::pad-added → link to decodebin3 ───────────────────────────
     {
         let decodebin_c = decodebin.clone();
@@ -163,6 +169,7 @@ fn main() {
         let shared_c = Arc::clone(&shared);
         let video_shm_c = video_shm.clone();
         let audio_shm_c = audio_shm.clone();
+        let video_frames_c = Arc::clone(&video_frames);
 
         decodebin.connect("pad-added", false, move |args| {
             let pad = args[1].get::<gstreamer::Pad>().unwrap();
@@ -189,7 +196,14 @@ fn main() {
                     }
                 } else {
                     // First time: build chain.
-                    match build_video_chain(&pipeline_c, &video_shm_c, prod_w, prod_h, fps) {
+                    match build_video_chain(
+                        &pipeline_c,
+                        &video_shm_c,
+                        prod_w,
+                        prod_h,
+                        fps,
+                        Arc::clone(&video_frames_c),
+                    ) {
                         Ok(chain) => {
                             if let Err(e) = pad.link(&chain.sink) {
                                 eprintln!("[rtsp-adapter] video link: {e}");
@@ -271,6 +285,7 @@ fn main() {
     let bus = pipeline.bus().unwrap();
     let mut ingest_state = IngestState::Running;
     let mut last_metrics = Instant::now();
+    let mut prev_video_frames: u64 = 0;
 
     // Max time to wait for ANY pad from RTSP before giving up and emitting Ready.
     let hard_deadline = Instant::now() + Duration::from_secs(30);
@@ -379,12 +394,20 @@ fn main() {
 
         // ── Metrics ~1 Hz ─────────────────────────────────────────────────
         if last_metrics.elapsed() >= Duration::from_secs(1) {
+            let elapsed = last_metrics.elapsed().as_secs_f64();
             last_metrics = Instant::now();
+
+            let current_frames = video_frames.load(Ordering::Relaxed);
+            let fps_in = current_frames.saturating_sub(prev_video_frames) as f64 / elapsed;
+            prev_video_frames = current_frames;
+
             let rc = shared.lock().unwrap().reconnect_count;
             emit(AdapterMessage::Metrics(SourceMetrics {
                 source_id: source_id.clone(),
-                fps_in: 0.0,
+                fps_in,
                 fps_out: 0.0,
+                // shmsink does not expose a drop counter; dropped_frames is
+                // deferred until a separate measurement mechanism is added.
                 dropped_frames: 0,
                 offset_vs_master_ms: 0,
                 state: ingest_state.clone(),
@@ -424,6 +447,7 @@ fn build_video_chain(
     prod_w: i32,
     prod_h: i32,
     fps: i32,
+    frame_counter: Arc<AtomicU64>,
 ) -> Result<Chain, Box<dyn std::error::Error + Send + Sync>> {
     let vconv = make("videoconvert", "vconv");
     let vdeint = make("deinterlace", "vdeint");
@@ -452,6 +476,15 @@ fn build_video_chain(
     // so state changes return NO_PREROLL and complete immediately).
     for elem in [&vconv, &vdeint, &vscale, &vcaps, &vshmsink] {
         let _ = elem.sync_state_with_parent();
+    }
+
+    // BUFFER probe on vcaps:src counts every frame written toward shmsink.
+    // This is the Step 6 boundary throughput counter (ADR-0008).
+    if let Some(vcaps_src) = vcaps.static_pad("src") {
+        vcaps_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+            frame_counter.fetch_add(1, Ordering::Relaxed);
+            gstreamer::PadProbeReturn::Ok
+        });
     }
 
     let sink = vconv.static_pad("sink").ok_or("vconv: no sink pad")?;

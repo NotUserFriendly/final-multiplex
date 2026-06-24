@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 2 Step 6 — boundary throughput metrics (ADR-0008 always-on tier):
+  - Both `fm-rtsp-adapter` and `fm-dummy-adapter` now install a GStreamer
+    `BUFFER` pad probe on the `vcaps:src` pad (output of the capsfilter, just
+    before `shmsink`).  Each passing buffer increments an `AtomicU64` counter.
+    The 1 Hz metrics loop computes `fps_in` from the counter delta, which is
+    the "buffers sent" rate across the shm boundary called for in Step 6.
+  - `fps_in` in `SourceMetrics` is now populated for both adapters.  The
+    supervisor's B7 frame-flow watchdog activates as soon as the first frame
+    is seen (`fps_in > 0`), then fires if no frames arrive for 120 s.
+  - `dropped_frames` remains 0 — GStreamer's `shmsink` does not expose a drop
+    counter via pads or properties.  Measuring true shmsink drops requires
+    comparing shmsink's `bytes-written` property against expected byte totals;
+    deferred until there is evidence of drops in practice.
+  - "Readback cost" (time from shm write to shm read on the core side) is also
+    deferred; it requires paired timestamps across the process boundary and will
+    be added in a later pass if shm vs. unixfd becomes a real question.
 - Phase 2 Step 5 — `fm-rtsp-adapter`: out-of-process adapter that streams one
   RTSP camera into the Final Multiplex compositor via shared memory.
   - Uses `rtspsrc → decodebin3` with dynamic pad-added callbacks so video and

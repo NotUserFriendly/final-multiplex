@@ -1,18 +1,16 @@
-//! fm-rtsp-adapter — RTSP source adapter for Final Multiplex (Phase 2 Step 5).
+//! fm-rtsp-adapter — RTSP source adapter for Final Multiplex (Phase 2 Step 5 / ADR-0013 / ADR-0014).
 //!
 //! Decodes an RTSP stream (H.264/H.265/MJPEG video + AAC/G.711 audio) into raw
 //! RGBA video and S16LE PCM audio delivered to shmsink sockets consumed by the
 //! core's shmsrc elements.  Slaved to the core's GstNetTimeProvider.
 //!
-//! Pipeline (built dynamically as RTSP PLAY causes decodebin3 to add pads):
-//!   rtspsrc → decodebin3 → {
-//!     video: videoconvert → deinterlace → videoscale → capsfilter(RGBA, prod_res) → shmsink
-//!     audio: audioconvert → audioresample → capsfilter(S16LE 48k 2ch) → shmsink
-//!   }
+//! Startup order (ADR-0014): wait for Configure on stdin → slave clock →
+//! open sockets → emit Ready.  The URI is never placed in argv.
 //!
-//! Reconnect: on GstMessageError the pipeline is cycled NULL → PLAYING.  Existing
-//! shmsink chains are reused so sockets stay open.  After MAX_RECONNECTS the adapter
-//! emits Error and exits; the supervisor restarts the process with backoff.
+//! Recovery (ADR-0013): on source drop, emits Reconnecting and performs
+//! in-process partial restart (rtspsrc + decodebin3 only); shmsink chains stay
+//! PLAYING so the core's shmsrc stays connected.  Emits StreamsChanged if the
+//! stream topology changes across a reconnect.
 //!
 //! Launch args:
 //!   --clock-addr   host:port   GstNetClientClock endpoint
@@ -23,7 +21,6 @@
 //!   --video-height px          production resolution height (ADR-0012)
 //!   --framerate    fps         frames per second
 //!   --base-time    ns          core pipeline base time in nanoseconds
-//!   --uri          rtsp://...  RTSP stream URL (required)
 //!
 //! stdin:  line-delimited JSON fm_adapter_sdk::contract::Command
 //! stdout: line-delimited JSON fm_adapter_sdk::contract::AdapterMessage
@@ -48,6 +45,41 @@ fn main() {
     let args = parse_args();
 
     gstreamer::init().expect("GStreamer init failed");
+
+    // ── Stdin command reader — started before Configure so the channel
+    // is ready when the core writes the first message.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Command>(&line) {
+                Ok(cmd) => {
+                    if cmd_tx.send(cmd).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => eprintln!("[rtsp-adapter] bad command: {e} ({line:?})"),
+            }
+        }
+    });
+
+    // ── Wait for Configure (ADR-0014): block until the core delivers the URI.
+    let uri = loop {
+        match cmd_rx.recv() {
+            Ok(Command::Configure { uri }) => break uri,
+            Ok(_) => {} // ignore Play/Pause/Shutdown before Configure
+            Err(_) => {
+                emit(AdapterMessage::Error {
+                    description: "stdin closed before Configure".to_string(),
+                });
+                return;
+            }
+        }
+    };
 
     // ── Net clock ─────────────────────────────────────────────────────────
     let clock_addr = args
@@ -74,23 +106,27 @@ fn main() {
         .get("source-id")
         .cloned()
         .unwrap_or_else(|| "rtsp".to_string());
-    let uri = match args.get("uri").filter(|u| !u.is_empty()).cloned() {
-        Some(u) => u,
-        None => {
-            let desc = "--uri not specified".to_string();
-            eprintln!("[rtsp-adapter] FATAL: {desc}");
-            emit(AdapterMessage::Error { description: desc });
-            std::process::exit(1);
-        }
-    };
+    // Never log the raw URI — use scrub_uri to mask credentials.
+    eprintln!(
+        "[rtsp-adapter] source={source_id} uri={} prod={}×{}@{}",
+        scrub_uri(&uri),
+        args.get("video-width")
+            .map(String::as_str)
+            .unwrap_or("1920"),
+        args.get("video-height")
+            .map(String::as_str)
+            .unwrap_or("1080"),
+        args.get("framerate").map(String::as_str).unwrap_or("30"),
+    );
+
     let video_shm = args
         .get("video-shm")
         .cloned()
-        .unwrap_or_else(|| format!("/tmp/fm-video-{source_id}.sock"));
+        .expect("--video-shm required");
     let audio_shm = args
         .get("audio-shm")
         .cloned()
-        .unwrap_or_else(|| format!("/tmp/fm-audio-{source_id}.sock"));
+        .expect("--audio-shm required");
     let prod_w: i32 = args
         .get("video-width")
         .and_then(|v| v.parse().ok())
@@ -107,8 +143,6 @@ fn main() {
         .get("base-time")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-
-    eprintln!("[rtsp-adapter] source={source_id} uri={uri} prod={prod_w}×{prod_h}@{fps}");
 
     // ── Pipeline ─────────────────────────────────────────────────────────
     let pipeline = gstreamer::Pipeline::new();
@@ -132,19 +166,16 @@ fn main() {
     }
 
     // ── Shared adapter state ──────────────────────────────────────────────
-    // Accessed from the GStreamer streaming thread (pad-added callbacks) and
-    // the main loop.
     let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared {
         video_chain: None,
         audio_chain: None,
         first_pad_at: None,
         reconnect_count: 0,
         ready_sent: false,
+        post_reconnect_check_at: None,
+        last_reported_caps: None,
     }));
 
-    // Frame counter incremented by a BUFFER pad probe on the vcaps:src pad
-    // (installed in build_video_chain).  Read by the metrics loop to compute
-    // fps_in — the boundary throughput number from ADR-0008 Step 6.
     let video_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // ── rtspsrc::pad-added → link to decodebin3 ───────────────────────────
@@ -182,6 +213,12 @@ fn main() {
 
             let mut s = shared_c.lock().unwrap();
 
+            // Reset the post-reconnect stability timer: a new pad means
+            // we should wait another PAD_STABILITY_SECS before checking.
+            if s.post_reconnect_check_at.is_some() {
+                s.post_reconnect_check_at = Some(Instant::now());
+            }
+
             if media.starts_with("video/") {
                 if let Some(ref chain) = s.video_chain {
                     // Reconnect: re-link existing chain.
@@ -196,7 +233,6 @@ fn main() {
                         }
                     }
                 } else {
-                    // First time: build chain.
                     match build_video_chain(
                         &pipeline_c,
                         &video_shm_c,
@@ -252,29 +288,7 @@ fn main() {
         });
     }
 
-    // ── Stdin command reader ──────────────────────────────────────────────
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
-    std::thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Command>(&line) {
-                Ok(cmd) => {
-                    if cmd_tx.send(cmd).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => eprintln!("[rtsp-adapter] bad command: {e} ({line:?})"),
-            }
-        }
-    });
-
     // ── Start pipeline ────────────────────────────────────────────────────
-    // Go straight to PLAYING — rtspsrc sends RTSP PLAY and data flows.
-    // Decoded pads appear shortly after via the pad-added callback above.
     if let Err(e) = pipeline.set_state(gstreamer::State::Playing) {
         let desc = format!("pipeline PLAYING failed: {e}");
         eprintln!("[rtsp-adapter] {desc}");
@@ -288,7 +302,6 @@ fn main() {
     let mut last_metrics = Instant::now();
     let mut prev_video_frames: u64 = 0;
 
-    // Max time to wait for ANY pad from RTSP before giving up and emitting Ready.
     let hard_deadline = Instant::now() + Duration::from_secs(30);
 
     // ── Main loop ─────────────────────────────────────────────────────────
@@ -296,6 +309,7 @@ fn main() {
         // ── Stdin commands ────────────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                Command::Configure { .. } => {} // already handled; ignore repeats
                 Command::Play => {
                     eprintln!("[rtsp-adapter] Play");
                     let _ = pipeline.set_state(gstreamer::State::Playing);
@@ -307,7 +321,9 @@ fn main() {
                     ingest_state = IngestState::Idle;
                 }
                 Command::Shutdown => {
-                    eprintln!("[rtsp-adapter] Shutdown — exiting");
+                    eprintln!("[rtsp-adapter] Shutdown — tearing down");
+                    // pipeline.set_state(Null) triggers rtspsrc to send
+                    // RTSP TEARDOWN before closing the connection.
                     let _ = pipeline.set_state(gstreamer::State::Null);
                     return;
                 }
@@ -335,6 +351,9 @@ fn main() {
                         return;
                     }
 
+                    // Notify core: source dropped, we are recovering (ADR-0013).
+                    emit(AdapterMessage::Reconnecting { attempt: count });
+
                     let delay = reconnect_delay_secs(count);
                     eprintln!("[rtsp-adapter] reconnect #{count}/{MAX_RECONNECTS} in {delay}s");
                     std::thread::sleep(Duration::from_secs(delay));
@@ -346,13 +365,26 @@ fn main() {
                     let _ = decodebin.set_state(gstreamer::State::Null);
                     let _ = decodebin.sync_state_with_parent();
                     let _ = rtspsrc.sync_state_with_parent();
+
+                    // Start the post-reconnect stability window for StreamsChanged.
+                    shared.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
                 }
                 MessageView::Eos(_) => {
                     eprintln!("[rtsp-adapter] EOS — restarting source");
+
+                    let count = {
+                        let mut s = shared.lock().unwrap();
+                        s.reconnect_count += 1;
+                        s.reconnect_count
+                    };
+                    emit(AdapterMessage::Reconnecting { attempt: count });
+
                     let _ = rtspsrc.set_state(gstreamer::State::Null);
                     let _ = decodebin.set_state(gstreamer::State::Null);
                     let _ = decodebin.sync_state_with_parent();
                     let _ = rtspsrc.sync_state_with_parent();
+
+                    shared.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
                 }
                 MessageView::Warning(w) => {
                     eprintln!("[rtsp-adapter] WARNING: {}", w.error());
@@ -369,7 +401,7 @@ fn main() {
             }
         }
 
-        // ── Ready emission ────────────────────────────────────────────────
+        // ── Ready emission (once, at startup) ─────────────────────────────
         {
             let mut s = shared.lock().unwrap();
             if !s.ready_sent {
@@ -395,6 +427,35 @@ fn main() {
                         protocol_version: PROTOCOL_VERSION,
                     });
                     s.ready_sent = true;
+                    s.last_reported_caps = Some((has_video, has_audio));
+                }
+            }
+        }
+
+        // ── Post-reconnect StreamsChanged check ───────────────────────────
+        {
+            let mut s = shared.lock().unwrap();
+            if s.ready_sent {
+                if let Some(reconnect_time) = s.post_reconnect_check_at {
+                    if reconnect_time.elapsed() >= Duration::from_secs(PAD_STABILITY_SECS) {
+                        // All expected pads should have arrived by now.
+                        let has_video =
+                            s.video_chain.as_ref().map_or(false, |c| c.sink.is_linked());
+                        let has_audio =
+                            s.audio_chain.as_ref().map_or(false, |c| c.sink.is_linked());
+                        let current = (has_video, has_audio);
+                        if Some(current) != s.last_reported_caps {
+                            eprintln!(
+                                "[rtsp-adapter] StreamsChanged (video={has_video} audio={has_audio})"
+                            );
+                            emit(AdapterMessage::StreamsChanged {
+                                has_video,
+                                has_audio,
+                            });
+                            s.last_reported_caps = Some(current);
+                        }
+                        s.post_reconnect_check_at = None;
+                    }
                 }
             }
         }
@@ -413,8 +474,6 @@ fn main() {
                 source_id: source_id.clone(),
                 fps_in,
                 fps_out: 0.0,
-                // shmsink does not expose a drop counter; dropped_frames is
-                // deferred until a separate measurement mechanism is added.
                 dropped_frames: 0,
                 offset_vs_master_ms: 0,
                 state: ingest_state.clone(),
@@ -433,10 +492,15 @@ fn main() {
 struct Shared {
     video_chain: Option<Chain>,
     audio_chain: Option<Chain>,
-    /// When the first decoded pad appeared; starts the stability timer.
+    /// When the first decoded pad appeared; starts the startup stability timer.
     first_pad_at: Option<Instant>,
     reconnect_count: u32,
     ready_sent: bool,
+    /// Set when a partial restart completes; starts the post-reconnect stability
+    /// window for StreamsChanged.  Reset by pad-added (extends window on new pads).
+    post_reconnect_check_at: Option<Instant>,
+    /// What was last reported to the core via Ready or StreamsChanged.
+    last_reported_caps: Option<(bool, bool)>,
 }
 
 struct Chain {
@@ -484,14 +548,11 @@ fn build_video_chain(
     pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
     gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
 
-    // Sync each element to the pipeline state (which is PLAYING — live source,
-    // so state changes return NO_PREROLL and complete immediately).
     for elem in [&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink] {
         let _ = elem.sync_state_with_parent();
     }
 
     // BUFFER probe on vcaps:src counts every frame written toward shmsink.
-    // This is the Step 6 boundary throughput counter (ADR-0008).
     if let Some(vcaps_src) = vcaps.static_pad("src") {
         vcaps_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
             frame_counter.fetch_add(1, Ordering::Relaxed);
@@ -545,6 +606,19 @@ fn build_audio_chain(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Mask credentials in a URI so it is safe to write to logs or stderr.
+/// `rtsp://user:pass@host/path` → `rtsp://<credentials>@host/path`
+fn scrub_uri(uri: &str) -> String {
+    if let Some(at_pos) = uri.find('@') {
+        if let Some(scheme_end) = uri.find("://") {
+            let scheme = &uri[..scheme_end + 3];
+            let rest = &uri[at_pos + 1..];
+            return format!("{scheme}<credentials>@{rest}");
+        }
+    }
+    uri.to_string()
+}
 
 fn reconnect_delay_secs(attempt: u32) -> u64 {
     const DELAYS: &[u64] = &[1, 2, 4, 8, 16, 30];

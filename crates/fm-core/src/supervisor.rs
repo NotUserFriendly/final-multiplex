@@ -1,4 +1,4 @@
-//! Adapter process supervisor (ADR-0005 / ADR-0012).
+//! Adapter process supervisor (ADR-0005 / ADR-0012 / ADR-0013 / ADR-0014).
 //!
 //! Spawns each out-of-process adapter, monitors it for death, and restarts it
 //! with exponential backoff.  Source-specific recovery (e.g. RTSP reconnect)
@@ -7,8 +7,16 @@
 //! Control channel: line-delimited JSON on the adapter's stdin/stdout.
 //!   core → adapter stdin:  fm_adapter_sdk::contract::Command
 //!   adapter stdout → core: fm_adapter_sdk::contract::AdapterMessage
+//!
+//! Recovery protocol (ADR-0013): while an adapter is in the Reconnecting state
+//! the frame-flow watchdog is suppressed; only total silence triggers a kill.
+//!
+//! Graceful stop (ADR-0013): all core-initiated kills send Shutdown first and
+//! wait TEARDOWN_WINDOW_SECS for the adapter to release its source (e.g. RTSP
+//! TEARDOWN) before force-killing.
 
 use crate::net_clock::NetClock;
+use crate::runtime;
 use fm_adapter_sdk::contract::{self, AdapterMessage, Command, PROTOCOL_VERSION};
 use fm_adapter_sdk::metrics::SourceMetrics;
 use std::collections::HashMap;
@@ -20,9 +28,14 @@ use std::time::{Duration, Instant};
 const BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
 /// Adapter must be alive this long before the backoff index resets.
 const HEALTHY_RUN_SECS: u64 = 60;
-/// Watchdog: restart if no frames arrive for this long while Running + playing.
-/// Generous to accommodate RTSP cold-start (which can be several minutes).
+/// Frame-flow watchdog: restart if no frames for this long while Running and
+/// not reconnecting.  Generous to cover RTSP cold-start (can be minutes).
 const WATCHDOG_SECS: u64 = 120;
+/// Silence watchdog: kill if the adapter emits no message of any kind for this
+/// long.  Must exceed the ~1 Hz metrics cadence by a large margin.
+const SILENCE_TIMEOUT_SECS: u64 = 30;
+/// Wait this long for a graceful Shutdown response before force-killing.
+const TEARDOWN_WINDOW_SECS: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterState {
@@ -43,8 +56,12 @@ pub struct AdapterStatus {
     pub has_video: Option<bool>,
     pub has_audio: Option<bool>,
     /// Last time `fps_in > 0` was seen in a Metrics message.
-    /// `None` until the first frame arrives.
     pub last_frame_at: Option<Instant>,
+    /// Set when the adapter emits Reconnecting; cleared on StreamsChanged or
+    /// when Metrics with fps_in > 0 arrives (recovery confirmed).
+    pub is_reconnecting: bool,
+    /// Updated on every message from the adapter (used by silence watchdog).
+    pub last_any_msg_at: Option<Instant>,
 }
 
 impl AdapterStatus {
@@ -56,6 +73,8 @@ impl AdapterStatus {
             has_video: None,
             has_audio: None,
             last_frame_at: None,
+            is_reconnecting: false,
+            last_any_msg_at: None,
         }
     }
 }
@@ -72,7 +91,8 @@ struct LaunchSpec {
     video_height: u32,
     framerate: u32,
     base_time_ns: u64,
-    /// Optional source URI forwarded as `--uri` (e.g. `rtsp://...`).
+    /// Source URI delivered to the adapter via Configure on stdin (ADR-0014).
+    /// Never passed as argv so credentials do not appear in process listings.
     uri: Option<String>,
 }
 
@@ -81,6 +101,9 @@ struct LiveHandle {
     /// Shared with the reader thread so it can auto-send Play on Ready.
     stdin: Arc<Mutex<std::process::ChildStdin>>,
     started_at: Instant,
+    /// Set when Shutdown has been sent; the process is in teardown.
+    /// None means the process is running normally.
+    shutdown_deadline: Option<Instant>,
 }
 
 struct PendingRestart {
@@ -97,6 +120,9 @@ pub struct Supervisor {
     /// Source IDs whose adapter just restarted and whose shmsrc elements in
     /// the core pipeline need to be reset.  Drained by `take_restarted()`.
     restarted: Arc<Mutex<Vec<String>>>,
+    /// Topology changes signalled by StreamsChanged messages.
+    /// Drained by `take_streams_changed()`.
+    streams_changed: Arc<Mutex<Vec<(String, bool, bool)>>>,
     /// Whether the supervisor is in the play state; new/restarted adapters
     /// that send Ready automatically receive Play when this is true.
     playing: Arc<Mutex<bool>>,
@@ -104,12 +130,17 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new() -> Self {
+        runtime::reap_orphans();
+        if let Err(e) = runtime::ensure_dirs() {
+            eprintln!("[supervisor] WARNING: could not create runtime dirs: {e}");
+        }
         Self {
             live: HashMap::new(),
             pending: HashMap::new(),
             specs: HashMap::new(),
             status: Arc::new(Mutex::new(HashMap::new())),
             restarted: Arc::new(Mutex::new(Vec::new())),
+            streams_changed: Arc::new(Mutex::new(Vec::new())),
             playing: Arc::new(Mutex::new(false)),
         }
     }
@@ -119,24 +150,25 @@ impl Supervisor {
         Arc::clone(&self.status)
     }
 
-    /// Drain and return source IDs that restarted since the last call.
+    /// Drain source IDs that restarted since the last call.
     /// The caller should reset the corresponding shmsrc pipeline elements.
     pub fn take_restarted(&self) -> Vec<String> {
         std::mem::take(&mut *self.restarted.lock().unwrap())
     }
 
+    /// Drain topology changes from StreamsChanged messages.
+    /// Each entry is `(source_id, has_video, has_audio)`.
+    /// The caller should call `Pipeline::build_shmsrc_chain` for each.
+    pub fn take_streams_changed(&self) -> Vec<(String, bool, bool)> {
+        std::mem::take(&mut *self.streams_changed.lock().unwrap())
+    }
+
     /// Canonical shm socket paths for a source id.
     pub fn shm_paths(source_id: &str) -> (String, String) {
-        (
-            format!("/tmp/fm-video-{source_id}.sock"),
-            format!("/tmp/fm-audio-{source_id}.sock"),
-        )
+        runtime::shm_paths(source_id)
     }
 
     /// Initial spawn for `source_id`. Call once at startup per external source.
-    /// `prod_w` / `prod_h` are the production resolution the adapter should
-    /// produce at (typically the full grid output resolution — ADR-0012).
-    /// `uri` is forwarded as `--uri` to adapters that use it (e.g. RTSP).
     pub fn spawn(
         &mut self,
         binary: &str,
@@ -147,7 +179,7 @@ impl Supervisor {
         fps: u32,
         uri: Option<&str>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (video_shm, audio_shm) = Self::shm_paths(source_id);
+        let (video_shm, audio_shm) = runtime::shm_paths(source_id);
         let spec = LaunchSpec {
             binary: binary.to_string(),
             source_id: source_id.to_string(),
@@ -167,24 +199,43 @@ impl Supervisor {
     /// Poll all live processes; restart any that have died or stalled.
     /// Call periodically (e.g. from the iced Tick handler, ~every 500 ms).
     pub fn poll(&mut self) {
-        // 1. Check live processes for death.
-        let mut died: Vec<(String, Duration)> = Vec::new();
+        let now = Instant::now();
+
+        // ── Phase 1: collect processes to reap ───────────────────────────────
+        // Includes both graceful teardowns-in-progress and unexpected deaths.
+        let mut to_reap: Vec<(String, Duration, bool)> = Vec::new(); // (id, ran_for, was_teardown)
+
         for (id, handle) in self.live.iter_mut() {
-            match handle.child.try_wait() {
-                Ok(Some(status)) => {
-                    let ran_for = handle.started_at.elapsed();
-                    eprintln!("[supervisor] '{id}' exited ({status})");
-                    died.push((id.clone(), ran_for));
+            if let Some(deadline) = handle.shutdown_deadline {
+                // Graceful teardown in progress.
+                match handle.child.try_wait() {
+                    Ok(Some(_)) => {
+                        to_reap.push((id.clone(), handle.started_at.elapsed(), true));
+                    }
+                    Ok(None) if now >= deadline => {
+                        eprintln!("[supervisor] '{id}': force-kill after teardown timeout");
+                        let _ = handle.child.kill();
+                        to_reap.push((id.clone(), handle.started_at.elapsed(), true));
+                    }
+                    _ => {}
                 }
-                Ok(None) => {}
-                Err(e) => eprintln!("[supervisor] '{id}' wait error: {e}"),
+            } else {
+                // Normal running process — check for unexpected death.
+                match handle.child.try_wait() {
+                    Ok(Some(status)) => {
+                        eprintln!("[supervisor] '{id}' exited ({status})");
+                        to_reap.push((id.clone(), handle.started_at.elapsed(), false));
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[supervisor] '{id}' wait error: {e}"),
+                }
             }
         }
-        for (id, ran_for) in died {
+
+        // ── Phase 2: process reaps → schedule restarts ────────────────────────
+        for (id, ran_for, _was_teardown) in to_reap {
             self.live.remove(&id);
 
-            // Reset backoff if the adapter ran healthily — don't penalise a
-            // source that had one bad moment after a long successful run.
             if ran_for >= Duration::from_secs(HEALTHY_RUN_SECS) {
                 eprintln!(
                     "[supervisor] '{id}' ran for {}s — resetting backoff",
@@ -208,6 +259,7 @@ impl Supervisor {
                 let mut s = self.status.lock().unwrap();
                 if let Some(a) = s.get_mut(&id) {
                     a.state = AdapterState::Restarting;
+                    a.is_reconnecting = false;
                 }
             }
             if let Some(spec) = self.specs.get(&id).cloned() {
@@ -216,43 +268,60 @@ impl Supervisor {
                     id,
                     PendingRestart {
                         spec,
-                        retry_at: Instant::now() + Duration::from_secs(delay),
+                        retry_at: now + Duration::from_secs(delay),
                         attempt,
                     },
                 );
             }
         }
 
-        // 2. Frame-flow watchdog: restart adapters that are alive but stalled.
+        // ── Phase 3: watchdogs (only on normally-running processes) ───────────
         if *self.playing.lock().unwrap() {
-            let mut stalled: Vec<String> = Vec::new();
+            let mut to_shutdown: Vec<String> = Vec::new();
             {
                 let s = self.status.lock().unwrap();
-                for (id, handle) in &mut self.live {
-                    let _ = handle; // keep borrow checker happy
-                    if let Some(status) = s.get(id) {
-                        if status.state == AdapterState::Running {
-                            // Only watchdog if we've seen at least one frame
-                            // (cold-start before first frame is not a stall).
-                            if let Some(last_frame) = status.last_frame_at {
-                                if last_frame.elapsed() > Duration::from_secs(WATCHDOG_SECS) {
-                                    stalled.push(id.clone());
-                                }
-                            }
+                for (id, handle) in &self.live {
+                    if handle.shutdown_deadline.is_some() {
+                        continue; // already in teardown
+                    }
+                    let Some(status) = s.get(id) else { continue };
+                    if status.state != AdapterState::Running {
+                        continue;
+                    }
+
+                    // Silence watchdog: kill if adapter emitted nothing at all.
+                    if let Some(last_msg) = status.last_any_msg_at {
+                        if last_msg.elapsed() > Duration::from_secs(SILENCE_TIMEOUT_SECS) {
+                            eprintln!(
+                                "[supervisor] '{id}' silence watchdog: no message for \
+                                 {SILENCE_TIMEOUT_SECS}s — initiating graceful shutdown"
+                            );
+                            to_shutdown.push(id.clone());
+                            continue;
+                        }
+                    }
+
+                    // Frame-flow watchdog: skip adapters that are recovering.
+                    if status.is_reconnecting {
+                        continue;
+                    }
+                    if let Some(last_frame) = status.last_frame_at {
+                        if last_frame.elapsed() > Duration::from_secs(WATCHDOG_SECS) {
+                            eprintln!(
+                                "[supervisor] '{id}' frame watchdog: no frames for \
+                                 {WATCHDOG_SECS}s — initiating graceful shutdown"
+                            );
+                            to_shutdown.push(id.clone());
                         }
                     }
                 }
             }
-            for id in stalled {
-                eprintln!("[supervisor] '{id}' watchdog: no frames for {WATCHDOG_SECS}s — killing");
-                if let Some(handle) = self.live.get_mut(&id) {
-                    let _ = handle.child.kill();
-                }
+            for id in to_shutdown {
+                self.graceful_shutdown_live(&id);
             }
         }
 
-        // 3. Fire any expired pending restarts.
-        let now = Instant::now();
+        // ── Phase 4: fire expired pending restarts ────────────────────────────
         let ready: Vec<String> = self
             .pending
             .iter()
@@ -280,10 +349,10 @@ impl Supervisor {
         self.broadcast(Command::Pause);
     }
 
-    /// Send Shutdown to every adapter and wait up to 2 s per process.
+    /// Send Shutdown to every adapter; wait up to TEARDOWN_WINDOW_SECS per process.
     pub fn shutdown_all(&mut self) {
         self.broadcast(Command::Shutdown);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(TEARDOWN_WINDOW_SECS);
         for (id, handle) in self.live.iter_mut() {
             loop {
                 match handle.child.try_wait() {
@@ -292,7 +361,7 @@ impl Supervisor {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     _ => {
-                        eprintln!("[supervisor] '{id}': kill after shutdown timeout");
+                        eprintln!("[supervisor] '{id}': force-kill after shutdown timeout");
                         let _ = handle.child.kill();
                         break;
                     }
@@ -301,9 +370,20 @@ impl Supervisor {
         }
         self.live.clear();
         self.pending.clear();
+        runtime::cleanup();
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
+
+    /// Send Shutdown to a live adapter and mark it for graceful teardown.
+    fn graceful_shutdown_live(&mut self, id: &str) {
+        if let Some(handle) = self.live.get_mut(id) {
+            let line = contract::encode_command(&Command::Shutdown);
+            let _ = handle.stdin.lock().unwrap().write_all(line.as_bytes());
+            handle.shutdown_deadline =
+                Some(Instant::now() + Duration::from_secs(TEARDOWN_WINDOW_SECS));
+        }
+    }
 
     fn do_spawn(
         &mut self,
@@ -319,7 +399,7 @@ impl Supervisor {
         let video_h = spec.video_height.to_string();
         let framerate = spec.framerate.to_string();
         let base_time = spec.base_time_ns.to_string();
-        let mut argv: Vec<&str> = vec![
+        let argv: Vec<&str> = vec![
             CLOCK_ADDR,
             &spec.clock_addr,
             VIDEO_SHM,
@@ -337,10 +417,6 @@ impl Supervisor {
             BASE_TIME,
             &base_time,
         ];
-        if let Some(ref u) = spec.uri {
-            argv.push(URI);
-            argv.push(u.as_str());
-        }
         let mut child = StdCommand::new(&spec.binary)
             .args(&argv)
             .stdin(Stdio::piped())
@@ -349,11 +425,26 @@ impl Supervisor {
             .spawn()?;
 
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin was piped")));
+
+        // Send Configure immediately so the adapter has the URI before it tries
+        // to connect to its source.  URI is never in argv (ADR-0014).
+        {
+            let uri = spec.uri.as_deref().unwrap_or("").to_string();
+            let line = contract::encode_command(&Command::Configure { uri });
+            if let Err(e) = stdin.lock().unwrap().write_all(line.as_bytes()) {
+                eprintln!(
+                    "[supervisor] '{}': Configure write failed: {e}",
+                    spec.source_id
+                );
+            }
+        }
+
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let source_id = spec.source_id.clone();
         let status = Arc::clone(&self.status);
         let restarted = Arc::clone(&self.restarted);
+        let streams_changed = Arc::clone(&self.streams_changed);
         let playing = Arc::clone(&self.playing);
         let stdin_for_reader = Arc::clone(&stdin);
         std::thread::spawn(move || {
@@ -369,6 +460,7 @@ impl Supervisor {
                         msg,
                         &status,
                         &restarted,
+                        &streams_changed,
                         &playing,
                         &stdin_for_reader,
                     ),
@@ -388,6 +480,8 @@ impl Supervisor {
             entry.state = AdapterState::Starting;
             entry.has_video = None;
             entry.has_audio = None;
+            entry.is_reconnecting = false;
+            entry.last_any_msg_at = None;
             if attempt > 0 {
                 entry.restart_count += 1;
             }
@@ -405,6 +499,7 @@ impl Supervisor {
                 child,
                 stdin,
                 started_at: Instant::now(),
+                shutdown_deadline: None,
             },
         );
         Ok(())
@@ -420,11 +515,13 @@ impl Supervisor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_msg(
     source_id: &str,
     msg: AdapterMessage,
     status: &Arc<Mutex<HashMap<String, AdapterStatus>>>,
     restarted: &Arc<Mutex<Vec<String>>>,
+    streams_changed: &Arc<Mutex<Vec<(String, bool, bool)>>>,
     playing: &Arc<Mutex<bool>>,
     stdin: &Arc<Mutex<std::process::ChildStdin>>,
 ) {
@@ -432,6 +529,9 @@ fn handle_msg(
     let entry = s
         .entry(source_id.to_string())
         .or_insert_with(AdapterStatus::new);
+
+    entry.last_any_msg_at = Some(Instant::now());
+
     match msg {
         AdapterMessage::Ready {
             has_video,
@@ -454,25 +554,53 @@ fn handle_msg(
             entry.state = AdapterState::Running;
             entry.has_video = Some(has_video);
             entry.has_audio = Some(has_audio);
+            entry.is_reconnecting = false;
 
-            // Auto-send Play if the pipeline is playing.
             if *playing.lock().unwrap() {
                 let line = contract::encode_command(&Command::Play);
                 if let Ok(mut w) = stdin.lock() {
                     let _ = w.write_all(line.as_bytes());
                 }
             }
-            // Signal shmsrc reset only on actual restarts, not initial startup.
             if is_restart {
                 restarted.lock().unwrap().push(source_id.to_string());
             }
         }
+
+        AdapterMessage::Reconnecting { attempt } => {
+            eprintln!("[supervisor] '{source_id}': Reconnecting (attempt {attempt})");
+            entry.is_reconnecting = true;
+            // Clear last_frame_at so the frame watchdog does not immediately
+            // fire if recovery takes longer than WATCHDOG_SECS.
+            entry.last_frame_at = None;
+        }
+
+        AdapterMessage::StreamsChanged {
+            has_video,
+            has_audio,
+        } => {
+            eprintln!(
+                "[supervisor] '{source_id}': StreamsChanged \
+                 (video={has_video} audio={has_audio})"
+            );
+            entry.is_reconnecting = false;
+            entry.has_video = Some(has_video);
+            entry.has_audio = Some(has_audio);
+            streams_changed
+                .lock()
+                .unwrap()
+                .push((source_id.to_string(), has_video, has_audio));
+        }
+
         AdapterMessage::Metrics(m) => {
             if m.fps_in > 0.0 {
                 entry.last_frame_at = Some(Instant::now());
+                // Frames flowing again means in-process recovery completed.
+                entry.is_reconnecting = false;
             }
             entry.latest_metrics = Some(m);
         }
+
         AdapterMessage::Error { description } => {
             eprintln!("[supervisor] '{source_id}': Error: {description}");
         }

@@ -6,6 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Adapter-owned recovery (ADR-0013):** adapters now signal in-process reconnects with
+  `Reconnecting { attempt }` so the supervisor's frame-flow watchdog does not kill an
+  adapter that is legitimately recovering.  Watchdog now kills only on total silence (no
+  message of any kind for 30 s) or an `Error` message, never on `fps == 0` alone.
+- **Live topology changes (ADR-0013):** new `StreamsChanged { has_video, has_audio }`
+  message lets adapters report mid-session stream-set changes (camera reconnects with
+  different codec, offline-at-startup source comes online).  Core builds or tears down
+  shmsrc chains on the running pipeline without restarting the process.
+- **Credential-safe URI delivery (ADR-0014):** source URIs (including credentials) are
+  now delivered to adapters via `Command::Configure { uri }` on stdin rather than `--uri`
+  argv — credentials no longer appear in `ps` output.  Both adapters wait for `Configure`
+  before connecting to their source.
+- **Runtime file isolation (ADR-0014):** all shmsink sockets now live under
+  `$XDG_RUNTIME_DIR/final-multiplex/{pid}/` (fallback: `/tmp/final-multiplex/{pid}/`)
+  with mode `0700`/`0600`.  Startup orphan-reaping removes dead prior-run directories.
+  Graceful exit removes the run directory.
+- **Graceful teardown on all core-initiated kills (ADR-0013):** watchdog and restart paths
+  now send `Shutdown` and wait up to 3 s for the adapter to release its source (RTSP
+  TEARDOWN) before force-killing.  Prevents orphaned camera sessions on the respawn path.
+- **Protocol version bump:** `PROTOCOL_VERSION` → 2 (wire format changed: new message
+  types, `--uri` flag removed from argv).
+- `fm-rtsp-adapter`: credential scrubbing — `user:pass@` is masked in all stderr log
+  lines; the raw URI never reaches log output.
+- `fm-rtsp-adapter`: emits `StreamsChanged` after each reconnect's stability window if the
+  stream set (video/audio presence) differs from what was last reported.
+
 ### Fixed
 - `fm-rtsp-adapter`: force TCP-only RTSP transport (`protocols = "tcp"`) — eliminates
   repeated `not-negotiated (-4)` errors from `rtspsrc`'s internal `udpsrc` elements that

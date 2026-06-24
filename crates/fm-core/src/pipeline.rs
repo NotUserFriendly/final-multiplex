@@ -1,5 +1,5 @@
 use crate::config::{SceneConfig, SourceType};
-use crate::supervisor::Supervisor;
+use crate::runtime;
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 
@@ -33,6 +33,13 @@ fn probe_streams(uri: &str) -> (bool, bool) {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
+    gstreamer::ElementFactory::make(factory)
+        .name(name)
+        .build()
+        .map_err(|e| format!("missing GStreamer element '{factory}': {e}").into())
+}
+
 /// Source-side pad references for a single source.
 ///
 /// `gst_pad_set_offset` only works reliably on **source** pads, so we store
@@ -45,6 +52,18 @@ pub struct SourcePads {
     /// `acaps_{id}:src` — the source pad feeding `audiomixer:sink_N`.
     /// None when the source has no audio stream.
     pub audio_src: Option<gstreamer::Pad>,
+}
+
+/// Tile position and offset for a single external source.
+/// Stored at build time so `build_shmsrc_chain` can add chains dynamically
+/// without access to the original SceneConfig.
+struct SourceLayout {
+    xpos: i32,
+    ypos: i32,
+    tile_w: i32,
+    tile_h: i32,
+    offset_ns: i64,
+    volume: f64,
 }
 
 /// The in-core GStreamer pipeline (Phase 1 + Phase 2).
@@ -69,6 +88,14 @@ pub struct Pipeline {
     /// `audiomixer` sink pad per source, keyed by source id.
     /// Separate from the offset-carrying `audio_src` pads (ADR-0004).
     mixer_sink_pads: HashMap<String, gstreamer::Pad>,
+    /// `compositor` sink pad per source — stored so we can release it on teardown.
+    comp_sink_pads: HashMap<String, gstreamer::Pad>,
+    /// Grid output resolution and framerate — needed when building chains dynamically.
+    grid_w: i32,
+    grid_h: i32,
+    grid_fps: i32,
+    /// Tile layout per external source — needed when building chains dynamically.
+    source_layouts: HashMap<String, SourceLayout>,
 }
 
 impl Pipeline {
@@ -181,9 +208,14 @@ impl Pipeline {
         let rows = (n + cols - 1) / cols;
         let tile_w = (scene.grid.width / cols) as i32;
         let tile_h = (scene.grid.height / rows) as i32;
+        let grid_w = scene.grid.width as i32;
+        let grid_h = scene.grid.height as i32;
+        let grid_fps = scene.grid.fps as i32;
 
         let mut source_pads: HashMap<String, SourcePads> = HashMap::new();
         let mut mixer_sink_pads: HashMap<String, gstreamer::Pad> = HashMap::new();
+        let mut comp_sink_pads: HashMap<String, gstreamer::Pad> = HashMap::new();
+        let mut source_layouts: HashMap<String, SourceLayout> = HashMap::new();
 
         for (idx, source) in scene.source.iter().enumerate() {
             let (has_video, has_audio) = stream_caps[idx];
@@ -199,6 +231,19 @@ impl Pipeline {
             let xpos = ((idx as u32 % cols) * tile_w as u32) as i32;
             let ypos = ((idx as u32 / cols) * tile_h as u32) as i32;
             let offset_ns = source.offset_ms * 1_000_000;
+
+            // Store layout for later dynamic chain builds.
+            source_layouts.insert(
+                source.id.clone(),
+                SourceLayout {
+                    xpos,
+                    ypos,
+                    tile_w,
+                    tile_h,
+                    offset_ns,
+                    volume: source.volume,
+                },
+            );
 
             // ── Video chain (only when probe confirmed video) ──────────────
             let mut vcaps_src: Option<gstreamer::Pad> = None;
@@ -247,6 +292,7 @@ impl Pipeline {
                 vs.set_offset(offset_ns);
                 vs.link(&comp_sink)?;
 
+                comp_sink_pads.insert(source.id.clone(), comp_sink);
                 vconv_sink_for_cb = Some(vconv.static_pad("sink").ok_or("vconv: no sink pad")?);
                 vcaps_src = Some(vs);
             }
@@ -345,7 +391,7 @@ impl Pipeline {
                     // Capsfilters after each shmsrc pin the expected caps so GStreamer
                     // doesn't have to guess during negotiation (the adapter contract
                     // guarantees these formats — ADR-0011).
-                    let (video_sock, audio_sock) = Supervisor::shm_paths(&source.id);
+                    let (video_sock, audio_sock) = runtime::shm_paths(&source.id);
 
                     if has_video {
                         let vshmsrc: gstreamer::Element = gstreamer::ElementFactory::make("shmsrc")
@@ -367,12 +413,9 @@ impl Pipeline {
                             "caps",
                             gstreamer::Caps::builder("video/x-raw")
                                 .field("format", "RGBA")
-                                .field("width", scene.grid.width as i32)
-                                .field("height", scene.grid.height as i32)
-                                .field(
-                                    "framerate",
-                                    gstreamer::Fraction::new(scene.grid.fps as i32, 1),
-                                )
+                                .field("width", grid_w)
+                                .field("height", grid_h)
+                                .field("framerate", gstreamer::Fraction::new(grid_fps, 1))
                                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                                 .build(),
                         );
@@ -445,6 +488,11 @@ impl Pipeline {
             appsink,
             source_pads,
             mixer_sink_pads,
+            comp_sink_pads,
+            grid_w,
+            grid_h,
+            grid_fps,
+            source_layouts,
         })
     }
 
@@ -477,5 +525,294 @@ impl Pipeline {
                 let _ = elem.sync_state_with_parent();
             }
         }
+    }
+
+    /// Apply a topology change from a StreamsChanged message (ADR-0013).
+    ///
+    /// Adds missing shmsrc chains and tears down chains that are no longer
+    /// present, live on a PLAYING pipeline.  This is the implementation risk
+    /// called out in ADR-0013 — if it stalls the compositor, stop and treat it
+    /// as a core problem to solve.
+    pub fn build_shmsrc_chain(&mut self, source_id: &str, has_video: bool, has_audio: bool) {
+        let current_has_video = self
+            .inner
+            .by_name(&format!("vshmsrc_{source_id}"))
+            .is_some();
+        let current_has_audio = self
+            .inner
+            .by_name(&format!("ashmsrc_{source_id}"))
+            .is_some();
+
+        if has_video && !current_has_video {
+            if let Err(e) = self.add_video_chain(source_id) {
+                eprintln!("[pipeline] add_video_chain '{source_id}': {e}");
+            }
+        } else if !has_video && current_has_video {
+            self.remove_video_chain(source_id);
+        }
+
+        if has_audio && !current_has_audio {
+            if let Err(e) = self.add_audio_chain(source_id) {
+                eprintln!("[pipeline] add_audio_chain '{source_id}': {e}");
+            }
+        } else if !has_audio && current_has_audio {
+            self.remove_audio_chain(source_id);
+        }
+    }
+
+    /// Remove all shmsrc chains for a source (full teardown for permanent removal).
+    pub fn teardown_shmsrc_chain(&mut self, source_id: &str) {
+        self.remove_video_chain(source_id);
+        self.remove_audio_chain(source_id);
+    }
+
+    // ── Dynamic chain builders / tearers ─────────────────────────────────────
+
+    fn add_video_chain(&mut self, source_id: &str) -> Result<()> {
+        let layout = self
+            .source_layouts
+            .get(source_id)
+            .ok_or_else(|| format!("no layout for '{source_id}'"))?;
+
+        let (video_sock, _) = runtime::shm_paths(source_id);
+
+        let vshmsrc = make("shmsrc", &format!("vshmsrc_{source_id}"))?;
+        vshmsrc.set_property_from_str("socket-path", &video_sock);
+        vshmsrc.set_property("is-live", true);
+        vshmsrc.set_property("do-timestamp", true);
+
+        let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
+        vshmcaps.set_property(
+            "caps",
+            gstreamer::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", self.grid_w)
+                .field("height", self.grid_h)
+                .field("framerate", gstreamer::Fraction::new(self.grid_fps, 1))
+                .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
+                .build(),
+        );
+
+        let vqueue = make("queue", &format!("vshm_q_{source_id}"))?;
+        vqueue.set_property("max-size-buffers", 2u32);
+        vqueue.set_property("max-size-bytes", 0u32);
+        vqueue.set_property("max-size-time", 0u64);
+        vqueue.set_property_from_str("leaky", "downstream");
+
+        let vconv = make("videoconvert", &format!("vconv_{source_id}"))?;
+        let vdeint = make("deinterlace", &format!("vdeint_{source_id}"))?;
+        let vscale = make("videoscale", &format!("vscale_{source_id}"))?;
+        let vcaps = make("capsfilter", &format!("vcaps_{source_id}"))?;
+        vcaps.set_property(
+            "caps",
+            &gstreamer::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", layout.tile_w)
+                .field("height", layout.tile_h)
+                .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
+                .build(),
+        );
+
+        self.inner.add_many([
+            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+        ])?;
+        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
+        gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps])?;
+        vqueue
+            .static_pad("src")
+            .ok_or("vshm_q: no src")?
+            .link(&vconv.static_pad("sink").ok_or("vconv: no sink")?)?;
+
+        let compositor = self
+            .inner
+            .by_name("compositor")
+            .ok_or("compositor not found")?;
+        let comp_sink = compositor
+            .request_pad_simple("sink_%u")
+            .ok_or("compositor: no sink pad")?;
+        comp_sink.set_property("xpos", layout.xpos);
+        comp_sink.set_property("ypos", layout.ypos);
+        comp_sink.set_property("width", layout.tile_w);
+        comp_sink.set_property("height", layout.tile_h);
+        comp_sink.set_property("repeat-after-eos", true);
+
+        let vcaps_src = vcaps.static_pad("src").ok_or("vcaps: no src")?;
+        vcaps_src.set_offset(layout.offset_ns);
+        vcaps_src.link(&comp_sink)?;
+
+        for elem in [
+            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+        ] {
+            let _ = elem.sync_state_with_parent();
+        }
+
+        eprintln!("[pipeline] added video chain for '{source_id}'");
+        self.comp_sink_pads.insert(source_id.to_string(), comp_sink);
+        self.source_pads
+            .entry(source_id.to_string())
+            .or_insert(SourcePads {
+                video_src: None,
+                audio_src: None,
+            })
+            .video_src = Some(vcaps_src);
+        Ok(())
+    }
+
+    fn remove_video_chain(&mut self, source_id: &str) {
+        // Set shmsrc to NULL first to stop the data flow.
+        if let Some(elem) = self.inner.by_name(&format!("vshmsrc_{source_id}")) {
+            let _ = elem.set_state(gstreamer::State::Null);
+        }
+
+        // Unlink and release compositor pad.
+        if let Some(comp_sink) = self.comp_sink_pads.remove(source_id) {
+            if let Some(sp) = self.source_pads.get(source_id) {
+                if let Some(ref vcaps_src) = sp.video_src {
+                    let _ = vcaps_src.unlink(&comp_sink);
+                }
+            }
+            if let Some(compositor) = self.inner.by_name("compositor") {
+                compositor.release_request_pad(&comp_sink);
+            }
+        }
+        if let Some(sp) = self.source_pads.get_mut(source_id) {
+            sp.video_src = None;
+        }
+
+        for name in [
+            format!("vshmsrc_{source_id}"),
+            format!("vshmcaps_{source_id}"),
+            format!("vshm_q_{source_id}"),
+            format!("vconv_{source_id}"),
+            format!("vdeint_{source_id}"),
+            format!("vscale_{source_id}"),
+            format!("vcaps_{source_id}"),
+        ] {
+            if let Some(elem) = self.inner.by_name(&name) {
+                let _ = elem.set_state(gstreamer::State::Null);
+                let _ = self.inner.remove(&elem);
+            }
+        }
+        eprintln!("[pipeline] removed video chain for '{source_id}'");
+    }
+
+    fn add_audio_chain(&mut self, source_id: &str) -> Result<()> {
+        let layout = self
+            .source_layouts
+            .get(source_id)
+            .ok_or_else(|| format!("no layout for '{source_id}'"))?;
+
+        let (_, audio_sock) = runtime::shm_paths(source_id);
+
+        let ashmsrc = make("shmsrc", &format!("ashmsrc_{source_id}"))?;
+        ashmsrc.set_property_from_str("socket-path", &audio_sock);
+        ashmsrc.set_property("is-live", true);
+        ashmsrc.set_property("do-timestamp", true);
+
+        let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
+        ashmcaps.set_property(
+            "caps",
+            gstreamer::Caps::builder("audio/x-raw")
+                .field("format", "S16LE")
+                .field("rate", 48_000i32)
+                .field("channels", 2i32)
+                .field("layout", "interleaved")
+                .build(),
+        );
+
+        let aqueue = make("queue", &format!("ashm_q_{source_id}"))?;
+        aqueue.set_property("max-size-buffers", 4u32);
+        aqueue.set_property("max-size-bytes", 0u32);
+        aqueue.set_property("max-size-time", 0u64);
+        aqueue.set_property_from_str("leaky", "downstream");
+
+        let aconv = make("audioconvert", &format!("aconv_{source_id}"))?;
+        let aresamp = make("audioresample", &format!("aresamp_{source_id}"))?;
+        let alevel = make("level", &format!("alevel_{source_id}"))?;
+        alevel.set_property("post-messages", true);
+        let acaps = make("capsfilter", &format!("acaps_{source_id}"))?;
+        acaps.set_property(
+            "caps",
+            &gstreamer::Caps::builder("audio/x-raw")
+                .field("rate", 48_000i32)
+                .field("channels", 2i32)
+                .build(),
+        );
+
+        self.inner.add_many([
+            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+        ])?;
+        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
+        gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
+        aqueue
+            .static_pad("src")
+            .ok_or("ashm_q: no src")?
+            .link(&aconv.static_pad("sink").ok_or("aconv: no sink")?)?;
+
+        let audiomixer = self
+            .inner
+            .by_name("audiomixer")
+            .ok_or("audiomixer not found")?;
+        let mix_sink = audiomixer
+            .request_pad_simple("sink_%u")
+            .ok_or("audiomixer: no sink pad")?;
+
+        let acaps_src = acaps.static_pad("src").ok_or("acaps: no src")?;
+        acaps_src.set_offset(layout.offset_ns);
+        acaps_src.link(&mix_sink)?;
+        mix_sink.set_property("volume", layout.volume);
+
+        for elem in [
+            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+        ] {
+            let _ = elem.sync_state_with_parent();
+        }
+
+        eprintln!("[pipeline] added audio chain for '{source_id}'");
+        self.mixer_sink_pads.insert(source_id.to_string(), mix_sink);
+        self.source_pads
+            .entry(source_id.to_string())
+            .or_insert(SourcePads {
+                video_src: None,
+                audio_src: None,
+            })
+            .audio_src = Some(acaps_src);
+        Ok(())
+    }
+
+    fn remove_audio_chain(&mut self, source_id: &str) {
+        if let Some(elem) = self.inner.by_name(&format!("ashmsrc_{source_id}")) {
+            let _ = elem.set_state(gstreamer::State::Null);
+        }
+
+        if let Some(mix_sink) = self.mixer_sink_pads.remove(source_id) {
+            if let Some(sp) = self.source_pads.get(source_id) {
+                if let Some(ref acaps_src) = sp.audio_src {
+                    let _ = acaps_src.unlink(&mix_sink);
+                }
+            }
+            if let Some(audiomixer) = self.inner.by_name("audiomixer") {
+                audiomixer.release_request_pad(&mix_sink);
+            }
+        }
+        if let Some(sp) = self.source_pads.get_mut(source_id) {
+            sp.audio_src = None;
+        }
+
+        for name in [
+            format!("ashmsrc_{source_id}"),
+            format!("ashmcaps_{source_id}"),
+            format!("ashm_q_{source_id}"),
+            format!("aconv_{source_id}"),
+            format!("aresamp_{source_id}"),
+            format!("alevel_{source_id}"),
+            format!("acaps_{source_id}"),
+        ] {
+            if let Some(elem) = self.inner.by_name(&name) {
+                let _ = elem.set_state(gstreamer::State::Null);
+                let _ = self.inner.remove(&elem);
+            }
+        }
+        eprintln!("[pipeline] removed audio chain for '{source_id}'");
     }
 }

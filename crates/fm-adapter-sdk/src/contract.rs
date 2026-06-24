@@ -1,9 +1,14 @@
-//! Adapter process contract for Final Multiplex (ADR-0012).
+//! Adapter process contract for Final Multiplex (ADR-0012 / ADR-0013 / ADR-0014).
 //!
 //! An adapter is a subprocess that:
-//!   1. Slaves to the core's GstNetTimeProvider via GstNetClientClock.
-//!   2. Produces raw decoded frames to two shmsink sockets (video + audio).
-//!   3. Exchanges line-delimited JSON with the core over stdin/stdout.
+//!   1. Waits for [`Command::Configure`] on stdin before connecting to its source.
+//!   2. Slaves to the core's GstNetTimeProvider via GstNetClientClock.
+//!   3. Produces raw decoded frames to two shmsink sockets (video + audio).
+//!   4. Exchanges line-delimited JSON with the core over stdin/stdout.
+//!
+//! Startup order (ADR-0014): spawn → receive Configure → slave clock →
+//! open sockets → emit Ready.  The adapter must not connect to its source
+//! before Configure arrives.
 //!
 //! Wire format: one JSON object per line, flushed immediately.
 //! Core writes [`Command`] lines to the adapter's stdin.
@@ -24,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump this when the wire format changes in a backward-incompatible way.
 /// The core rejects adapters that send a different version in [`AdapterMessage::Ready`].
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Launch argument names
@@ -32,12 +37,16 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Argv constants shared by the core supervisor and every adapter binary so
 /// the spelling is never out of sync.
+///
+/// The source URI is no longer an argv flag — it is delivered via
+/// [`Command::Configure`] over stdin so credentials never appear in the
+/// process listing (ADR-0014).
 pub mod args {
     /// GstNetClientClock endpoint: `"host:port"` (e.g. `"127.0.0.1:5637"`).
     pub const CLOCK_ADDR: &str = "--clock-addr";
-    /// shmsink socket path for the video stream (e.g. `/tmp/fm-video-cam0`).
+    /// shmsink socket path for the video stream.
     pub const VIDEO_SHM: &str = "--video-shm";
-    /// shmsink socket path for the audio stream (e.g. `/tmp/fm-audio-cam0`).
+    /// shmsink socket path for the audio stream.
     pub const AUDIO_SHM: &str = "--audio-shm";
     /// Source identifier string; echoed back in [`SourceMetrics::source_id`].
     pub const SOURCE_ID: &str = "--source-id";
@@ -51,9 +60,6 @@ pub mod args {
     /// Core pipeline base time in nanoseconds; lets the adapter align its
     /// GStreamer base time without a clock query round-trip.
     pub const BASE_TIME: &str = "--base-time";
-    /// Media source URI passed to adapters that accept one (e.g. RTSP, file).
-    /// Not all adapters use this; it is ignored if unrecognised.
-    pub const URI: &str = "--uri";
 }
 
 // ---------------------------------------------------------------------------
@@ -78,11 +84,17 @@ pub const AUDIO_CAPS: &str = "audio/x-raw,format=S16LE,rate=48000,channels=2,lay
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
+    /// Deliver the source URI to the adapter (ADR-0014).
+    ///
+    /// Sent immediately after spawn, before [`Play`].  The adapter must not
+    /// connect to its source until this is received.  Credentials in the URI
+    /// are never placed in argv; this is the only legitimate delivery path.
+    Configure { uri: String },
     /// Begin (or resume) producing frames.
     Play,
     /// Pause frame production; shm sockets remain open.
     Pause,
-    /// Flush and exit cleanly.
+    /// Flush and exit cleanly, releasing the source (e.g. RTSP TEARDOWN).
     Shutdown,
 }
 
@@ -104,6 +116,18 @@ pub enum AdapterMessage {
         has_audio: bool,
         protocol_version: u32,
     },
+    /// Source dropped; adapter is recovering in-process (ADR-0013).
+    ///
+    /// The core frame-watchdog must not kill an adapter in this state.
+    /// Recovery ends when [`StreamsChanged`] arrives (topology changed) or
+    /// when [`Metrics`] with `fps_in > 0` arrives (same topology, flowing again).
+    Reconnecting { attempt: u32 },
+    /// Stream topology changed mid-session (ADR-0013).
+    ///
+    /// The core adds or removes shmsrc chains live to match.  Sent after a
+    /// reconnect when `has_video`/`has_audio` differ from the last [`Ready`]
+    /// or previous `StreamsChanged`.
+    StreamsChanged { has_video: bool, has_audio: bool },
     /// Per-source telemetry, ~1 Hz cadence (ADR-0008).
     Metrics(SourceMetrics),
     /// Adapter hit an unrecoverable error and will exit.

@@ -78,6 +78,13 @@ impl Transport {
     pub fn restart_external_source(&self, source_id: &str) {
         self.pipeline.restart_shmsrc(source_id);
     }
+
+    /// Apply a topology change from the adapter's StreamsChanged message (ADR-0013).
+    /// Adds or removes shmsrc chains on the live pipeline to match `has_video`/`has_audio`.
+    pub fn apply_streams_changed(&mut self, source_id: &str, has_video: bool, has_audio: bool) {
+        self.pipeline
+            .build_shmsrc_chain(source_id, has_video, has_audio);
+    }
 }
 
 /// Run the GStreamer bus message loop in a dedicated thread.

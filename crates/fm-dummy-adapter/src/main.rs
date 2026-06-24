@@ -1,4 +1,4 @@
-//! fm-dummy-adapter — Phase 2 test adapter (ADR-0005 / ADR-0011 / ADR-0012).
+//! fm-dummy-adapter — Phase 2 test adapter (ADR-0005 / ADR-0011 / ADR-0012 / ADR-0014).
 //!
 //! Normal mode: produces a moving videotestsrc ball + audiotestsrc sine wave,
 //! slaved to the core's GstNetTimeProvider, and writes raw frames to shmsink
@@ -8,6 +8,9 @@
 //! emits Ready but keeps the pipeline in PAUSED — no frames ever enter the shm
 //! ring buffer.  Used to confirm the core compositor does not stall when a live
 //! shmsrc receives no data.
+//!
+//! Startup order (ADR-0014): wait for Configure on stdin → slave clock →
+//! open sockets → emit Ready.  The URI in Configure is accepted but ignored.
 //!
 //! Launch args (defined in fm_adapter_sdk::contract::args):
 //!   --clock-addr   host:port   GstNetClientClock endpoint
@@ -36,6 +39,42 @@ fn main() {
     let args = parse_args();
 
     gstreamer::init().expect("GStreamer init failed");
+
+    // ── Stdin command reader — started before Configure so the channel
+    // is ready when the core writes the first message.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Command>(&line) {
+                Ok(cmd) => {
+                    if cmd_tx.send(cmd).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => eprintln!("[dummy-adapter] bad command: {e} ({line:?})"),
+            }
+        }
+    });
+
+    // ── Wait for Configure (ADR-0014): block until the core sends it.
+    // The dummy adapter does not use the URI but must wait before proceeding.
+    loop {
+        match cmd_rx.recv() {
+            Ok(Command::Configure { .. }) => break,
+            Ok(_) => {} // ignore Play/Pause/Shutdown before Configure
+            Err(_) => {
+                emit(AdapterMessage::Error {
+                    description: "stdin closed before Configure".to_string(),
+                });
+                return;
+            }
+        }
+    }
 
     // ── Net clock ─────────────────────────────────────────────────────────
     let clock_addr = args
@@ -67,11 +106,11 @@ fn main() {
     let video_shm = args
         .get("video-shm")
         .cloned()
-        .unwrap_or_else(|| format!("/tmp/fm-video-{source_id}.sock"));
+        .expect("--video-shm required");
     let audio_shm = args
         .get("audio-shm")
         .cloned()
-        .unwrap_or_else(|| format!("/tmp/fm-audio-{source_id}.sock"));
+        .expect("--audio-shm required");
     let width: i32 = args
         .get("video-width")
         .and_then(|v| v.parse().ok())
@@ -126,7 +165,6 @@ fn main() {
     gstreamer::Element::link_many([&vsrc, &vconv, &vscale, &vcaps, &vshmsink]).unwrap();
 
     // BUFFER probe on vcaps:src counts frames written toward shmsink.
-    // Step 6 boundary throughput counter (ADR-0008).
     let frame_counter = Arc::new(AtomicU64::new(0));
     if let Some(vcaps_src) = vcaps.static_pad("src") {
         let fc = Arc::clone(&frame_counter);
@@ -170,9 +208,6 @@ fn main() {
     }
 
     // PAUSED creates the shmsink sockets (READY→PAUSED opens the socket file).
-    // In --no-frames mode we stay in PAUSED indefinitely so the socket exists
-    // but the ring buffer remains empty.  In normal mode we also start PAUSED
-    // and wait for a Play command before producing frames.
     pipeline.set_state(gstreamer::State::Paused).unwrap();
 
     // ── Announce ready ────────────────────────────────────────────────────
@@ -180,26 +215,6 @@ fn main() {
         has_video: true,
         has_audio: true,
         protocol_version: PROTOCOL_VERSION,
-    });
-
-    // ── Stdin command reader (separate thread) ────────────────────────────
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
-    std::thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Command>(&line) {
-                Ok(cmd) => {
-                    if cmd_tx.send(cmd).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => eprintln!("[dummy-adapter] bad command: {e} ({line:?})"),
-            }
-        }
     });
 
     // ── Main loop ─────────────────────────────────────────────────────────
@@ -212,6 +227,7 @@ fn main() {
         // Process pending commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                Command::Configure { .. } => {} // ignore; already handled
                 Command::Play => {
                     if no_frames {
                         eprintln!("[dummy-adapter] Play (ignored — --no-frames mode)");

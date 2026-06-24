@@ -53,29 +53,21 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
 - [ ] [rtsp-adapter] Camera offline at startup leaves a permanently dead tile: if no
       RTSP pads appear before the 30 s hard deadline, the adapter emits
       `Ready { has_video: false, has_audio: false }` and the core builds the tile with no
-      shmsrc chains.  If the adapter then succeeds on an internal reconnect, streams flow
-      into shmsink but the core has no shmsrc to receive them — the tile stays black for
-      the lifetime of the process.  Fix requires either re-emitting Ready on reconnect and
-      the core rebuilding the affected chains, or the supervisor detecting a no-stream Ready
-      and restarting the process after a delay to retry discovery. (2026-06-23)
+      shmsrc chains.  ADR-0013 implementation: the adapter now emits `StreamsChanged` after
+      a reconnect stability window when streams appear; the core calls `build_shmsrc_chain`
+      live.  **Pending Group F validation** before moving to Fixed. (2026-06-23)
 - [ ] [rtsp-adapter] Late audio pad excluded after stability window: the adapter emits
       Ready 3 s after the first decoded pad.  If a camera's video pad appears at T=0 and
       its audio pad at T>3 s, Ready fires with `has_audio: false` and the core never wires
-      an audio shmsrc for this session.  Most cameras deliver both pads within ~500 ms so
-      the 3 s window is adequate in practice, but it is not guaranteed.  Fix: use a
-      per-stream-type "first-pad" timer so the window resets when any new media type
-      appears, or extend the window. (2026-06-23)
-- [ ] [rtsp-adapter] First respawn after SIGKILL can stick in an in-process reconnect
-      loop: the adapter is killed without sending RTSP TEARDOWN, so the camera may hold
-      the old session open for 10–120 s.  The new process immediately attempts RTSP PLAY;
-      if the camera rejects or drops the connection before caps are negotiated, an
-      in-process reconnect fires (1 s delay), then another, until the camera finally
-      cleans up.  During this loop the adapter uses near-zero CPU and the tile shows the
-      frozen last frame.  After 8 in-process failures the adapter emits Error and exits;
-      the supervisor respawns, and that second fresh process typically succeeds.
-      Fix direction: add a configurable post-crash startup delay (e.g. 5 s) before the
-      first RTSP PLAY so the camera has time to release the old session, or send a
-      graceful TEARDOWN on SIGTERM before the supervisor force-kills. (2026-06-24)
+      an audio shmsrc for this session.  ADR-0013 implementation: `StreamsChanged` after a
+      reconnect will deliver the audio chain live; the original first-startup window is
+      unchanged.  **Partially addressed; pending Group F validation.** (2026-06-23)
+- [ ] [rtsp-adapter] Reconnect storm after SIGKILL: the adapter was killed without sending
+      RTSP TEARDOWN, so the camera held the old session open (10–120 s) and the new process
+      failed to reconnect.  ADR-0013 implementation: supervisor now sends `Shutdown` and waits
+      3 s for the adapter to send RTSP TEARDOWN before force-killing — eliminates the storm for
+      all supervisor-initiated kills.  A direct `kill -9` from outside the supervisor still
+      skips TEARDOWN.  **Pending Group F validation** for supervisor kill path. (2026-06-24)
 
 ---
 

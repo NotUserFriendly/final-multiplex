@@ -134,6 +134,12 @@ impl App {
                                 t.restart_external_source(&id);
                             }
                         }
+                        // Apply live topology changes from StreamsChanged messages.
+                        for (id, has_video, has_audio) in sup.take_streams_changed() {
+                            if let Some(t) = &mut self.transport {
+                                t.apply_streams_changed(&id, has_video, has_audio);
+                            }
+                        }
                     }
                 }
             }

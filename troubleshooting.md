@@ -1,63 +1,75 @@
 # Troubleshooting Log
 
-## Per-source offset seek not working reliably
+## cam-77 RTSP video frozen / not updating (ongoing)
 
-**Symptom 1 (iteration 1 — `gst_pad_set_offset` only):**
-Pressing +1s/−1s caused a brief stutter then the video resumed at exactly the
-same frame. No visible content change.
-
-**Root cause:** `gst_pad_set_offset` on the capsfilter src pads changes the
-compositor _timestamp mapping_ only — it shifts when each frame appears on the
-compositor timeline but does not move the file read head. The content shown is
-identical to before; only the compositor clock offset changes.
+**Symptom:** cam-77 tile displays a still frame. Camera management interface
+shows live video. Audio from cam-77 works correctly. cam-27 displays live video
+at ~70% CPU; cam-77 adapter idles at ~1.6% CPU.
 
 ---
 
-**Symptom 2 (iteration 2 — `uri_elem.seek_simple(FLUSH | KEY_UNIT)`, no pad offset):**
-Inconsistent: sometimes the video scrubbed forward, sometimes nothing happened.
+### Attempt 1 — Suspected orphaned adapter processes
 
-**Root cause:** `KEY_UNIT` seeks to the _nearest_ keyframe to the target. For
-videos with sparse keyframes (e.g., one keyframe every 2–3 s), a 1 s step from
-position 0 has no keyframe between 0 and 1 s, so `KEY_UNIT` snaps back to the
-keyframe at 0 s — visually "nothing happens." When the step happened to cross a
-keyframe boundary, it appeared to work.
+**Hypothesis:** A prior-session adapter held cam-77's RTSP stream slot, starving
+the new session's adapter of video allocation.
 
----
+**Action:** Killed orphaned fm-rtsp-adapter processes (PIDs 123552, 126254,
+129282, 129777). Confirmed no orphans for the current session.
 
-**Symptom 3 (iteration 3 — seek + `pad_offset = running_now`, KEY_UNIT):**
-Pressing +1s/−1s consistently reset the video to the beginning, with occasional
-exceptions.
-
-**Root cause (double-offset):** After a per-element `FLUSH` seek, GStreamer sets
-the new segment's `base` field to the current pipeline running time T. Frames
-from the seeked source therefore arrive at the compositor at running time T
-(correct, no adjustment needed). Adding `pad_offset = T` on the capsfilter src
-pad doubled the offset, sending frames to running time 2T — T seconds in the
-future. The compositor froze that tile waiting; other sources continued playing,
-eventually reaching EOS; the pipeline EOS handler fired and sought everything
-back to position 0.
-
-**Root cause (KEY_UNIT snapping):** Same as iteration 2 — KEY_UNIT snapping to
-keyframe 0 caused the visible "reset to beginning" in the non-double-offset case.
+**Result:** Did not fix the freeze. cam-77 adapter still showed 1.6% CPU with
+no new video frames after the reconnect that followed the power-cycle.
 
 ---
 
-**Fix (iteration 4 — `seek_simple(FLUSH | ACCURATE)`, no pad offset):**
-- `ACCURATE` flag: seek lands at exactly the requested timestamp; no keyframe
-  snapping. Slightly slower than KEY_UNIT (decoder must decode from previous
-  keyframe) but correct for a frame-accurate sync tool.
-- No pad offset: GStreamer's segment `base` field already compensates for
-  running time, so frames arrive at the compositor on schedule without manual
-  offset. Adding a manual pad offset introduced the double-offset bug.
+### Attempt 2 — SIGTERM cam-77 adapter to force full RTSP re-session
 
-**Status:** deployed, awaiting verification.
+**Hypothesis:** The in-process partial reconnect (rtspsrc + decodebin3 cycled
+through Null) established an RTSP session but left the camera's RTP video sender
+in a stale state. A full process death → supervisor respawn → fresh
+DESCRIBE/SETUP would force the camera to open a new RTP session.
+
+**Action:** `kill -TERM <pid>` on the cam-77 adapter. Supervisor spawned a new
+adapter. New adapter got both pads (video + audio chains ready), emitted
+`Ready {true, true}`, received Play.
+
+**Result:** Video jumped to a new timestamp (05:42:08) then immediately froze
+again. Audio continued working. CPU remained ~1.6–1.9%.
+
+`ss -tnp` showed `recv_q=190391` stable across multiple samples on the TCP
+connection to port 554 — the camera was actively sending RTP data, but rtspsrc
+was not reading it. This confirmed downstream backpressure blocking the read.
 
 ---
 
-## Known limitation — per-source offsets not preserved across loops
+### Attempt 3 — Set `sync=false` on vshmsink and ashmsink
 
-When all sources reach end-of-file, the bus loop seeks the entire pipeline back
-to position 0 (`seek_all`). Per-source offsets are lost; the UI still displays
-the previously set values but the sources have all returned to position 0. The
-user must re-apply offsets after a loop. Fix: pass source-offset state into the
-bus loop and re-seek each source after the pipeline loop seek. Deferred.
+**Hypothesis:** `sync=true` on vshmsink causes the sink to pace writes to the
+pipeline clock. After a long reconnect cycle (pipeline running for 30+ minutes),
+the freshly-started RTP stream's timestamps don't align with the pipeline's
+accumulated running time. vshmsink stalls waiting for timestamps to catch up,
+creating backpressure through the entire chain back to rtspsrc — which stops
+consuming from the TCP recv buffer, explaining the stable `recv_q=190391`.
+The core's compositor handles sync via `do-timestamp=true` on vshmsrc; the
+adapter's shmsink does not need to enforce sync.
+
+**Action:** Changed `vshmsink.set_property("sync", true)` →
+`vshmsink.set_property("sync", false)` and same for ashmsink in
+`crates/fm-rtsp-adapter/src/main.rs`. Rebuilt. Restarted session.
+
+**Result:** Confirmed fix. cam-77 tile shows live video at ~60% CPU. Clock on
+camera display advances in real time. Both cameras live simultaneously.
+
+---
+
+### What is known / ruled out
+
+- Camera's RTSP server is healthy: DESCRIBE/SETUP succeeds, pads appear, audio
+  flows.
+- No orphaned adapters competing for the camera slot.
+- The AAC audio decode errors in ffplayExtract.md (malformed PCE headers, buffer
+  exhausted) are camera-side and unrelated to the video freeze — ffplay shows
+  video correctly despite those errors, and audio works in our adapter too.
+- The freeze happens both after in-process reconnect (partial rtspsrc restart)
+  and after full process death + respawn.
+- recv_q stable at 190391 bytes on the RTSP TCP socket confirms rtspsrc is not
+  consuming data — pointing to downstream backpressure, not a camera send problem.

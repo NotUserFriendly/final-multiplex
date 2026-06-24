@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream set (video/audio presence) differs from what was last reported.
 
 ### Fixed
+- `fm-rtsp-adapter`: `vshmsink` and `ashmsink` now use `sync=false`.
+  `sync=true` caused these transport sinks to pace writes against the pipeline
+  clock.  After a partial in-process reconnect (rtspsrc/decodebin3 cycled
+  through Null), the fresh RTP session's buffer timestamps did not align with
+  the pipeline's accumulated running time (30+ min into a session).  vshmsink
+  blocked waiting for timestamps to arrive, creating backpressure all the way
+  back to rtspsrc, which stopped consuming the TCP recv buffer — confirmed by
+  a stable `recv_q` on the RTSP socket.  The core's compositor handles sync via
+  `do-timestamp=true` on vshmsrc; adapter shmsinks are pure transports and must
+  not enforce clock synchronisation.
 - `fm-rtsp-adapter`: `reconnect_count` is now incremented only after the
   `reconnecting` CAS succeeds.  Previously the counter was incremented before
   the `compare_exchange` gate, so the burst of ~5 GStreamer Error events that

@@ -575,7 +575,7 @@ fn build_video_chain(
             .build(),
     );
     vshmsink.set_property_from_str("socket-path", shm_path);
-    vshmsink.set_property("sync", true);
+    vshmsink.set_property("sync", false);
     vshmsink.set_property("wait-for-connection", false);
 
     pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
@@ -620,7 +620,7 @@ fn build_audio_chain(
             .build(),
     );
     ashmsink.set_property_from_str("socket-path", shm_path);
-    ashmsink.set_property("sync", true);
+    ashmsink.set_property("sync", false);
     ashmsink.set_property("wait-for-connection", false);
 
     pipeline.add_many([&aconv, &aresamp, &acaps, &ashmsink])?;

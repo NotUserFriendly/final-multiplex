@@ -51,7 +51,8 @@ struct LaunchSpec {
 
 struct LiveHandle {
     child: Child,
-    stdin: std::process::ChildStdin,
+    /// Shared with the reader thread so it can auto-send Play on Ready.
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
 }
 
 struct PendingRestart {
@@ -65,6 +66,12 @@ pub struct Supervisor {
     pending: HashMap<String, PendingRestart>,
     specs: HashMap<String, LaunchSpec>,
     status: Arc<Mutex<HashMap<String, AdapterStatus>>>,
+    /// Source IDs whose adapter just (re)started and whose shmsrc elements in
+    /// the core pipeline need to be reset.  Drained by `take_restarted()`.
+    restarted: Arc<Mutex<Vec<String>>>,
+    /// Whether the supervisor is in the play state; new/restarted adapters that
+    /// send Ready automatically receive Play when this is true.
+    playing: Arc<Mutex<bool>>,
 }
 
 impl Supervisor {
@@ -74,12 +81,20 @@ impl Supervisor {
             pending: HashMap::new(),
             specs: HashMap::new(),
             status: Arc::new(Mutex::new(HashMap::new())),
+            restarted: Arc::new(Mutex::new(Vec::new())),
+            playing: Arc::new(Mutex::new(false)),
         }
     }
 
     /// Clone of the shared status map; hand this to the UI.
     pub fn status_handle(&self) -> Arc<Mutex<HashMap<String, AdapterStatus>>> {
         Arc::clone(&self.status)
+    }
+
+    /// Drain and return source IDs that restarted since the last call.
+    /// The caller should reset the corresponding shmsrc pipeline elements.
+    pub fn take_restarted(&self) -> Vec<String> {
+        std::mem::take(&mut *self.restarted.lock().unwrap())
     }
 
     /// Canonical shm socket paths for a source id.
@@ -176,13 +191,16 @@ impl Supervisor {
         }
     }
 
-    /// Send Play to all live adapters.
+    /// Send Play to all live adapters and flip the internal play flag so
+    /// newly-restarted adapters auto-receive Play on their Ready message.
     pub fn send_play_all(&mut self) {
+        *self.playing.lock().unwrap() = true;
         self.broadcast(Command::Play);
     }
 
     /// Send Pause to all live adapters.
     pub fn send_pause_all(&mut self) {
+        *self.playing.lock().unwrap() = false;
         self.broadcast(Command::Pause);
     }
 
@@ -216,6 +234,12 @@ impl Supervisor {
         spec: LaunchSpec,
         attempt: usize,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Remove stale sockets so the adapter creates fresh ones. Without this,
+        // a shmsrc in the core that reconnects could receive a mid-stream segment
+        // from the previous adapter run and fail segment format assertions.
+        let _ = std::fs::remove_file(&spec.video_shm);
+        let _ = std::fs::remove_file(&spec.audio_shm);
+
         use contract::args::*;
         let mut child = StdCommand::new(&spec.binary)
             .args([
@@ -241,11 +265,14 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin was piped")));
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let source_id = spec.source_id.clone();
         let status = Arc::clone(&self.status);
+        let restarted = Arc::clone(&self.restarted);
+        let playing = Arc::clone(&self.playing);
+        let stdin_for_reader = Arc::clone(&stdin);
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -254,7 +281,14 @@ impl Supervisor {
                     continue;
                 }
                 match contract::decode_message(&line) {
-                    Ok(msg) => handle_msg(&source_id, msg, &status),
+                    Ok(msg) => handle_msg(
+                        &source_id,
+                        msg,
+                        &status,
+                        &restarted,
+                        &playing,
+                        &stdin_for_reader,
+                    ),
                     Err(e) => {
                         eprintln!("[supervisor] '{source_id}': parse error: {e} ({line:?})")
                     }
@@ -290,7 +324,7 @@ impl Supervisor {
     fn broadcast(&mut self, cmd: Command) {
         let line = contract::encode_command(&cmd);
         for (id, handle) in self.live.iter_mut() {
-            if let Err(e) = handle.stdin.write_all(line.as_bytes()) {
+            if let Err(e) = handle.stdin.lock().unwrap().write_all(line.as_bytes()) {
                 eprintln!("[supervisor] '{id}': write error: {e}");
             }
         }
@@ -301,6 +335,9 @@ fn handle_msg(
     source_id: &str,
     msg: AdapterMessage,
     status: &Arc<Mutex<HashMap<String, AdapterStatus>>>,
+    restarted: &Arc<Mutex<Vec<String>>>,
+    playing: &Arc<Mutex<bool>>,
+    stdin: &Arc<Mutex<std::process::ChildStdin>>,
 ) {
     let mut s = status.lock().unwrap();
     let entry = s.entry(source_id.to_string()).or_insert(AdapterStatus {
@@ -311,7 +348,20 @@ fn handle_msg(
     match msg {
         AdapterMessage::Ready => {
             eprintln!("[supervisor] '{source_id}': Ready");
+            let is_restart = entry.restart_count > 0;
             entry.state = AdapterState::Running;
+            // Auto-send Play if the pipeline is playing (handles restarts).
+            if *playing.lock().unwrap() {
+                let line = contract::encode_command(&Command::Play);
+                if let Ok(mut w) = stdin.lock() {
+                    let _ = w.write_all(line.as_bytes());
+                }
+            }
+            // Only signal shmsrc reset on actual restarts; at initial startup the
+            // shmsrc hasn't connected yet so no element reset is needed.
+            if is_restart {
+                restarted.lock().unwrap().push(source_id.to_string());
+            }
         }
         AdapterMessage::Metrics(m) => {
             entry.latest_metrics = Some(m);

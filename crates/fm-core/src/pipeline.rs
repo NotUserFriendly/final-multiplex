@@ -331,9 +331,9 @@ impl Pipeline {
                 }
                 SourceType::External => {
                     // shmsrc elements — connect to the adapter's shmsink sockets.
-                    // The adapter must create its sockets before the pipeline goes
-                    // to PLAYING; shmsrc blocks in state-change until they appear
-                    // (up to its timeout property, default 10 s).
+                    // Capsfilters after each shmsrc pin the expected caps so GStreamer
+                    // doesn't have to guess during negotiation (the adapter contract
+                    // guarantees these formats — ADR-0011).
                     let (video_sock, audio_sock) = Supervisor::shm_paths(&source.id);
 
                     if has_video {
@@ -342,12 +342,42 @@ impl Pipeline {
                             .build()?;
                         vshmsrc.set_property_from_str("socket-path", &video_sock);
                         vshmsrc.set_property("is-live", true);
-                        vshmsrc.set_property("do-timestamp", false);
-                        pipeline.add(&vshmsrc)?;
+                        vshmsrc.set_property("do-timestamp", true);
+
+                        let vshmcaps: gstreamer::Element =
+                            gstreamer::ElementFactory::make("capsfilter")
+                                .name(format!("vshmcaps_{}", source.id))
+                                .build()?;
+                        vshmcaps.set_property(
+                            "caps",
+                            gstreamer::Caps::builder("video/x-raw")
+                                .field("format", "RGBA")
+                                .field("width", tile_w as i32)
+                                .field("height", tile_h as i32)
+                                .field(
+                                    "framerate",
+                                    gstreamer::Fraction::new(scene.grid.fps as i32, 1),
+                                )
+                                .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
+                                .build(),
+                        );
+
+                        // queue decouples the shmsrc (live) thread from the
+                        // compositor thread so they don't block each other.
+                        let vqueue: gstreamer::Element = gstreamer::ElementFactory::make("queue")
+                            .name(format!("vshm_q_{}", source.id))
+                            .build()?;
+                        vqueue.set_property("max-size-buffers", 2u32);
+                        vqueue.set_property("max-size-bytes", 0u32);
+                        vqueue.set_property("max-size-time", 0u64);
+                        vqueue.set_property_from_str("leaky", "downstream");
+
+                        pipeline.add_many([&vshmsrc, &vshmcaps, &vqueue])?;
+                        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
                         if let Some(ref vconv_sink) = vconv_sink_for_cb {
-                            vshmsrc
+                            vqueue
                                 .static_pad("src")
-                                .ok_or("vshmsrc: no src pad")?
+                                .ok_or("vshm_q: no src pad")?
                                 .link(vconv_sink)?;
                         }
                     }
@@ -358,12 +388,36 @@ impl Pipeline {
                             .build()?;
                         ashmsrc.set_property_from_str("socket-path", &audio_sock);
                         ashmsrc.set_property("is-live", true);
-                        ashmsrc.set_property("do-timestamp", false);
-                        pipeline.add(&ashmsrc)?;
+                        ashmsrc.set_property("do-timestamp", true);
+
+                        let ashmcaps: gstreamer::Element =
+                            gstreamer::ElementFactory::make("capsfilter")
+                                .name(format!("ashmcaps_{}", source.id))
+                                .build()?;
+                        ashmcaps.set_property(
+                            "caps",
+                            gstreamer::Caps::builder("audio/x-raw")
+                                .field("format", "S16LE")
+                                .field("rate", 48_000i32)
+                                .field("channels", 2i32)
+                                .field("layout", "interleaved")
+                                .build(),
+                        );
+
+                        let aqueue: gstreamer::Element = gstreamer::ElementFactory::make("queue")
+                            .name(format!("ashm_q_{}", source.id))
+                            .build()?;
+                        aqueue.set_property("max-size-buffers", 4u32);
+                        aqueue.set_property("max-size-bytes", 0u32);
+                        aqueue.set_property("max-size-time", 0u64);
+                        aqueue.set_property_from_str("leaky", "downstream");
+
+                        pipeline.add_many([&ashmsrc, &ashmcaps, &aqueue])?;
+                        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
-                            ashmsrc
+                            aqueue
                                 .static_pad("src")
-                                .ok_or("ashmsrc: no src pad")?
+                                .ok_or("ashm_q: no src pad")?
                                 .link(aconv_sink)?;
                         }
                     }
@@ -393,5 +447,20 @@ impl Pipeline {
 
     pub fn mixer_sink_pads(&self) -> &HashMap<String, gstreamer::Pad> {
         &self.mixer_sink_pads
+    }
+
+    /// Reset the shmsrc elements for an external source after its adapter
+    /// process has restarted and created fresh shmsink sockets.
+    /// Sets each element to NULL then syncs it back to the pipeline state so
+    /// it reconnects to the new socket.
+    pub fn restart_shmsrc(&self, source_id: &str) {
+        for prefix in &["vshmsrc_", "ashmsrc_"] {
+            let name = format!("{prefix}{source_id}");
+            if let Some(elem) = self.inner.by_name(&name) {
+                eprintln!("[pipeline] resetting {name} for reconnect");
+                let _ = elem.set_state(gstreamer::State::Null);
+                let _ = elem.sync_state_with_parent();
+            }
+        }
     }
 }

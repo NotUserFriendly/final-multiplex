@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 2 Steps 0–3: process boundary with crash isolation proven.
+  - Step 3: crash isolation gate confirmed — killing the dummy adapter mid-play
+    leaves the core running with all other sources unaffected.  The supervisor
+    detects the exit, applies the backoff delay, respawns with attempt=1, the new
+    adapter auto-receives Play on its Ready message, and the core pipeline resets the
+    `shmsrc` elements so they reconnect to the new adapter sockets.
+    Known issue: GStreamer `gst_poll_fd_*` criticals flood stderr during the NULL
+    transition of a disconnected shmsrc (see BUGS.md — non-fatal). (2026-06-23)
 - Phase 2 Steps 0–2: process boundary with a dummy adapter.
   - ADR-0011: shm transport carries raw decoded frames (RGBA video + PCM audio).
     Resolves the ADR-0005-deferred payload question. Raw = no decode in core, simple

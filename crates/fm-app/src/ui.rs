@@ -72,26 +72,29 @@ impl App {
         let frame_store = bridge::new_store();
         match try_init(config_path, frame_store.clone()) {
             Ok(state) => state,
-            Err(e) => Self {
-                transport: None,
-                metrics: None,
-                frame_store,
-                current_frame: None,
-                frame_gen: 0,
-                playing: false,
-                sources: Vec::new(),
-                source_metrics: Vec::new(),
-                grid_cols: 1,
-                grid_rows: 1,
-                grid_ar: 16.0 / 9.0,
-                win_w: 1280.0,
-                win_h: 720.0,
-                error: Some(e.to_string()),
-                supervisor: None,
-                config_persist: None,
-                last_offset_change: None,
-                tick_count: 0,
-            },
+            Err(e) => {
+                eprintln!("[app] try_init failed: {e}");
+                Self {
+                    transport: None,
+                    metrics: None,
+                    frame_store,
+                    current_frame: None,
+                    frame_gen: 0,
+                    playing: false,
+                    sources: Vec::new(),
+                    source_metrics: Vec::new(),
+                    grid_cols: 1,
+                    grid_rows: 1,
+                    grid_ar: 16.0 / 9.0,
+                    win_w: 1280.0,
+                    win_h: 720.0,
+                    error: Some(e.to_string()),
+                    supervisor: None,
+                    config_persist: None,
+                    last_offset_change: None,
+                    tick_count: 0,
+                }
+            }
         }
     }
 
@@ -124,6 +127,13 @@ impl App {
                 if self.tick_count % 30 == 0 {
                     if let Some(sup) = &mut self.supervisor {
                         sup.poll();
+                        // Reset shmsrc elements for any adapters that restarted
+                        // so they reconnect to the new adapter sockets.
+                        for id in sup.take_restarted() {
+                            if let Some(t) = &self.transport {
+                                t.restart_external_source(&id);
+                            }
+                        }
                     }
                 }
             }
@@ -501,6 +511,73 @@ fn try_init(
 
     let config_persist = fm_core::persist::ConfigPersist::load(config_path).ok();
 
+    // ── Adapter supervisor (Phase 2) ─────────────────────────────────────
+    // Adapters must be spawned and their shmsink sockets must exist BEFORE
+    // the core pipeline goes to PLAYING, because shmsrc tries to open those
+    // sockets during its READY→PAUSED state transition.  Startup sequence:
+    //   1. gstreamer::init (needed for SystemClock)
+    //   2. Create NetClock
+    //   3. Spawn adapters
+    //   4. Wait for all adapters to send Ready (sockets now exist)
+    //   5. Build pipeline + transport.play()
+    gstreamer::init()?;
+
+    let has_external = scene
+        .source
+        .iter()
+        .any(|s| s.source_type == fm_core::config::SourceType::External);
+
+    let (supervisor, external_ids) = if has_external {
+        let net = fm_core::net_clock::NetClock::new()?;
+        let mut sup = fm_core::supervisor::Supervisor::new();
+        let cols_u = scene.grid.columns.max(1).min(scene.source.len() as u32);
+        let rows_u = (scene.source.len() as u32 + cols_u - 1) / cols_u;
+        let tile_w = scene.grid.width / cols_u;
+        let tile_h = scene.grid.height / rows_u;
+        let mut ids: Vec<String> = Vec::new();
+        for s in &scene.source {
+            if s.source_type != fm_core::config::SourceType::External {
+                continue;
+            }
+            let binary = s.adapter.as_deref().unwrap_or("fm-dummy-adapter");
+            if let Err(e) = sup.spawn(binary, &s.id, &net, tile_w, tile_h, scene.grid.fps) {
+                eprintln!("[app] failed to spawn adapter for '{}': {e}", s.id);
+            } else {
+                ids.push(s.id.clone());
+            }
+        }
+
+        // Wait up to 10 s for all adapters to send Ready (sockets created).
+        let status = sup.status_handle();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let all_ready = {
+                let s = status.lock().unwrap();
+                ids.iter().all(|id| {
+                    matches!(
+                        s.get(id),
+                        Some(fm_core::supervisor::AdapterStatus {
+                            state: fm_core::supervisor::AdapterState::Running,
+                            ..
+                        })
+                    )
+                })
+            };
+            if all_ready {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("[app] WARNING: not all adapters ready within 10 s — proceeding anyway");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        (Some(sup), ids)
+    } else {
+        (None, Vec::new())
+    };
+
     let pipeline = fm_core::pipeline::Pipeline::build(&scene)?;
     let metrics = fm_core::metrics::MetricsCollector::attach(&pipeline);
     let bus_pipe = pipeline.inner().clone();
@@ -510,34 +587,14 @@ fn try_init(
     let transport = fm_core::transport::Transport::new(pipeline);
     transport.play()?;
 
-    // ── Adapter supervisor (Phase 2) ─────────────────────────────────────
-    // Spawn out-of-process adapters for any external sources. Net clock is
-    // created after transport.play() so the pipeline clock is available.
-    let supervisor = if scene
-        .source
-        .iter()
-        .any(|s| s.source_type == fm_core::config::SourceType::External)
-    {
-        let net = fm_core::net_clock::NetClock::new(transport.pipeline_inner())?;
-        let mut sup = fm_core::supervisor::Supervisor::new();
-        let cols_u = scene.grid.columns.max(1).min(scene.source.len() as u32);
-        let rows_u = (scene.source.len() as u32 + cols_u - 1) / cols_u;
-        let tile_w = scene.grid.width / cols_u;
-        let tile_h = scene.grid.height / rows_u;
-        for s in &scene.source {
-            if s.source_type != fm_core::config::SourceType::External {
-                continue;
-            }
-            let binary = s.adapter.as_deref().unwrap_or("fm-dummy-adapter");
-            if let Err(e) = sup.spawn(binary, &s.id, &net, tile_w, tile_h, scene.grid.fps) {
-                eprintln!("[app] failed to spawn adapter for '{}': {e}", s.id);
-            }
-        }
+    // Pipeline is playing; tell adapters to start streaming.
+    let supervisor = if let Some(mut sup) = supervisor {
         sup.send_play_all();
         Some(sup)
     } else {
         None
     };
+    let _ = external_ids; // used above
 
     let audio_store = metrics.audio_store();
     std::thread::spawn(move || fm_core::transport::run_bus_loop(bus_pipe, audio_store));

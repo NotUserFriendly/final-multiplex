@@ -73,8 +73,10 @@ impl Transport {
         &self.pipeline
     }
 
-    pub fn pipeline_inner(&self) -> &gstreamer::Pipeline {
-        self.pipeline.inner()
+    /// Reset shmsrc elements for a restarted external source so they
+    /// reconnect to the adapter's new shmsink sockets.
+    pub fn restart_external_source(&self, source_id: &str) {
+        self.pipeline.restart_shmsrc(source_id);
     }
 }
 

@@ -119,7 +119,7 @@ fn main() {
     let ashmsink = make("shmsink", "ashmsink");
 
     asrc.set_property("is-live", true);
-    asrc.set_property("wave", 0i32); // sine
+    asrc.set_property_from_str("wave", "sine");
     acaps.set_property(
         "caps",
         &gstreamer::Caps::builder("audio/x-raw")

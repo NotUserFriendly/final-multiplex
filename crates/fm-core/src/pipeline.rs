@@ -3,6 +3,8 @@ use crate::supervisor::Supervisor;
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 
+type ExternalCaps = HashMap<String, (bool, bool)>;
+
 /// Discover which stream types a URI contains before building the pipeline.
 /// Returns (has_video, has_audio). Runs with a 2-second timeout per source.
 /// Called in parallel threads, one per source, in `Pipeline::build`.
@@ -51,9 +53,12 @@ pub struct SourcePads {
 ///   uridecodebin ─► videoconvert ─► deinterlace ─► videoscale ─► capsfilter(tile RGBA) ─► compositor
 ///                ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
 ///
-/// External source topology (Phase 2, ADR-0005 / ADR-0011):
-///   shmsrc(video) ─► videoconvert ─► videoscale ─► capsfilter(tile RGBA) ─► compositor
-///   shmsrc(audio) ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
+/// External source topology (Phase 2, ADR-0005 / ADR-0011 / ADR-0012):
+///   shmsrc(video) ─► vshmcaps(prod_res) ─► queue ─► vconv ─► vdeint ─► vscale ─► vcaps(tile) ─► compositor
+///   shmsrc(audio) ─► ashmcaps(S16LE)    ─► queue ─► aconv ─► aresamp ─► acaps(48k/2ch) ─► audiomixer
+///
+///   prod_res = full grid output resolution (ADR-0012 core-owned resize).
+///   The adapter produces at prod_res; the core scales to tile size here.
 ///
 /// compositor ─► capsfilter(output RGBA) ─► appsink  (→ UI bridge, ADR-0006)
 /// audiomixer ─► audioconvert ─► audioresample ─► autoaudiosink
@@ -67,7 +72,13 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn build(scene: &SceneConfig) -> Result<Self> {
+    /// Build the pipeline.
+    ///
+    /// `external_caps`: per external-source `(has_video, has_audio)` reported by
+    /// the adapter's `Ready` message.  The core wires only the pads for streams
+    /// that are present — same pattern as the Phase-1 discoverer probe.
+    /// For sources not in the map, defaults to `(true, true)` (conservative).
+    pub fn build(scene: &SceneConfig, external_caps: &ExternalCaps) -> Result<Self> {
         gstreamer::init()?;
 
         // Probe each source in parallel before building to learn which stream
@@ -80,15 +91,15 @@ impl Pipeline {
         //
         // A video-only source gets only the video chain; no idle audio chain is
         // left in the pipeline with an unlinked sink.
-        // External sources always have video + audio (the adapter contract
-        // guarantees it); only probe file sources.
+        // External sources use the caps reported in their Ready message.
         let stream_caps: Vec<(bool, bool)> = {
             let handles: Vec<_> = scene
                 .source
                 .iter()
                 .map(|s| {
                     if s.source_type == SourceType::External {
-                        return std::thread::spawn(|| (true, true));
+                        let caps = external_caps.get(&s.id).copied().unwrap_or((true, true));
+                        return std::thread::spawn(move || caps);
                     }
                     let uri = s.uri.clone().unwrap_or_default();
                     std::thread::spawn(move || probe_streams(&uri))
@@ -344,6 +355,10 @@ impl Pipeline {
                         vshmsrc.set_property("is-live", true);
                         vshmsrc.set_property("do-timestamp", true);
 
+                        // vshmcaps pins the production resolution that the adapter
+                        // was launched with (full grid output resolution by default —
+                        // ADR-0012 core-owned resize).  The vscale + vcaps chain
+                        // downstream scales to tile dimensions.
                         let vshmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
                                 .name(format!("vshmcaps_{}", source.id))
@@ -352,8 +367,8 @@ impl Pipeline {
                             "caps",
                             gstreamer::Caps::builder("video/x-raw")
                                 .field("format", "RGBA")
-                                .field("width", tile_w as i32)
-                                .field("height", tile_h as i32)
+                                .field("width", scene.grid.width as i32)
+                                .field("height", scene.grid.height as i32)
                                 .field(
                                     "framerate",
                                     gstreamer::Fraction::new(scene.grid.fps as i32, 1),

@@ -45,6 +45,15 @@ pub struct GridConfig {
     pub height: u32,
     /// Composited output frame rate.
     pub fps: u32,
+    /// How long to wait for each external adapter to send `Ready` before
+    /// proceeding to PLAYING anyway.  RTSP cold-start can exceed 10 s, so
+    /// the default is generous.  Units: seconds.
+    #[serde(default = "default_adapter_ready_timeout")]
+    pub adapter_ready_timeout_secs: u64,
+}
+
+fn default_adapter_ready_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]

@@ -35,6 +35,12 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
 
 - [ ] [ui] skipped (probe-failed) source still shows a tile slot with 0 fps and a
       no-op offset box — cosmetic; the source has no pipeline pads to control. (2026-06-22)
+- [ ] [adapter-sdk] stdout-JSON fragility: any stray byte on an adapter's stdout (a
+      GStreamer debug print routed to stdout, a library `println!`, or a Rust panic
+      backtrace) corrupts the line-delimited JSON control channel and will be logged as a
+      parse error by the supervisor.  Adapters must route all diagnostic output to stderr.
+      The correct architectural fix is a dedicated control file-descriptor (not stdout),
+      deferred until it bites in practice.  Documented in ADR-0012 Consequences. (2026-06-23)
 - [ ] [pipeline] GStreamer criticals flood on adapter crash: when an external adapter dies,
       `shmsrc` enters error state with an invalid poll fd.  Setting the element to NULL to
       reconnect triggers `gst_poll_fd_has_error / gst_poll_remove_fd: assertion 'fd->fd >= 0'

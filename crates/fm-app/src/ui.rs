@@ -527,29 +527,38 @@ fn try_init(
         .iter()
         .any(|s| s.source_type == fm_core::config::SourceType::External);
 
+    // Spawn adapters at the full grid resolution (ADR-0012 core-owned resize).
+    // The adapter produces at prod_res; the core's vshmcaps → vscale → vcaps
+    // chain downscales to tile dimensions inside the compositor pipeline.
     let (supervisor, external_ids) = if has_external {
         let net = fm_core::net_clock::NetClock::new()?;
         let mut sup = fm_core::supervisor::Supervisor::new();
-        let cols_u = scene.grid.columns.max(1).min(scene.source.len() as u32);
-        let rows_u = (scene.source.len() as u32 + cols_u - 1) / cols_u;
-        let tile_w = scene.grid.width / cols_u;
-        let tile_h = scene.grid.height / rows_u;
         let mut ids: Vec<String> = Vec::new();
         for s in &scene.source {
             if s.source_type != fm_core::config::SourceType::External {
                 continue;
             }
             let binary = s.adapter.as_deref().unwrap_or("fm-dummy-adapter");
-            if let Err(e) = sup.spawn(binary, &s.id, &net, tile_w, tile_h, scene.grid.fps) {
+            if let Err(e) = sup.spawn(
+                binary,
+                &s.id,
+                &net,
+                scene.grid.width,
+                scene.grid.height,
+                scene.grid.fps,
+            ) {
                 eprintln!("[app] failed to spawn adapter for '{}': {e}", s.id);
             } else {
                 ids.push(s.id.clone());
             }
         }
 
-        // Wait up to 10 s for all adapters to send Ready (sockets created).
+        // Wait for all adapters to send Ready (sockets must exist before shmsrc
+        // transitions to PAUSED).  Timeout is configurable in the scene [grid]
+        // section; RTSP cold-start can comfortably exceed 10 s.
+        let timeout = scene.grid.adapter_ready_timeout_secs;
         let status = sup.status_handle();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
         loop {
             let all_ready = {
                 let s = status.lock().unwrap();
@@ -567,7 +576,9 @@ fn try_init(
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                eprintln!("[app] WARNING: not all adapters ready within 10 s — proceeding anyway");
+                eprintln!(
+                    "[app] WARNING: not all adapters ready within {timeout}s — proceeding anyway"
+                );
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -578,7 +589,24 @@ fn try_init(
         (None, Vec::new())
     };
 
-    let pipeline = fm_core::pipeline::Pipeline::build(&scene)?;
+    // Collect has_video/has_audio per external source from the Ready messages
+    // received during the wait above.  The pipeline wires only present streams.
+    let mut external_caps: std::collections::HashMap<String, (bool, bool)> =
+        std::collections::HashMap::new();
+    if let Some(sup) = &supervisor {
+        let s = sup.status_handle();
+        let s = s.lock().unwrap();
+        for id in &external_ids {
+            if let Some(a) = s.get(id) {
+                external_caps.insert(
+                    id.clone(),
+                    (a.has_video.unwrap_or(true), a.has_audio.unwrap_or(true)),
+                );
+            }
+        }
+    }
+
+    let pipeline = fm_core::pipeline::Pipeline::build(&scene, &external_caps)?;
     let metrics = fm_core::metrics::MetricsCollector::attach(&pipeline);
     let bus_pipe = pipeline.inner().clone();
 

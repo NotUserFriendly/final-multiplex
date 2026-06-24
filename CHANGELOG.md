@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 2 TaskBlock2 hardening pass (Groups A–D) — all changes below run before RTSP.
+  - **A1 — Optional streams in `Ready`:** `AdapterMessage::Ready` is now a struct
+    `{ has_video: bool, has_audio: bool, protocol_version: u32 }`.  The core wires only
+    the pads for present streams (same pattern as the Phase-1 discoverer probe), so a
+    video-only RTSP camera no longer needs an audio shmsink or shmsrc.
+  - **A2 — Core-owned resize (ADR-0012):** `--video-width`/`--video-height` now carry the
+    full grid output resolution (the adapter's *production resolution*), not the tile size.
+    The core inserts `videoscale → capsfilter(tile)` after each `shmsrc` to scale to tile
+    dimensions.  Focus-mode zoom later scales *down* from real pixels instead of upscaling
+    a tile-sized frame.  Recorded in ADR-0012 Consequences and PLAN.md Open questions.
+  - **A3 — `BASE_TIME` constant in SDK:** `contract::args::BASE_TIME = "--base-time"` is
+    now exported from the SDK crate; the supervisor uses it instead of a string literal.
+  - **A4 — Protocol version:** `PROTOCOL_VERSION: u32 = 1` constant in
+    `fm_adapter_sdk::contract`; carried in every `Ready` message.  The core logs an error
+    and withholds `play` from an adapter that reports a mismatched version.
+  - **A5 — Caps reconcile:** `VIDEO_CAPS_TEMPLATE` now includes `pixel-aspect-ratio=1/1`;
+    the adapter vcaps capsfilter pins this field to match the core's vshmcaps.
+  - **B6 — Backoff reset on healthy run:** if an adapter ran for > 60 s before dying, the
+    supervisor resets its `restart_count` to 0 so the next restart uses the shortest
+    backoff delay rather than capping at 30 s forever.
+  - **B7 — Frame-flow watchdog:** if `fps_in` stays 0 for 120 s while an adapter is
+    Running + playing (and at least one frame has previously arrived), the supervisor kills
+    and restarts it.  The 120 s threshold is generous for RTSP cold-start; once a first
+    frame has arrived, prolonged silence is treated as a stall.
+  - **B8 — Configurable Ready timeout:** the wait-for-Ready timeout is now a `[grid]`
+    field `adapter_ready_timeout_secs` (default 30 s, was hardcoded 10 s).  RTSP
+    cold-start can comfortably exceed 10 s.
+  - **C9 — `--no-frames` mode in dummy adapter:** `fm-dummy-adapter --no-frames` opens
+    shmsink sockets and emits `Ready` but keeps the pipeline in PAUSED so no frames enter
+    the shm ring buffer.  Used to test the alive-but-silent RTSP reconnect window before
+    any RTSP code exists.
+  - **D10/D11 — ADR-0012 revised:** body updated to reflect the corrected contract
+    (optional-stream Ready, protocol version, core-owned resize, BASE_TIME constant,
+    configurable timeout) and accepted.  Consequences section now records the
+    shm-bandwidth tradeoff (full-resolution frames cross the boundary per source; relief
+    valve is an optional per-source production-resolution cap, deferred until measured).
+  - **D12 — Docs/known limitations:** stdout-JSON fragility added to BUGS.md and
+    ADR-0012 Consequences.  PLAN.md Open questions updated with shm-bandwidth note.
 - Phase 2 Steps 0–4 complete.
   - Step 4: ADR-0012 — adapter SDK contract. Freezes the three wire surfaces
     (launch args, stream caps, control channel) now that the boundary is proven.

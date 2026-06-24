@@ -148,3 +148,9 @@ Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources
   the control channel. ADR-0008 says per-source telemetry originates in the adapter, but
   level is a cheap post-decode measurement that's simplest taken at one core-side spot —
   resolve when the Phase-2 contract is concrete.
+- **shm bandwidth:** the core scales full-resolution frames per source (ADR-0012
+  core-owned resize — adapter produces at full grid resolution, core scales to tile).
+  At 1920×1080 @ 30 fps that is ~240 MB/s per source over shared memory.  Acceptable on
+  the discrete-GPU target; if it bites on integrated-hardware camera walls, add an
+  optional per-source production-resolution cap as a launch arg (addable without changing
+  the ownership model).  Deferred until it is a measured problem.

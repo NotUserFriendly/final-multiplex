@@ -3,7 +3,7 @@ A task is not done until ALL of these are true:
 - [ ] `cargo fmt --check` and `cargo check --workspace` pass
 - [ ] CHANGELOG.md has an entry under `[Unreleased]` if the change is user-visible or alters behavior
 - [ ] No Accepted ADR was edited (see Process rules)
-- [ ] New architectural decision? A new ADR was written, not an edit to an old one
+- [ ] New architectural decision? Flagged for the review chat — not authored or edited here
 - [ ] Commit message states what changed and why
 
 ## Process rules
@@ -31,9 +31,8 @@ A task is not done until ALL of these are true:
 - **`docs/decisions/`** — Architecture Decision Records (ADRs). One file per significant decision.
 
 ## Working agreements
-
 - When a change is user-visible or alters behavior, add an entry under `## [Unreleased]` in `CHANGELOG.md`.
-- When you make a decision that's hard to reverse or that a future reader would ask "why?" about (a dependency, a data model, an architectural boundary), write an ADR in `docs/decisions/` using `0000-adr-template.md`.
+- When you hit a decision that's hard to reverse or that a future reader would ask "why?" about (a dependency, a data model, an architectural boundary), STOP and flag it for the review chat to author the ADR — do not write or edit the ADR yourself. The test: would you answer "why is it built this way?" differently than the existing ADRs in `docs/decisions/`? If you can't tell, flag it anyway. You still write `CHANGELOG.md` entries and code comments, and you read and implement against existing ADRs.
 - Don't restate PLAN.md or CHANGELOG.md content here. Link, don't duplicate.
 
 ## Conventions

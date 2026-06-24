@@ -1,4 +1,4 @@
-//! Adapter process contract for Final Multiplex (ADR-0005 / ADR-0011).
+//! Adapter process contract for Final Multiplex (ADR-0012).
 //!
 //! An adapter is a subprocess that:
 //!   1. Slaves to the core's GstNetTimeProvider via GstNetClientClock.
@@ -9,9 +9,22 @@
 //! Core writes [`Command`] lines to the adapter's stdin.
 //! Adapter writes [`AdapterMessage`] lines to its stdout.
 //! Adapter's stderr is left for logs and is not parsed.
+//!
+//! **stdout-JSON fragility note:** any stray output on the adapter's stdout
+//! (e.g. from a GStreamer debug print) corrupts the line protocol.  Adapters
+//! must ensure all debug output goes to stderr.  A dedicated control fd is the
+//! correct long-term fix; deferred until it actually bites (see BUGS.md).
 
 use crate::metrics::SourceMetrics;
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Protocol version
+// ---------------------------------------------------------------------------
+
+/// Bump this when the wire format changes in a backward-incompatible way.
+/// The core rejects adapters that send a different version in [`AdapterMessage::Ready`].
+pub const PROTOCOL_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Launch argument names
@@ -28,22 +41,28 @@ pub mod args {
     pub const AUDIO_SHM: &str = "--audio-shm";
     /// Source identifier string; echoed back in [`SourceMetrics::source_id`].
     pub const SOURCE_ID: &str = "--source-id";
-    /// Output video width in pixels (must match the core compositor tile width).
+    /// Production resolution width in pixels.  The adapter produces at this
+    /// resolution; the core scales to tile size (ADR-0012).
     pub const VIDEO_WIDTH: &str = "--video-width";
-    /// Output video height in pixels (must match the core compositor tile height).
+    /// Production resolution height in pixels.
     pub const VIDEO_HEIGHT: &str = "--video-height";
     /// Output framerate in frames per second (integer).
     pub const FRAMERATE: &str = "--framerate";
+    /// Core pipeline base time in nanoseconds; lets the adapter align its
+    /// GStreamer base time without a clock query round-trip.
+    pub const BASE_TIME: &str = "--base-time";
 }
 
 // ---------------------------------------------------------------------------
-// Video / audio caps that cross the boundary (ADR-0011)
+// Video / audio caps that cross the boundary (ADR-0011 / ADR-0012)
 // ---------------------------------------------------------------------------
 
 /// GStreamer caps template for the video shmsink the adapter must produce.
 /// Substitute `{width}`, `{height}`, `{fps}` before passing to GStreamer.
+/// `pixel-aspect-ratio=1/1` is required; the core's post-shmsrc capsfilter
+/// pins this field so negotiation is deterministic.
 pub const VIDEO_CAPS_TEMPLATE: &str =
-    "video/x-raw,format=RGBA,width={width},height={height},framerate={fps}/1";
+    "video/x-raw,format=RGBA,width={width},height={height},framerate={fps}/1,pixel-aspect-ratio=1/1";
 
 /// GStreamer caps for the audio shmsink the adapter must produce.
 pub const AUDIO_CAPS: &str = "audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved";
@@ -69,7 +88,19 @@ pub enum Command {
 #[serde(tag = "msg", rename_all = "snake_case")]
 pub enum AdapterMessage {
     /// Adapter has slaved the net clock and opened shm sockets; ready for [`Command::Play`].
-    Ready,
+    ///
+    /// `protocol_version` must equal [`PROTOCOL_VERSION`]; the core logs an
+    /// error and will not send Play if the version mismatches.
+    ///
+    /// `has_video` / `has_audio` tell the core which shm sockets are active.
+    /// The core wires only the pads for present streams (same logic as the
+    /// Phase-1 discoverer probe).  A video-only adapter sets `has_audio: false`
+    /// and must not create the audio shmsink socket.
+    Ready {
+        has_video: bool,
+        has_audio: bool,
+        protocol_version: u32,
+    },
     /// Per-source telemetry, ~1 Hz cadence (ADR-0008).
     Metrics(SourceMetrics),
     /// Adapter hit an unrecoverable error and will exit.

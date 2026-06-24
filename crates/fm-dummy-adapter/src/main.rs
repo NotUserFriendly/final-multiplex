@@ -1,23 +1,29 @@
-//! fm-dummy-adapter — Phase 2 test adapter (ADR-0005 / ADR-0011).
+//! fm-dummy-adapter — Phase 2 test adapter (ADR-0005 / ADR-0011 / ADR-0012).
 //!
-//! Produces a moving videotestsrc ball + audiotestsrc sine wave, slaved to
-//! the core's GstNetTimeProvider, and writes raw frames to shmsink sockets.
-//! Used to validate the process boundary and crash-isolation before RTSP.
+//! Normal mode: produces a moving videotestsrc ball + audiotestsrc sine wave,
+//! slaved to the core's GstNetTimeProvider, and writes raw frames to shmsink
+//! sockets.  Used to validate the process boundary and crash-isolation before RTSP.
+//!
+//! **`--no-frames` mode (C9 silent-adapter test):** opens shmsink sockets and
+//! emits Ready but keeps the pipeline in PAUSED — no frames ever enter the shm
+//! ring buffer.  Used to confirm the core compositor does not stall when a live
+//! shmsrc receives no data.
 //!
 //! Launch args (defined in fm_adapter_sdk::contract::args):
-//!   --clock-addr  host:port   GstNetClientClock endpoint
-//!   --video-shm   path        shmsink socket path for video
-//!   --audio-shm   path        shmsink socket path for audio
-//!   --source-id   id          identifier echoed in telemetry
-//!   --video-width  px         tile width
-//!   --video-height px         tile height
-//!   --framerate    fps        frames per second
-//!   --base-time    ns         core pipeline base time in nanoseconds
+//!   --clock-addr   host:port   GstNetClientClock endpoint
+//!   --video-shm    path        shmsink socket path for video
+//!   --audio-shm    path        shmsink socket path for audio
+//!   --source-id    id          identifier echoed in telemetry
+//!   --video-width  px          production resolution width  (ADR-0012)
+//!   --video-height px          production resolution height (ADR-0012)
+//!   --framerate    fps         frames per second
+//!   --base-time    ns          core pipeline base time in nanoseconds
+//!   --no-frames    (flag)      open sockets + emit Ready but never produce frames
 //!
 //! stdin:  line-delimited JSON fm_adapter_sdk::contract::Command
 //! stdout: line-delimited JSON fm_adapter_sdk::contract::AdapterMessage
 
-use fm_adapter_sdk::contract::{AdapterMessage, Command};
+use fm_adapter_sdk::contract::{AdapterMessage, Command, PROTOCOL_VERSION};
 use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
@@ -68,11 +74,11 @@ fn main() {
     let width: i32 = args
         .get("video-width")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(960);
+        .unwrap_or(1920);
     let height: i32 = args
         .get("video-height")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(540);
+        .unwrap_or(1080);
     let fps: i32 = args
         .get("framerate")
         .and_then(|v| v.parse().ok())
@@ -81,6 +87,11 @@ fn main() {
         .get("base-time")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let no_frames = args.contains_key("no-frames");
+
+    if no_frames {
+        eprintln!("[dummy-adapter] --no-frames mode: sockets open but no frames produced");
+    }
 
     // ── Pipeline ─────────────────────────────────────────────────────────
     let pipeline = gstreamer::Pipeline::new();
@@ -100,6 +111,7 @@ fn main() {
             .field("width", width)
             .field("height", height)
             .field("framerate", gstreamer::Fraction::new(fps, 1))
+            .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );
     vshmsink.set_property_from_str("socket-path", &video_shm);
@@ -145,11 +157,18 @@ fn main() {
         pipeline.set_base_time(gstreamer::ClockTime::from_nseconds(base_time_ns));
     }
 
-    // Start paused; produce frames only after Play is received.
+    // PAUSED creates the shmsink sockets (READY→PAUSED opens the socket file).
+    // In --no-frames mode we stay in PAUSED indefinitely so the socket exists
+    // but the ring buffer remains empty.  In normal mode we also start PAUSED
+    // and wait for a Play command before producing frames.
     pipeline.set_state(gstreamer::State::Paused).unwrap();
 
     // ── Announce ready ────────────────────────────────────────────────────
-    emit(AdapterMessage::Ready);
+    emit(AdapterMessage::Ready {
+        has_video: true,
+        has_audio: true,
+        protocol_version: PROTOCOL_VERSION,
+    });
 
     // ── Stdin command reader (separate thread) ────────────────────────────
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
@@ -181,9 +200,13 @@ fn main() {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Command::Play => {
-                    pipeline.set_state(gstreamer::State::Playing).unwrap();
-                    ingest_state = IngestState::Running;
-                    eprintln!("[dummy-adapter] Play");
+                    if no_frames {
+                        eprintln!("[dummy-adapter] Play (ignored — --no-frames mode)");
+                    } else {
+                        pipeline.set_state(gstreamer::State::Playing).unwrap();
+                        ingest_state = IngestState::Running;
+                        eprintln!("[dummy-adapter] Play");
+                    }
                 }
                 Command::Pause => {
                     pipeline.set_state(gstreamer::State::Paused).unwrap();

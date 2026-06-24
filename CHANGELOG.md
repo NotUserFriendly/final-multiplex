@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `fm-rtsp-adapter`: force TCP-only RTSP transport (`protocols = "tcp"`) — eliminates
+  repeated `not-negotiated (-4)` errors from `rtspsrc`'s internal `udpsrc` elements that
+  occurred when cameras required TCP but the adapter tried UDP first.
+- `fm-rtsp-adapter`: partial pipeline restart on reconnect — only `rtspsrc` and `decodebin3`
+  are cycled through NULL; the shmsink chains stay in PLAYING so their sockets remain open
+  and the core's shmsrc does not see a socket-closed event during in-process reconnect.
+  Previously the full pipeline was cycled, causing shmsrc errors in the core that the
+  supervisor never recovered from (it only calls `restart_shmsrc` on process death, not on
+  in-process reconnects).
+- `fm-rtsp-adapter`: add `videorate` to the video chain before `vcaps` — converts the
+  camera's native framerate to the configured grid fps so that the capsfilter downstream
+  emits fully-fixed caps.  Without this, removing the framerate field from vcaps caused
+  the core's `vshmcaps` to see a framerate range `[0, MAX]` and error with "output caps
+  are unfixed".
+
 ### Added
 - Phase 2 Step 6 — boundary throughput metrics (ADR-0008 always-on tier):
   - Both `fm-rtsp-adapter` and `fm-dummy-adapter` now install a GStreamer

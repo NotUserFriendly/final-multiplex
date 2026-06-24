@@ -116,8 +116,9 @@ fn main() {
     let rtspsrc = make("rtspsrc", "rtspsrc");
     rtspsrc.set_property("location", &uri);
     rtspsrc.set_property("latency", 200u32);
-    // Try TCP first; many cameras sit behind NAT that blocks UDP.
-    rtspsrc.set_property_from_str("protocols", "tcp+udp-mcast+udp");
+    // Force TCP: cameras on LAN handle TCP fine, and UDP causes
+    // caps not-negotiated failures from rtspsrc's internal udpsrc elements.
+    rtspsrc.set_property_from_str("protocols", "tcp");
 
     let decodebin = make("decodebin3", "decodebin3");
 
@@ -338,14 +339,20 @@ fn main() {
                     eprintln!("[rtsp-adapter] reconnect #{count}/{MAX_RECONNECTS} in {delay}s");
                     std::thread::sleep(Duration::from_secs(delay));
 
-                    let _ = pipeline.set_state(gstreamer::State::Null);
-                    // Restore PLAYING; pad-added callbacks will re-link.
-                    let _ = pipeline.set_state(gstreamer::State::Playing);
+                    // Partial restart: cycle only rtspsrc + decodebin3,
+                    // leaving the shmsink chains in PLAYING so their sockets
+                    // stay open and the core's shmsrc stays connected.
+                    let _ = rtspsrc.set_state(gstreamer::State::Null);
+                    let _ = decodebin.set_state(gstreamer::State::Null);
+                    let _ = decodebin.sync_state_with_parent();
+                    let _ = rtspsrc.sync_state_with_parent();
                 }
                 MessageView::Eos(_) => {
-                    eprintln!("[rtsp-adapter] EOS — restarting");
-                    let _ = pipeline.set_state(gstreamer::State::Null);
-                    let _ = pipeline.set_state(gstreamer::State::Playing);
+                    eprintln!("[rtsp-adapter] EOS — restarting source");
+                    let _ = rtspsrc.set_state(gstreamer::State::Null);
+                    let _ = decodebin.set_state(gstreamer::State::Null);
+                    let _ = decodebin.sync_state_with_parent();
+                    let _ = rtspsrc.sync_state_with_parent();
                 }
                 MessageView::Warning(w) => {
                     eprintln!("[rtsp-adapter] WARNING: {}", w.error());
@@ -452,6 +459,11 @@ fn build_video_chain(
     let vconv = make("videoconvert", "vconv");
     let vdeint = make("deinterlace", "vdeint");
     let vscale = make("videoscale", "vscale");
+    // videorate converts the camera's native framerate to the configured fps
+    // so that vcaps below can specify a fully-fixed framerate.  Without a fixed
+    // framerate in the caps, the core's capsfilter downstream sees a range and
+    // errors with "output caps are unfixed".
+    let vrate = make("videorate", "vrate");
     let vcaps = make("capsfilter", "vcaps");
     let vshmsink = make("shmsink", "vshmsink");
 
@@ -469,12 +481,12 @@ fn build_video_chain(
     vshmsink.set_property("sync", true);
     vshmsink.set_property("wait-for-connection", false);
 
-    pipeline.add_many([&vconv, &vdeint, &vscale, &vcaps, &vshmsink])?;
-    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps, &vshmsink])?;
+    pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
+    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
 
     // Sync each element to the pipeline state (which is PLAYING — live source,
     // so state changes return NO_PREROLL and complete immediately).
-    for elem in [&vconv, &vdeint, &vscale, &vcaps, &vshmsink] {
+    for elem in [&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink] {
         let _ = elem.sync_state_with_parent();
     }
 
@@ -491,7 +503,7 @@ fn build_video_chain(
     eprintln!("[rtsp-adapter] video chain ready → {shm_path}");
     Ok(Chain {
         sink,
-        elements: vec![vconv, vdeint, vscale, vcaps, vshmsink],
+        elements: vec![vconv, vdeint, vscale, vrate, vcaps, vshmsink],
     })
 }
 

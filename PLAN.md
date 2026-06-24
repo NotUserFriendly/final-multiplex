@@ -119,8 +119,6 @@ Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources
 
 ## Open questions
 
-- **shm payload:** raw frames vs encoded — bandwidth vs isolation. Decide at Phase 2.
-- **Source-adapter SDK crate shape:** finalize when Phase 2 makes the contract concrete.
 - **Runtime decode failure / stall resilience:** the build-time stall is **resolved** —
   a mixed scene (good sources plus a corrupt or video-only source) previously stalled the
   whole multiplex at "waiting for first frame"; good sources now play while unusable ones

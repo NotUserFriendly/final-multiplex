@@ -546,6 +546,7 @@ fn try_init(
                 scene.grid.width,
                 scene.grid.height,
                 scene.grid.fps,
+                s.uri.as_deref(),
             ) {
                 eprintln!("[app] failed to spawn adapter for '{}': {e}", s.id);
             } else {

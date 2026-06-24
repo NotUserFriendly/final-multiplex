@@ -72,6 +72,8 @@ struct LaunchSpec {
     video_height: u32,
     framerate: u32,
     base_time_ns: u64,
+    /// Optional source URI forwarded as `--uri` (e.g. `rtsp://...`).
+    uri: Option<String>,
 }
 
 struct LiveHandle {
@@ -134,6 +136,7 @@ impl Supervisor {
     /// Initial spawn for `source_id`. Call once at startup per external source.
     /// `prod_w` / `prod_h` are the production resolution the adapter should
     /// produce at (typically the full grid output resolution — ADR-0012).
+    /// `uri` is forwarded as `--uri` to adapters that use it (e.g. RTSP).
     pub fn spawn(
         &mut self,
         binary: &str,
@@ -142,6 +145,7 @@ impl Supervisor {
         prod_w: u32,
         prod_h: u32,
         fps: u32,
+        uri: Option<&str>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (video_shm, audio_shm) = Self::shm_paths(source_id);
         let spec = LaunchSpec {
@@ -154,6 +158,7 @@ impl Supervisor {
             video_height: prod_h,
             framerate: fps,
             base_time_ns: net.base_time_ns,
+            uri: uri.map(|s| s.to_string()),
         };
         self.specs.insert(source_id.to_string(), spec.clone());
         self.do_spawn(spec, 0)
@@ -310,25 +315,34 @@ impl Supervisor {
         let _ = std::fs::remove_file(&spec.audio_shm);
 
         use contract::args::*;
+        let video_w = spec.video_width.to_string();
+        let video_h = spec.video_height.to_string();
+        let framerate = spec.framerate.to_string();
+        let base_time = spec.base_time_ns.to_string();
+        let mut argv: Vec<&str> = vec![
+            CLOCK_ADDR,
+            &spec.clock_addr,
+            VIDEO_SHM,
+            &spec.video_shm,
+            AUDIO_SHM,
+            &spec.audio_shm,
+            SOURCE_ID,
+            &spec.source_id,
+            VIDEO_WIDTH,
+            &video_w,
+            VIDEO_HEIGHT,
+            &video_h,
+            FRAMERATE,
+            &framerate,
+            BASE_TIME,
+            &base_time,
+        ];
+        if let Some(ref u) = spec.uri {
+            argv.push(URI);
+            argv.push(u.as_str());
+        }
         let mut child = StdCommand::new(&spec.binary)
-            .args([
-                CLOCK_ADDR,
-                &spec.clock_addr,
-                VIDEO_SHM,
-                &spec.video_shm,
-                AUDIO_SHM,
-                &spec.audio_shm,
-                SOURCE_ID,
-                &spec.source_id,
-                VIDEO_WIDTH,
-                &spec.video_width.to_string(),
-                VIDEO_HEIGHT,
-                &spec.video_height.to_string(),
-                FRAMERATE,
-                &spec.framerate.to_string(),
-                BASE_TIME,
-                &spec.base_time_ns.to_string(),
-            ])
+            .args(&argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

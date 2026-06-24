@@ -1,0 +1,16 @@
+[package]
+name        = "fm-rtsp-adapter"
+description = "RTSP source adapter for Final Multiplex (Phase 2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fm-rtsp-adapter"
+path = "src/main.rs"
+
+[dependencies]
+fm-adapter-sdk.workspace  = true
+gstreamer.workspace       = true
+gstreamer-net.workspace   = true
+serde_json.workspace      = true

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 2 Step 5 — `fm-rtsp-adapter`: out-of-process adapter that streams one
+  RTSP camera into the Final Multiplex compositor via shared memory.
+  - Uses `rtspsrc → decodebin3` with dynamic pad-added callbacks so video and
+    audio chains are built on the fly when the RTSP server describes the streams.
+    No assumptions about codec or number of streams; `has_video` / `has_audio`
+    are determined by which pads actually appear.
+  - Emits `Ready` after a 3-second stability window from the first decoded pad
+    (gives time for a second stream to appear), or after a 30-second hard deadline
+    if no pads arrived (emits `has_video=false, has_audio=false` so the core
+    can still proceed).
+  - In-process reconnect: on `GstMessageError` the pipeline cycles NULL → PLAYING;
+    existing shmsink chains are kept in the pipeline so sockets stay open and
+    the core's shmsrc does not need to reset.  On reconnect the chains' sink pads
+    are re-linked to the new decoded pads from decodebin3.  After 8 failed
+    consecutive reconnects the adapter emits `Error` and exits; the supervisor
+    restarts the process with backoff.
+  - Slaved to the core's `GstNetClientClock` (same as the dummy adapter).
+  - `--uri` added to `contract::args` as a typed constant; supervisor passes it
+    whenever `SourceConfig.uri` is set on an external source.
+  - `scene-step5.toml`: test scene using the two known LAN cameras (`cam-27` and
+    `cam-77`) in a 1×2 grid at 1920×1080@30.  `adapter_ready_timeout_secs = 45`
+    to accommodate RTSP cold-start.
 - Phase 2 TaskBlock2 hardening pass (Groups A–D) — all changes below run before RTSP.
   - **A1 — Optional streams in `Ready`:** `AdapterMessage::Ready` is now a struct
     `{ has_video: bool, has_audio: bool, protocol_version: u32 }`.  The core wires only

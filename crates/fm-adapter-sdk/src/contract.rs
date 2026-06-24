@@ -51,6 +51,9 @@ pub mod args {
     /// Core pipeline base time in nanoseconds; lets the adapter align its
     /// GStreamer base time without a clock query round-trip.
     pub const BASE_TIME: &str = "--base-time";
+    /// Media source URI passed to adapters that accept one (e.g. RTSP, file).
+    /// Not all adapters use this; it is ignored if unrecognised.
+    pub const URI: &str = "--uri";
 }
 
 // ---------------------------------------------------------------------------

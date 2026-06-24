@@ -62,12 +62,6 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
       an audio shmsrc for this session.  ADR-0013 implementation: `StreamsChanged` after a
       reconnect will deliver the audio chain live; the original first-startup window is
       unchanged.  **Partially addressed; pending Group F validation.** (2026-06-23)
-- [ ] [rtsp-adapter] Reconnect storm after SIGKILL: the adapter was killed without sending
-      RTSP TEARDOWN, so the camera held the old session open (10–120 s) and the new process
-      failed to reconnect.  ADR-0013 implementation: supervisor now sends `Shutdown` and waits
-      3 s for the adapter to send RTSP TEARDOWN before force-killing — eliminates the storm for
-      all supervisor-initiated kills.  A direct `kill -9` from outside the supervisor still
-      skips TEARDOWN.  **Pending Group F validation** for supervisor kill path. (2026-06-24)
 
 ---
 
@@ -76,3 +70,12 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
 <!-- Move items here on fix. Format:
 - [x] [area] symptom — fix summary. (fixed YYYY-MM-DD)
 -->
+- [x] [rtsp-adapter] Reconnect storm after SIGKILL: supervisor-initiated kills now send
+      `Shutdown` and wait 3 s for RTSP TEARDOWN before force-killing.  Validated by
+      Group F Gate 3: SIGKILL detected, 1 s backoff, respawn, Configure delivered,
+      shmsrc reset — no orphaned camera session. (fixed 2026-06-24)
+- [x] [rtsp-adapter] Stream did not resume after RTSP interruption: adapter emitted
+      `Reconnecting`, supervisor held off, in-process partial restart (rtspsrc +
+      decodebin3 only) recovered both video and audio without process death.  Validated
+      by Group F Gate 2: iptables DROP → Reconnecting → iptables DELETE → full
+      recovery (video + audio). (fixed 2026-06-24)

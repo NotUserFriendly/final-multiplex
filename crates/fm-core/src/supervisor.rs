@@ -64,6 +64,10 @@ pub struct AdapterStatus {
     pub is_reconnecting: bool,
     /// Updated on every message from the adapter (used by silence watchdog).
     pub last_any_msg_at: Option<Instant>,
+    /// When this entry last transitioned into Running state.  Used by the frame
+    /// watchdog to catch adapters that claim has_video=true but never produce a
+    /// single frame (last_frame_at stays None).
+    pub running_since: Option<Instant>,
 }
 
 impl AdapterStatus {
@@ -77,6 +81,7 @@ impl AdapterStatus {
             last_frame_at: None,
             is_reconnecting: false,
             last_any_msg_at: None,
+            running_since: None,
         }
     }
 }
@@ -307,8 +312,15 @@ impl Supervisor {
                     if status.is_reconnecting {
                         continue;
                     }
-                    if let Some(last_frame) = status.last_frame_at {
-                        if last_frame.elapsed() > Duration::from_secs(WATCHDOG_SECS) {
+                    if status.has_video == Some(true) {
+                        let stale = match status.last_frame_at {
+                            Some(t) => t.elapsed() > Duration::from_secs(WATCHDOG_SECS),
+                            // Never produced a frame: fire once Running for WATCHDOG_SECS.
+                            None => status.running_since.map_or(false, |t| {
+                                t.elapsed() > Duration::from_secs(WATCHDOG_SECS)
+                            }),
+                        };
+                        if stale {
                             eprintln!(
                                 "[supervisor] '{id}' frame watchdog: no frames for \
                                  {WATCHDOG_SECS}s — initiating graceful shutdown"
@@ -485,6 +497,7 @@ impl Supervisor {
             entry.is_reconnecting = false;
             entry.last_frame_at = None;
             entry.last_any_msg_at = None;
+            entry.running_since = None;
             if attempt > 0 {
                 entry.restart_count += 1;
             }
@@ -558,6 +571,7 @@ fn handle_msg(
             entry.has_video = Some(has_video);
             entry.has_audio = Some(has_audio);
             entry.is_reconnecting = false;
+            entry.running_since = Some(Instant::now());
 
             if *playing.lock().unwrap() {
                 let line = contract::encode_command(&Command::Play);

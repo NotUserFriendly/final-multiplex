@@ -34,6 +34,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream set (video/audio presence) differs from what was last reported.
 
 ### Fixed
+- `fm-core/supervisor`: frame watchdog now also fires when `has_video=true` but
+  `last_frame_at` is `None` for `WATCHDOG_SECS`.  Previously, an adapter whose RTSP
+  session was established while the camera was at connection capacity (no video
+  allocation granted) would never produce a frame but also never trigger a restart —
+  `last_frame_at` stayed `None` so the `if let Some(...)` guard silently skipped it.
+  New `running_since` field tracks when the adapter entered Running state; watchdog
+  fires on that elapsed time when no frame has ever arrived.
+- `fm-rtsp-adapter`: reconnect partial-restart moved to a background thread.
+  `rtspsrc.sync_state_with_parent()` performs RTSP DESCRIBE/SETUP during the
+  READY→PAUSED transition; when the network is unreachable this blocks for the full
+  OS connect timeout (~30 s).  Running it on the main loop stalled the 1 Hz Metrics
+  emit, triggering the silence watchdog before recovery could complete.  Fix: sleep +
+  state cycling now happen in a `std::thread::spawn` closure; an `AtomicBool` debounce
+  flag (`reconnecting`) prevents concurrent reconnect threads on rapid error bursts.
 - `fm-rtsp-adapter`: Ready emission no longer holds the `shared` mutex across the
   `emit()` call.  Previously, `emit(Ready)` was called while `shared` was locked; if
   a `pad-added` callback was concurrently building a chain (also holding `shared`),

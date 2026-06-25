@@ -157,7 +157,7 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources.
 
 **Cross-machine / distributed deployment.** Net-clock calibration fails on supervisor-respawned
-adapters (ForReview Issue 3): the system-clock seed (ADR-0005, single-machine) is load-bearing on
+adapters (the respawn clock-calibration gap): the system-clock seed (ADR-0005, single-machine) is load-bearing on
 every reconnect and masks it. Single-machine is unaffected — the system clock is the genuine
 shared timebase. Cross-machine deployments cannot rely on the seed. **Trigger:** when core and
 adapters run on different machines. Likely resolved by ADR-0005's `GstPtpClock` upgrade path

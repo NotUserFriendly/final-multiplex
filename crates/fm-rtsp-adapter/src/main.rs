@@ -117,7 +117,7 @@ fn main() {
     // Measurement confirmed that net calibration packets do not arrive on
     // respawn (net_clock stayed at ZERO+elapsed after 60 s), so the seed is
     // load-bearing, not a hint.  The cause is unknown but may be a GStreamer
-    // child-process global-state issue; recorded in troubleshooting.md.
+    // child-process global-state issue; recorded in docs/troubleshooting.md.
     //
     // Cross-machine caveat: this seed only works when adapter and core share
     // a monotonic clock.  A cross-machine deployment would need the NTP

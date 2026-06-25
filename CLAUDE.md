@@ -29,8 +29,10 @@ A task is not done until ALL of these are true:
 
 ## Steering documents
 
-- **`PLAN.md`** — current objective, phases, and exit criteria. Read it before starting work; it is the source of truth for *what* to build next.
+- **`docs/PLAN.md`** — current objective, phases, and exit criteria. Read it before starting work; it is the source of truth for *what* to build next.
 - **`CHANGELOG.md`** — running record of shipped changes (Keep a Changelog format).
+- **`docs/BUGS.md`** — deferred and known bugs; log issues here when deferring a fix.
+- **`docs/troubleshooting.md`** — active hardware/runtime scratchpad.
 - **`docs/decisions/`** — Architecture Decision Records (ADRs). One file per significant decision.
 
 ## Working agreements
@@ -42,9 +44,12 @@ A task is not done until ALL of these are true:
   indistinguishable from a hang to the maintainer; "thinking…" with a stalled token count reads
   as broken, not intentional. If a step you expected to be quick runs long, say so as soon as
   that's apparent, and prefer emitting interim progress over going silent.
+- Prefer reading the completed PID-tied `session.log` after a run over live-tailing it. The log
+  is isolated per run (instance check + PID path), so reading it once the run finishes is faster
+  and less wasteful than blocking on a sometimes-empty live feed.
 - When you're blocked waiting on the maintainer (a physical action like an unplug/replug, or a
   decision), state plainly that you're now waiting and on what — don't sit silent.
-- Don't restate PLAN.md or CHANGELOG.md content here. Link, don't duplicate.
+- Don't restate docs/PLAN.md or CHANGELOG.md content here. Link, don't duplicate.
 
 ## Conventions
 

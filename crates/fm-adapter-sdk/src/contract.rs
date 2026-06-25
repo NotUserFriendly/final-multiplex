@@ -18,7 +18,7 @@
 //! **stdout-JSON fragility note:** any stray output on the adapter's stdout
 //! (e.g. from a GStreamer debug print) corrupts the line protocol.  Adapters
 //! must ensure all debug output goes to stderr.  A dedicated control fd is the
-//! correct long-term fix; deferred until it actually bites (see BUGS.md).
+//! correct long-term fix; deferred until it actually bites (see docs/BUGS.md).
 
 use crate::metrics::SourceMetrics;
 use serde::{Deserialize, Serialize};

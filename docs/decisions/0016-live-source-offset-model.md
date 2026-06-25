@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-24
+- **Refined by:** ADR-0017 (2026-06-24) extends with adapter-declared offset capability constraining the UI ceiling. Implementation this session: offset-reset-on-reconnect bug fixed (`source_layouts` write-back added to `set_source_offset`/`set_source_mute`; previously UI changes only updated live pads and were lost on chain rebuild); permanent offset canary added on `voff_q:src` to verify applied offset on every reconnect (commit 792887d, 150 ms tolerance).
 
 ## Context
 

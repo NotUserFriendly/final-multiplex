@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-24
+- **Refined by:** ADR-0020 (2026-06-25) bounds the unbounded deference with a core delivery watchdog. Implementation this session: Issue 1 fixed (adapter now emits `StreamsChanged(false)` at reconnect start so `StreamsChanged(true)` always follows); Issue 2 fixed (EOS backoff + 3 s core grace debounce); ADR-0020 watchdog wired in `supervisor.rs` with `delivery_watchdog_ms` config knob.
 
 ## Context
 

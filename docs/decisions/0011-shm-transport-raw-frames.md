@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-23
+- **Transport mechanism superseded:** ADR-0019 (2026-06-25) replaced `shmsink`/`shmsrc` with `unixfdsink`/`unixfdsrc` on Linux; the raw-decoded-frames payload decision here is retained.
 
 ## Context
 

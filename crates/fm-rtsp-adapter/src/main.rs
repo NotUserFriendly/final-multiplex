@@ -425,6 +425,25 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(delay));
                         let _ = rtspsrc_c.set_state(gstreamer::State::Null);
                         let _ = decodebin_c.set_state(gstreamer::State::Null);
+                        // Emit StreamsChanged(false) now, while pads are unlinked,
+                        // so the core chain is torn down before we reconnect.
+                        // This guarantees last_reported_caps=(false,false) so the
+                        // post-reconnect stability timer always emits StreamsChanged(true).
+                        let should_notify = {
+                            let mut s = shared_c.lock().unwrap();
+                            if s.ready_sent && s.last_reported_caps != Some((false, false)) {
+                                s.last_reported_caps = Some((false, false));
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_notify {
+                            emit(AdapterMessage::StreamsChanged {
+                                has_video: false,
+                                has_audio: false,
+                            });
+                        }
                         let _ = decodebin_c.sync_state_with_parent();
                         let _ = rtspsrc_c.sync_state_with_parent();
                         shared_c.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
@@ -445,14 +464,35 @@ fn main() {
                     emit(AdapterMessage::Reconnecting {
                         attempt: count as u32,
                     });
+                    // Apply the same backoff as the Error path so a rapidly-EOSing
+                    // source (camera RTSP stack still initialising after replug)
+                    // doesn't hammer rtspsrc with back-to-back restarts.
+                    let delay = reconnect_delay_secs(count as u32);
+                    eprintln!("[rtsp-adapter] EOS restart #{count}/{MAX_RECONNECTS} in {delay}s");
 
                     let rtspsrc_c = rtspsrc.clone();
                     let decodebin_c = decodebin.clone();
                     let shared_c = Arc::clone(&shared);
                     let reconnecting_c = Arc::clone(&reconnecting);
                     std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(delay));
                         let _ = rtspsrc_c.set_state(gstreamer::State::Null);
                         let _ = decodebin_c.set_state(gstreamer::State::Null);
+                        let should_notify = {
+                            let mut s = shared_c.lock().unwrap();
+                            if s.ready_sent && s.last_reported_caps != Some((false, false)) {
+                                s.last_reported_caps = Some((false, false));
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_notify {
+                            emit(AdapterMessage::StreamsChanged {
+                                has_video: false,
+                                has_audio: false,
+                            });
+                        }
                         let _ = decodebin_c.sync_state_with_parent();
                         let _ = rtspsrc_c.sync_state_with_parent();
                         shared_c.lock().unwrap().post_reconnect_check_at = Some(Instant::now());

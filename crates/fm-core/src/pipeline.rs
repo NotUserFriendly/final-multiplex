@@ -680,19 +680,34 @@ impl Pipeline {
             .by_name(&format!("aunixfdsrc_{source_id}"))
             .is_some();
 
-        if has_video && !current_has_video {
+        if has_video {
+            if current_has_video {
+                // Rebuild, not reuse: the compositor's sink pad carries a PTS
+                // timeline from the previous stream epoch.  After an adapter
+                // restart the new RTSP stream begins at PTS≈0; the aggregator
+                // stalls until PTS+offset catches up to the current session
+                // running time (~20 s freeze / single-frame pulses).
+                // Re-creating the pad (remove then add) gives the aggregator a
+                // blank slate — identical to what cold-start does via
+                // request_pad_simple.  This converges reconnect onto the same
+                // code path so the asymmetry cannot reappear.
+                self.remove_video_chain(source_id);
+            }
             if let Err(e) = self.add_video_chain(source_id) {
                 eprintln!("[pipeline] add_video_chain '{source_id}': {e}");
             }
-        } else if !has_video && current_has_video {
+        } else if current_has_video {
             self.remove_video_chain(source_id);
         }
 
-        if has_audio && !current_has_audio {
+        if has_audio {
+            if current_has_audio {
+                self.remove_audio_chain(source_id);
+            }
             if let Err(e) = self.add_audio_chain(source_id) {
                 eprintln!("[pipeline] add_audio_chain '{source_id}': {e}");
             }
-        } else if !has_audio && current_has_audio {
+        } else if current_has_audio {
             self.remove_audio_chain(source_id);
         }
     }
@@ -791,10 +806,32 @@ impl Pipeline {
         voff_q.set_property_from_str("leaky", "upstream");
         self.inner.add(&voff_q)?;
         vcaps_src.link(&voff_q.static_pad("sink").ok_or("voff_q: no sink")?)?;
-        voff_q
-            .static_pad("src")
-            .ok_or("voff_q: no src")?
-            .link(&comp_sink)?;
+        let voff_src = voff_q.static_pad("src").ok_or("voff_q: no src")?;
+        voff_src.link(&comp_sink)?;
+
+        // Group 1: log first PTS vs pipeline running time so reconnect PTS gaps
+        // appear in the log.  Fires once per chain build (cold-start and reconnect).
+        {
+            let pipeline_weak = self.inner.downgrade();
+            let sid = source_id.to_string();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            voff_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+                if !done.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data {
+                        if let Some(pipeline) = pipeline_weak.upgrade() {
+                            let running = pipeline.current_running_time();
+                            eprintln!(
+                                "[reconnect-pts] '{}' first_pts={:?} pipeline_running={:?}",
+                                sid,
+                                buf.pts(),
+                                running
+                            );
+                        }
+                    }
+                }
+                gstreamer::PadProbeReturn::Ok
+            });
+        }
 
         for elem in [
             &vunixfdsrc,

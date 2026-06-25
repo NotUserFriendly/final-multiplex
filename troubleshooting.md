@@ -77,3 +77,65 @@ discussing:
 Option 1 is the most defensible because it matches the already-working cold-start
 behavior exactly. Options 2 and 3 are more surgical but require careful segment/offset
 arithmetic. This is a decision for the review chat — flagged.
+
+**Attempt 1 — Option 1 implemented; partial result 2026-06-25.**
+
+Action: On `Ready` with `is_restart=true`, supervisor now always pushes to
+`streams_changed` (not `restarted`). `build_shmsrc_chain` tears down the existing
+video/audio chains before rebuilding if they are present. Code compiles and the
+Group 1 PTS diagnostic probe fires on every `add_video_chain` call.
+
+Result: The 20-second freeze / single-frame-pulse symptom is **gone** — the compositor
+pad teardown+rebuild is working as intended, and the old stale-pad PTS stall does not
+reappear. However, cam-77 still does not recover after reconnect. A second bug was
+discovered during the same test run.
+
+---
+
+## cam-77 reconnect: adapter clock sync timeout on respawn → PTS=0 → respawn loop
+
+**Symptom (discovered 2026-06-25):** After the compositor pad fix, cam-77 enters a
+120-second respawn loop instead of the 20-second pulse pattern. Video never resumes.
+
+**Root cause confirmed by log:** Every *respawned* adapter process (attempt≥1) emits
+`WARNING: clock sync timed out — proceeding`, then connects and begins producing frames.
+Cold-start adapters (attempt=0) do NOT emit this warning — their clock sync succeeds.
+
+Without a successful clock sync the adapter's pipeline base-time does not match the
+core's. All frames are timestamped relative to a fresh clock starting at zero.
+The Group 1 PTS probe confirms this:
+
+```
+[reconnect-pts] 'cam-77' first_pts=Some(0:00:00.000000000) pipeline_running=Some(0:08:10...)
+```
+
+PTS=0 frames arrive at the compositor when its running time is 8:10. The compositor
+correctly discards them as ~8 minutes late. The socket fills, `fps_in` drops to 0,
+and the 120-second frame watchdog fires. The respawn loop repeats indefinitely.
+
+**Why cold-start adapters sync but respawned ones time out:** unknown. The NetClock
+server port is unchanged. Adapter code and arguments are identical. The clock sync
+timeout in the adapter may be too short for an already-running provider, or
+GstNetClientClock may require more rounds to converge when calibrating against a clock
+that has been ticking for minutes. Needs investigation in the adapter source.
+
+**This is a separate bug from the stale compositor pad.** The compositor pad fix is
+correct and necessary; this clock sync issue would cause a different failure (frames
+silently dropped as late rather than the 20-second pulse freeze) even once the pad fix
+lands.
+
+**Options for review chat:**
+1. Increase or remove the clock sync wait timeout in the adapter so respawned processes
+   block until GstNetClientClock actually converges (simplest; adds startup latency on
+   respawn but that is fine — recovery is already slow).
+2. After clock sync timeout, fall back to using `pipeline_current_running_time()` at
+   the moment the first RTSP pad is linked to set a corrective pad offset
+   (`session_running_time - first_rtp_pts`) on the transport source. Surgical but
+   requires per-reconnect arithmetic in the adapter and/or core.
+3. Accept clock desync; compensate at the pipeline boundary: in `add_video_chain`, read
+   the pipeline's current running time and set it as the vcaps_src pad offset, effectively
+   making the compositor treat the reconnected stream as "starting now."
+   Downside: the offset calculation happens at chain-build time; there is a small window
+   before the first buffer arrives where the pad offset may be stale.
+
+Flagged to review chat before any fix is attempted.

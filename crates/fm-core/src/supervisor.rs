@@ -463,7 +463,6 @@ impl Supervisor {
 
         let source_id = spec.source_id.clone();
         let status = Arc::clone(&self.status);
-        let restarted = Arc::clone(&self.restarted);
         let streams_changed = Arc::clone(&self.streams_changed);
         let playing = Arc::clone(&self.playing);
         let stdin_for_reader = Arc::clone(&stdin);
@@ -479,7 +478,6 @@ impl Supervisor {
                         &source_id,
                         msg,
                         &status,
-                        &restarted,
                         &streams_changed,
                         &playing,
                         &stdin_for_reader,
@@ -547,12 +545,10 @@ impl Drop for Supervisor {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_msg(
     source_id: &str,
     msg: AdapterMessage,
     status: &Arc<Mutex<HashMap<String, AdapterStatus>>>,
-    restarted: &Arc<Mutex<Vec<String>>>,
     streams_changed: &Arc<Mutex<Vec<(String, bool, bool)>>>,
     playing: &Arc<Mutex<bool>>,
     stdin: &Arc<Mutex<std::process::ChildStdin>>,
@@ -586,7 +582,6 @@ fn handle_msg(
                  offset_polarity={offset_polarity:?} max_offset_ms={max_offset_ms})"
             );
             let is_restart = entry.restart_count > 0;
-            let prev_caps = (entry.has_video, entry.has_audio);
             entry.state = AdapterState::Running;
             entry.has_video = Some(has_video);
             entry.has_audio = Some(has_audio);
@@ -602,16 +597,15 @@ fn handle_msg(
                 }
             }
             if is_restart {
-                restarted.lock().unwrap().push(source_id.to_string());
-                // If caps changed (e.g., was offline at startup → now has streams),
-                // also push to streams_changed so the core adds or removes chains.
-                if prev_caps != (Some(has_video), Some(has_audio)) {
-                    streams_changed.lock().unwrap().push((
-                        source_id.to_string(),
-                        has_video,
-                        has_audio,
-                    ));
-                }
+                // Always push to streams_changed on restart — not only when caps
+                // changed.  build_shmsrc_chain will tear down and rebuild the chain
+                // even when has_video/audio are unchanged, which releases the
+                // compositor sink pad and resets its PTS timeline (fixes the
+                // ~20 s reconnect freeze; see pipeline.rs build_shmsrc_chain).
+                streams_changed
+                    .lock()
+                    .unwrap()
+                    .push((source_id.to_string(), has_video, has_audio));
             }
         }
 

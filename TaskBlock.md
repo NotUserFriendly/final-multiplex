@@ -1,68 +1,65 @@
-# Task Block — Phase 2 close-out: seam, reconnect-freeze, dummy enrichment, log clear
+# Task Block — converge reconnect onto the cold-start chain-build path
 
-Phase 2's gate is met (T3 flat offset on live RTSP). These are the close-out items before
-Phase 3. None should change the validated offset behavior — Group 1 is a behavior-preserving
-refactor, and T3 on live RTSP is the regression gate for it.
+Fixes the cam-77 reconnect freeze. Root cause (confirmed by the cold-start/replug asymmetry):
+on replug, the compositor's cam-77 sink pad is session-old and holds an established PTS
+timeline, so a stream that restarts at PTS≈0 reads as ~hundreds of seconds in the past and the
+aggregator stalls (the ~20 s pulses are its latency-timeout). Cold-start avoids this because it
+requests a fresh pad with no timeline. Fix: make reconnect rebuild the chain the same way
+cold-start does, instead of reusing the stale pad.
 
-## Group 1 — finish the transport seam (ADR-0019)
+No ADR — this implements ADR-0013 (core handles reconnect topology via `StreamsChanged`), it
+doesn't decide anything new. The reasoning lives in a code comment at the rebuild site.
 
-Right now both adapters call `make("unixfdsink")` directly and the core builds `unixfdsrc`
-inline — the per-platform element choice is hardcoded, not behind the seam ADR-0019 specified.
-Realize the seam so adding a platform is one match arm at each end, not an edit per adapter:
+## Group 1 — confirm the PTS gap (cheap insurance before the fix)
 
-- **SDK output builder.** Add a function in `fm-adapter-sdk` that, given a video/audio output
-  request (socket path + caps), creates and returns the platform's sink — `unixfdsink` on
-  Linux, behind a single `cfg(target_os)` / platform switch. Both adapters call this instead
-  of constructing the sink themselves.
-- **Core receive builder.** The matching selection for the source side: `unixfdsrc` on Linux,
-  behind the same single switch, in the one place the receive chain is built.
-- **Refactor `fm-dummy-adapter` and `fm-rtsp-adapter`** to use the SDK builder; remove their
-  direct `unixfdsink` construction.
-- This is a **behavior-preserving refactor** — same elements, same properties, relocated. Do
-  not change the transport behavior. **Regression gate: T3 must still pass flat at +2000 ms on
-  live RTSP after the refactor.**
+- At reconnect, log the new stream's first PTS against the pipeline running time. Expect
+  first-PTS ≈ 0 while running time ≈ session age (hundreds of seconds). If it matches, the
+  diagnosis is nailed and you proceed. If it does **not**, stop and report — the fix below
+  assumes this gap.
 
-## Group 2 — confirm the cam-77 reconnect-freeze (HUMAN-IN-THE-LOOP)
+## Group 2 — the fix: reconnect tears down and rebuilds via the cold-start path
 
-The original cam-77 freeze (recv_q backpressure after a long reconnect cycle) was never
-root-caused and predates unixfd. unixfd changes the backpressure dynamics, so re-confirm
-whether it recurs.
+- On reconnect (adapter respawn → new stream available), **release the cam-77 compositor sink
+  pad and tear down its video chain** (voff_q, vcaps, vscale, etc.), then **rebuild it through
+  the same `add_video_chain` path cold-start uses** — fresh requested pad, fresh aggregator
+  timeline. Same for the audio chain via its mixer pad.
+- Concretely: route the reconnect's `StreamsChanged` through the identical teardown+build the
+  cold-start path already runs, rather than the current reuse-the-existing-pad branch. The goal
+  is that reconnect and cold-start converge on one code path, so the asymmetry can't reappear.
+- The rebuild re-applies the source's pad offset fresh (the bounded live offset, ADR-0016) —
+  verify it does, so a reconnect doesn't silently drop the user's offset.
+- During the rebuild gap the tile shows the black floor (ADR-0018) — that's correct ("no
+  signal"), not a bug to suppress.
+- **Add a code comment at the rebuild site** explaining why reconnect rebuilds rather than
+  reuses: a session-old aggregator pad holds a PTS timeline the restarted stream (PTS≈0)
+  cannot satisfy, so the pad must be re-created to reset it. This is the durable record; no ADR.
 
-- **STOP-AND-WAIT: this test needs a physical unplug/replug of cam-77, which only the
-  maintainer can do. You cannot perform it yourself.** Set up the test, then **stop and
-  explicitly ask the maintainer to unplug the camera, and wait for confirmation before
-  continuing. Do not simulate the disconnect, do not assume it happened, do not proceed as if
-  the cable moved.** Same again for the replug. The maintainer is not able to teleport on your
-  schedule — pause and hand control back at each physical step.
-- Procedure: run with cam-77 streaming and confirm live → ask maintainer to **unplug cam-77**,
-  wait → observe the adapter goes Reconnecting, other sources unaffected → ask maintainer to
-  **replug cam-77**, wait → confirm video resumes and does **not** freeze.
-- If it freezes: capture `recv_q` (via `ss -tnp` on the RTSP socket) and adapter CPU, and
-  **report back** — do not chase it solo. This is the multi-attempt bug from before; if it
-  survives unixfd it's a review-chat discussion, not a quick patch.
+## Group 3 — guard against disturbing other sources
 
-## Group 3 — enrich the dummy adapter with real events
+- Cold-start already proves a pad request on the live compositor doesn't disturb cam-27. The
+  new operation here is the **release** of a live pad — confirm releasing cam-77's pad and
+  chain leaves cam-27 (and the floors) untouched: no glitch, no dropped frames, no aggregator
+  re-negotiation hiccup on the other pads.
 
-The dummy adapter emits a minimal event stream, which is exactly why it hid the GDP bug for
-three rounds. Make it emit `decodebin3`-like events so transport-payload bugs surface on the
-cheap deterministic path:
+## Group 4 — validation (human-in-the-loop; you cannot move the cable)
 
-- Emit `stream-start`, `stream-collection`, and `tags` events on the dummy adapter's output,
-  matching the shape a real `decodebin3` source produces.
-- After enrichment, re-run **T1 and T3 on the dummy path** and confirm the events pass through
-  unixfd cleanly (they should — unixfd carries events natively) and the offset still holds.
-  This proves the dummy now exercises the event path a real source would.
+**STOP-AND-WAIT, same as before: the unplug/replug is physical and only the maintainer can do
+it. Set up, then stop and ask the maintainer to act, and wait for confirmation at each step. Do
+not simulate or assume the cable moved.**
 
-## Group 4 — housekeeping
+- Reconnect (the bug): cam-77 streaming → ask maintainer to **unplug**, wait → adapter goes
+  Reconnecting, cam-27 unaffected → ask maintainer to **replug**, wait → confirm cam-77 video
+  resumes at steady fps with **no ~20 s freeze/pulse pattern**.
+- Reconnect + offset: with cam-77 at a +2000 ms offset, confirm the offset still holds after
+  reconnect (not dropped, not divergent).
+- Cold-start unchanged: offline-at-launch → plug in → still works (didn't regress the path you
+  converged onto).
+- cam-27 untouched throughout every reconnect.
 
-- **Clear `troubleshooting.md`.** The cam-77-freeze and GDP-spike sections are resolved or
-  superseded (unixfd replaced GDP; cold-start fixed). Reset the file to just its header/purpose
-  block so it's a clean scratchpad for the next active bug. (The maintainer has delegated this
-  clear to you for this round.)
-- **ADR-0016** has been corrected by the maintainer (the `leaky=downstream` text was a factual
-  error; the correct mode is `leaky=upstream`, which the code already does). No code change —
-  just be aware the ADR text now matches the code.
-- CHANGELOG: transport seam realized (ADR-0019), dummy adapter event enrichment, and the
-  cam-77 reconnect-freeze result (once Group 2 produces one).
-- DoD checklist per commit; commit in chunks (seam refactor; dummy enrichment; housekeeping).
-  Group 2's result is reported to the review chat, not self-resolved.
+## Group 5 — housekeeping
+
+- CHANGELOG: cam-77 reconnect freeze fixed by rebuilding the source chain on reconnect (PTS
+  timeline reset); note it implements ADR-0013, no new ADR.
+- BUGS.md / troubleshooting.md: the reconnect-freeze entry resolves once Group 4 passes — move
+  the outcome to CHANGELOG and clear the scratchpad entry.
+- DoD checklist per commit.

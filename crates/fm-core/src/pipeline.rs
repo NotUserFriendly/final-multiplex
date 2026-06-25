@@ -187,6 +187,26 @@ impl Pipeline {
             .name("autoaudiosink")
             .build()?;
 
+        // audiotestsrc(silence) ensures audiomixer always has at least one
+        // input so it can negotiate caps even when every source is video-only
+        // or offline at startup. Adding live=true keeps it consistent with
+        // the rest of the live pipeline.
+        let silence_src: gstreamer::Element = gstreamer::ElementFactory::make("audiotestsrc")
+            .name("silence_src")
+            .build()?;
+        silence_src.set_property_from_str("wave", "silence");
+        silence_src.set_property("is-live", true);
+        let silence_caps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
+            .name("silence_caps")
+            .build()?;
+        silence_caps.set_property(
+            "caps",
+            gstreamer::Caps::builder("audio/x-raw")
+                .field("rate", 48_000i32)
+                .field("channels", 2i32)
+                .build(),
+        );
+
         pipeline.add(&compositor)?;
         pipeline.add(&comp_capsfilter)?;
         pipeline.add(&appsink)?;
@@ -194,10 +214,20 @@ impl Pipeline {
         pipeline.add(&aconv_out)?;
         pipeline.add(&aresamp_out)?;
         pipeline.add(&autoaudiosink)?;
+        pipeline.add(&silence_src)?;
+        pipeline.add(&silence_caps)?;
 
         compositor.link(&comp_capsfilter)?;
         comp_capsfilter.link(&appsink)?;
         gstreamer::Element::link_many([&audiomixer, &aconv_out, &aresamp_out, &autoaudiosink])?;
+        gstreamer::Element::link_many([&silence_src, &silence_caps])?;
+        let mix_silence_pad = audiomixer
+            .request_pad_simple("sink_%u")
+            .ok_or("audiomixer: could not request silence sink pad")?;
+        silence_caps
+            .static_pad("src")
+            .ok_or("silence_caps: no src pad")?
+            .link(&mix_silence_pad)?;
 
         // ── Per-source elements ────────────────────────────────────────────
         let n = scene.source.len() as u32;

@@ -567,6 +567,7 @@ fn handle_msg(
                  (video={has_video} audio={has_audio})"
             );
             let is_restart = entry.restart_count > 0;
+            let prev_caps = (entry.has_video, entry.has_audio);
             entry.state = AdapterState::Running;
             entry.has_video = Some(has_video);
             entry.has_audio = Some(has_audio);
@@ -581,6 +582,15 @@ fn handle_msg(
             }
             if is_restart {
                 restarted.lock().unwrap().push(source_id.to_string());
+                // If caps changed (e.g., was offline at startup → now has streams),
+                // also push to streams_changed so the core adds or removes chains.
+                if prev_caps != (Some(has_video), Some(has_audio)) {
+                    streams_changed.lock().unwrap().push((
+                        source_id.to_string(),
+                        has_video,
+                        has_audio,
+                    ));
+                }
             }
         }
 

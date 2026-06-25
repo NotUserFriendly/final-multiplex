@@ -98,6 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emits fully-fixed caps.  Without this, removing the framerate field from vcaps caused
   the core's `vshmcaps` to see a framerate range `[0, MAX]` and error with "output caps
   are unfixed".
+- `fm-core/pipeline`: `audiomixer` now always has at least one input — a permanent
+  live `audiotestsrc wave=silence` is wired as a seed input at build time.  Without
+  it, a scene where every source is video-only or offline at startup left the
+  `audiomixer → autoaudiosink` chain with zero inputs; the chain could not negotiate
+  audio caps, blocking the pipeline from reaching PLAYING state and preventing video
+  from rendering at all.
+- `fm-core/supervisor`: adapter process restart with changed stream caps now
+  triggers a `streams_changed` notification in addition to the `restarted` reset.
+  Previously, if a source was skipped at startup (Ready sent `video=false,
+  audio=false`) and its adapter process exhausted all reconnect retries and was
+  respawned, the fresh adapter's Ready `video=true, audio=true` updated the status
+  map but never pushed to `streams_changed`.  `restart_external_source` was called
+  (no-op — no chain existed), and the source remained absent from the display for the
+  rest of the session.  Fix: capture previous caps before updating; push to
+  `streams_changed` when `is_restart && prev_caps != new_caps`.
 
 ### Added
 - Phase 2 Step 6 — boundary throughput metrics (ADR-0008 always-on tier):

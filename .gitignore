@@ -31,6 +31,9 @@ Desktop.ini
 .env.*
 /secrets/
 
+# --- Local-only task scratchpads ---
+TaskBlock.md
+
 # --- Local media scratch ---
 # Don't commit test clips, stream dumps, or recordings.
 # Put intentional sample assets in e.g. /assets/ and they'll still be tracked.

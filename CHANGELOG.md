@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface on the cheap deterministic path, not only against live cameras.
 
 ### Added
+- **`delivery_watchdog_ms` config knob (ADR-0020):** `[grid]` section; default 30 000 ms.
+  When an adapter reports `fps_in > 0` but the core has no active chain for that source,
+  and the divergence persists beyond the timeout, the supervisor force-respawns the adapter
+  via the proven cold-start path.  Lower = faster backstop but more false-respawn risk;
+  must exceed the normal recovery + RTSP connect window.
 - **Offset reconnect canary (`[offset-canary]`):** a permanent, always-on probe on
   `voff_q:src` verifies the applied pad offset matches `source_layouts` on every chain
   rebuild.  Samples 20 buffers after the voff_q fill phase (windowed by `ceiling_ms +
@@ -35,6 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency.
 
 ### Fixed
+- **In-process reconnect now emits `StreamsChanged(true)` (Issue 1):** the RTSP
+  adapter now emits `StreamsChanged(false,false)` at the start of each reconnect attempt
+  (before `sync_state_with_parent`), guaranteeing `last_reported_caps` is `(false,false)`
+  when the post-reconnect stability timer fires.  Previously the stability timer
+  short-circuited when `last_reported_caps` was already `(true,true)` and the pad had
+  re-linked quickly, silently leaving the core chain torn down forever.
+  Hardware validated: unplug → 5 backoff attempts → replug → `StreamsChanged(true)`
+  → chain rebuilt → offset canary silent (500 ms offset survived).
+- **EOS churn: backoff and grace period (Issue 2):** the RTSP adapter now applies
+  the same exponential backoff to EOS-triggered restarts as to error-triggered ones,
+  preventing a rapidly-EOSing source from hammering `rtspsrc`.  The core supervisor
+  holds `StreamsChanged(false,false)` for 3 s (`STREAMS_GRACE_MS`) before tearing down
+  the chain; a recovery event within the grace period cancels the tear-down, so a fast
+  camera reconnect produces one rebuild rather than a remove+add cycle.
 - **Per-source offset and mute survive reconnect:** `transport::set_source_offset` and
   `set_source_mute` now write back to `source_layouts` (via `Pipeline::update_source_layout_offset`
   / `update_source_layout_mute`) in addition to updating the live pads.  Previously,

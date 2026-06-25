@@ -10,44 +10,32 @@ but has no watchdog for the case where an adapter is alive and internally
 
 ## Issue 1 — In-process reconnect: "video reconnected" with no StreamsChanged follow-up
 
-The RTSP adapter reconnects its internal source and logs success, but never
-emits `StreamsChanged(video=true audio=true)` to the core. The core's chain
-stays torn down (removed on the earlier `StreamsChanged(video=false)`). The
-tile is blank. Metrics show frames flowing (~0.6 fps via the control channel)
-so the adapter appears healthy. Required a manual `kill` of the adapter process
-to force a clean supervisor respawn.
+**RESOLVED** (commits a1c8be7, 989f79e)
 
-```
-[rtsp-adapter] video reconnected
-[rtsp-adapter] audio reconnected
-                                     ← StreamsChanged(video=true) never arrives
-```
+Root cause: the post-reconnect stability timer only emitted `StreamsChanged(true)` if
+`last_reported_caps != current`. When the pad re-linked fast enough that the timer saw it
+as already linked, and `last_reported_caps` was still `(true,true)` from the previous
+successful session, the check short-circuited. `StreamsChanged(true)` was never emitted.
 
-**Impact:** Blank tile with no automatic recovery. Core and adapter have
-diverged on stream state with no detection mechanism.
+Fix: the adapter now emits `StreamsChanged(false,false)` at reconnect start (before
+`sync_state_with_parent`), pinning `last_reported_caps = (false,false)`. The stability
+timer then always sees a change and emits `StreamsChanged(true)` on recovery. The core
+supervisor holds `StreamsChanged(false)` for 3 s before tearing down the chain, so a
+fast reconnect avoids a remove+add cycle.
+
+Hardware validated: unplug → backoff → replug → `StreamsChanged(true)` → chain rebuilt
+→ offset canary silent. (2026-06-25)
 
 ---
 
 ## Issue 2 — EOS loop: connect → EOS → chain removed → reconnect → repeat
 
-After replug, the camera came up but the RTSP stream dropped almost immediately
-on each attempt, cycling through chain add/remove repeatedly before (eventually)
-stabilising. When the loop coincided with Issue 1, the adapter got permanently
-stuck in the broken state.
+**RESOLVED** (commits a1c8be7, 989f79e)
 
-```
-[pipeline] added video chain for 'cam-77'
-[reconnect-pts] 'cam-77' first_pts=Some(0:04:04.276323840) pipeline_running=Some(0:04:04.374703360)
-[rtsp-adapter] EOS — restarting source
-[supervisor] 'cam-77': Reconnecting (attempt 8)
-[pipeline] removed video chain for 'cam-77'
-[rtsp-adapter] video reconnected
-[rtsp-adapter] audio reconnected
-                                     ← chain never re-added (Issue 1 triggered)
-```
-
-**Impact:** Composes with Issue 1 to produce a permanently blank tile after a
-replug where the camera takes time to stabilise its RTSP stack.
+Fixes: adapter EOS path now applies the same exponential backoff as the error path
+(was immediate restart). Core now debounces `StreamsChanged(false,false)` for 3 s —
+a fast EOS+reconnect completes before the grace period expires, so no chain tear-down
+occurs. Hardware validated same session as Issue 1 above.
 
 ---
 

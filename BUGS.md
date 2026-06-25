@@ -41,15 +41,10 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
       parse error by the supervisor.  Adapters must route all diagnostic output to stderr.
       The correct architectural fix is a dedicated control file-descriptor (not stdout),
       deferred until it bites in practice.  Documented in ADR-0012 Consequences. (2026-06-23)
-- [ ] [pipeline] GStreamer criticals flood on adapter crash: when an external adapter dies,
-      `shmsrc` enters error state with an invalid poll fd.  Setting the element to NULL to
-      reconnect triggers `gst_poll_fd_has_error / gst_poll_remove_fd: assertion 'fd->fd >= 0'
-      failed` hundreds of times in stderr before cleanup completes.  Non-fatal — core and all
-      other sources continue, adapter restarts and shmsrc reconnects — but the noise obscures
-      the log.  Root cause: GStreamer's shmsrc does not fully reset its poll set before posting
-      the error event, so fd references are invalid by the time we call set_state(Null).
-      Fix direction: send a GST_EVENT_FLUSH_START/STOP before the NULL transition, or defer
-      the element reset until the fd is confirmed closed. (2026-06-23)
+- [ ] [pipeline] GStreamer criticals on adapter crash: original shmsrc poll-fd assertion flood
+      may be resolved by the transport change (shmsrc → unixfdsrc, ADR-0019, 2026-06-25).
+      Needs verification: crash an adapter and check whether `gst_poll_fd_has_error` criticals
+      still appear with unixfdsrc.  If absent, close this entry. (2026-06-23, updated 2026-06-25)
 
 ---
 

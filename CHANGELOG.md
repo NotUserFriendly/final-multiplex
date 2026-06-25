@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **T3 offset accuracy validated on live RTSP (2026-06-25):** With the unixfd transport,
+  voff_q leaky=upstream, and compositor latency=ceiling_ns, both cameras deliver at steady
+  30 fps (33 ms frame intervals, no burst-gap pattern).  The n×2800 ms PTS divergence from
+  the leaky=downstream bug is confirmed absent.  Measured via T3-COMP probes on voff_q:src
+  for cam-27 (offset=0) and cam-77 (offset=2000 ms) over 20 frames each.
 - **Synthetic floor inputs (ADR-0018):** a permanent silent `audiotestsrc` (wave=silence,
   volume=0 on mixer pad) now feeds the audiomixer, and a permanent black `videotestsrc`
   (pattern=black, zorder=0) now feeds the compositor.  Both are infrastructure, not sources:

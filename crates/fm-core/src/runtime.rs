@@ -12,6 +12,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::io::IntoRawFd;
+
 /// Root directory for all Final Multiplex runtime files.
 pub fn runtime_root() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -92,6 +95,76 @@ pub fn cleanup() {
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Check whether another Final Multiplex instance is already running.
+/// Scans the runtime root for per-PID run directories whose owning process
+/// is still alive (and is not the calling process).  Returns the PID of the
+/// first live instance found, or `None` if none exists.
+///
+/// Call after `reap_orphans()` so dead entries are removed first.
+pub fn another_instance_running() -> Option<u32> {
+    let root = runtime_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return None;
+    };
+    let my_pid = std::process::id();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == my_pid {
+            continue;
+        }
+        if pid_is_alive(pid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Path of the session log file for this run.
+/// The run dir must already exist (call `ensure_dirs()` first).
+pub fn session_log_path() -> PathBuf {
+    run_dir().join("session.log")
+}
+
+/// Redirect stderr (fd 2) to `<<run_dir>>/session.log` so all subsequent
+/// `eprintln!` calls from this process and its children (which inherit fd 2)
+/// are captured in a per-run log.
+///
+/// Call `session_log_path()` and print it to the terminal BEFORE calling
+/// this function — after the redirect, terminal stderr is gone.
+///
+/// On non-Unix platforms this is a no-op; the function succeeds but no
+/// redirection is performed.
+pub fn init_session_log() -> std::io::Result<PathBuf> {
+    let log_path = session_log_path();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)?;
+
+    #[cfg(unix)]
+    {
+        let log_fd = file.into_raw_fd();
+        unsafe {
+            libc::dup2(log_fd, 2);
+            libc::close(log_fd);
+        }
+    }
+    #[cfg(not(unix))]
+    drop(file);
+
+    Ok(log_path)
 }
 
 fn pid_is_alive(pid: u32) -> bool {

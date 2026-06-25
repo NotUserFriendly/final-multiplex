@@ -1,71 +1,99 @@
-# Task Block — SPIKE: GDP-framed shm to carry PTS across the boundary
+# Task Block — swap Linux transport to unixfd (ADR-0019), then finish the offset path
 
-**Measure first. Commit nothing architectural until the data passes.** The bet: wrapping
-the shm payload in the GStreamer Data Protocol (`gdppay`/`gdpdepay`) makes buffer PTS, caps,
-and segment survive the process boundary — which should fix the offset divergence (Test 3)
-and likely the cam-77 freeze. Prove it on the dummy path, then report back. The ADR is
-authored in the review chat after the measurements, per the working agreement — **do not
-author or edit an ADR in this pass.**
+**What changed:** GDP can't carry decodebin3's event stream on 1.28.2. Per ADR-0019 the
+transport becomes platform-selected behind two seams; Linux uses `unixfd`. This removes the
+shm + GDP path on Linux and unblocks everything that was stuck behind it.
 
-Why GDP over `unixfd`: GDP keeps the existing shm transport (ADR-0011) and just frames the
-payload, and it is platform-portable — it works over any byte transport including on the
-Windows demo target, where `unixfdsink`'s unix-domain-socket model does not fit. So this is
-an *amendment* to ADR-0011 (shm retained; payload now GDP-framed), not a transport swap.
+**Done — do NOT redo:** synthetic floors (ADR-0018, PLAYING timeout resolved), the cascade
+fix (Play gated on PLAYING). Both confirmed working.
 
-## Pre-check
-- Confirm `gst-inspect-1.0 gdppay` and `gdpdepay` resolve on the dev box (they're in
-  gst-plugins-bad). If absent, stop and report — do not substitute silently.
+**Still pending (was blocked behind the transport):** compositor latency, `voff_q`
+correction, cam-77 cold-start, validation, test isolation.
 
-## The change (minimal, dummy path first)
-- **Adapter** (`fm-dummy-adapter` first): insert `gdppay` just before each shmsink —
-  `... -> vcaps -> gdppay -> vshmsink`, same for audio. `gdppay` serializes each buffer with
-  its PTS/DTS/caps/segment into the byte stream the shmsink writes.
-- **Core** (`build_shmsrc_chain` and the initial build path): insert `gdpdepay` right after
-  each shmsrc — `shmsrc -> gdpdepay -> vshmcaps -> queue -> ...`. `gdpdepay` reconstructs the
-  buffers with their original PTS/caps.
-- **Set `do-timestamp=false` on the core `vshmsrc`/`ashmsrc`.** This is the crux: we now
-  *want* the adapter's PTS (restored by gdpdepay) to pass through, not be overwritten by
-  arrival stamping. (Test 1's toggle failed before *because* bare shm carried no PTS;
-  gdpdepay now supplies it, so do-timestamp=false should work.)
-- **Leave adapter shmsink `sync=false`.** With PTS meaningful end-to-end, the core presents
-  per-PTS against the shared clock; the adapter should still push timestamped buffers ASAP.
-  Pacing at the adapter sink (`sync=true`) is what caused the reconnect-freeze, so keep it
-  off here.
-- **Caps:** `gdpdepay` restores caps, so the `vshmcaps`/`ashmcaps` capsfilter after it may
-  now be redundant or could conflict. Verify negotiation works; keep the capsfilter only if
-  it agrees with gdpdepay's output, otherwise drop it.
+Order: settle the premise (Group 1), confirm the tool (Group 2), build the seam + unixfd
+(Group 3), then the pending offset items, then validate on **real RTSP**.
 
-## Measurements (re-run the keystone tests on the dummy path)
+## Group 1 — settle the do-timestamp question, once, with a measurement
 
-1. **Test 1 redux — does PTS now cross?** Probe PTS at the adapter (before `gdppay`) and at
-   the core (after `gdpdepay`) for the same source. **Pass = the two PTS series now match**
-   (preserved), where before they were unrelated (arrival-stamped).
-2. **Test 3 redux — does the offset hold?** Two dummy sources, offset one by 2000 ms.
-   **Pass = a flat, stable +2000 ms shift** (not the old n×2000 ms divergence), with the
-   normal share of frames reaching the compositor (not 5%).
-3. **Test 2 redux — A/V still locked?** Confirm per-source A/V skew is still stable (now via
-   real PTS rather than coincidental arrival timing).
-4. **RTSP smoke (after dummy passes):** point one adapter at a live camera, confirm it plays
-   and the `recv_q` backpressure freeze does not recur. Quick smoke only — not full RTSP
-   integration.
+Before building anything, run the controlled test that was asserted but never cleanly
+isolated. Dummy adapter, **no framing**, plain `shmsrc` `do-timestamp=false`, probe core PTS
+against adapter PTS.
+- **If PTS does NOT cross** (expected — documented shm behavior): proceed to unixfd. The
+  question is now settled; do not revisit it.
+- **If PTS DOES cross** (unexpected): **stop and report** — the whole framing/transport swap
+  may be unnecessary and ADR-0019's premise needs revisiting before you build.
 
-## Gate
-- **All pass (esp. 1 and 3):** stop and report the data. The review chat authors the ADR
-  amending ADR-0011 (shm retained, payload GDP-framed, do-timestamp off), then you implement
-  fully across both adapters and the topology-build path.
-- **Fail (PTS still not crossing, or offset still diverges):** report the data, commit
-  nothing, and we reassess (e.g. `unixfd` on Linux as a fallback). Do not paper over a
-  failure by re-enabling arrival stamping.
+## Group 2 — confirm unixfd is available
 
-## Scope — do NOT do in this pass
-- No live topology-build fix (the cam-77 cold-start case) — that comes after, against the
-  new framed chain.
-- No metrics rework, no `fps_in` fix, no visual state overlays — separate passes.
-- No full RTSP integration beyond the smoke test.
+- `gst-inspect-1.0 unixfdsink` and `unixfdsrc` resolve on the dev box (need GStreamer ≥ 1.24;
+  box is 1.28.2). If absent, stop and report — do not substitute silently.
 
-## Housekeeping
-- Record the measured PTS series and offset numbers in `troubleshooting.md` (active
-  investigation), numbers not conclusions.
-- Temporary probes reverted (or behind a debug flag) before finishing.
-- No ADR authored/edited by CC. No CHANGELOG entry yet — nothing ships from a spike until
-  the architecture decision is made.
+## Group 3 — transport seam + unixfd (ADR-0019)
+
+- **Introduce the seam.** SDK exposes an output builder ("give me a video/audio output") that
+  selects the platform sink; the core's receive-chain builder selects the matching source.
+  Adapters call the builder and **never name the transport element** — they stay OS-agnostic.
+- **Linux path = unixfd.** Adapter side: `… → unixfdsink`. Core side: `unixfdsrc → …`.
+- **Remove the shm + GDP path on Linux:** drop `gdppay`/`gdpdepay` and `shmsink`/`shmsrc` from
+  the Linux build. `unixfd` carries PTS/caps/segment/events natively — no framing, and
+  `do-timestamp` is irrelevant (metadata arrives intact).
+- **Socket lives in the runtime dir** (ADR-0014): unix-domain socket path under the per-PID
+  dir, 0600, credentials never in argv. Reuse the existing runtime-dir plumbing.
+- Carry over the connection-ordering guarantee (`unixfd`'s equivalent of wait-for-connection /
+  the adapter pushing only after `Play`) so a fresh stream never pushes into an unconnected
+  consumer.
+
+## Group 4 — compositor latency + voff_q correction (ADR-0016) — still pending
+
+- **Re-add compositor `latency` = ceiling** (still unset in pushed code). With floors + the
+  Play-gate + unixfd, re-test it no longer errors. If it still errors, stop and report.
+- **`voff_q` is `leaky=downstream` always** (~line 358) with a comment claiming "voff_q alone
+  is sufficient — the compositor uses the latest frame." That comment *is* the T3 failure:
+  "uses the latest frame" is the leaky drop that makes the offset diverge. Make `voff_q`
+  **non-leaky within the ceiling**, leaky only beyond it, and delete that comment. The offset
+  holds only with both the latency (aggregator waits) and the non-leaky-within-ceiling queue.
+
+## Group 5 — cam-77 cold-start (still pending)
+
+- `build_shmsrc_chain` (now an `unixfdsrc` chain) builds a complete, queued, offset-capable
+  chain **live** on `StreamsChanged` and links it to the compositor/mixer. Validate offline →
+  online populates the tile without stalling others; dummy adapter first, then real RTSP.
+
+## Group 6 — test-run isolation (carry-over, still not landed)
+
+Polluted logs from surviving instances already caused one wrong conclusion. Land this:
+- **Refuse to launch if an instance is already running** (scan runtime root for live-PID dirs
+  via `runtime::is_pid_alive`; clear message + non-zero exit).
+- **PID-tied `session.log`** under the per-PID runtime dir.
+
+## Group 7 — validation — ON THE REAL RTSP PATH, not just dummy
+
+The dummy path is exactly what hid the GDP bug. Validate the transport against a live camera's
+full event stream.
+- **T1:** PTS crosses (adapter PTS == core PTS) over unixfd.
+- **T3 (the gate):** offset holds **flat at +2000 ms** within the ceiling on a **live RTSP
+  source**, normal frame delivery — not n×2800 divergence. Phase 2 is not done until this
+  passes on a live source.
+- **Beyond ceiling** clamped; **live negative** clamps to 0, no dead input.
+- **cam-77 cold-start:** offline → start → online → tile populates, others unstalled.
+- **RTSP smoke:** live camera plays, a 1–2 s offset visibly and stably delays it, no freeze,
+  no caps/event errors (the unixfd path should have none).
+
+## Group 8 — enrich the dummy adapter (process fix)
+
+- Make the dummy adapter emit `decodebin3`-like events (stream-collection, tags, stream-start)
+  so transport-payload bugs surface on the cheap deterministic path next time, instead of only
+  against a live camera. This is the lesson from the GDP miss, made permanent.
+
+## Group 9 — housekeeping
+
+- ADR-0019 authored (review chat) — implement against it. **Change ADR-0015's status line to
+  "Superseded by ADR-0019"** — that one-line status edit is the only permitted change to an
+  accepted ADR.
+- CHANGELOG: transport seam + unixfd on Linux, GDP removed, latency + voff_q correction.
+- BUGS.md: move offset-divergence and cam-77 cold-start to `## Fixed` once Group 7 confirms.
+- troubleshooting.md: close out the GDP saga (superseded by unixfd), keep nothing stale.
+- **Standing rule (still in force):** don't remove validated architecture to clear a symptom —
+  flag it. (This time the architecture genuinely was the problem, and it was diagnosed and
+  escalated correctly rather than ripped out — that's the right pattern.)
+- DoD checklist per commit; commit in chunks (seam+unixfd; offset items; cold-start; isolation).

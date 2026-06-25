@@ -1,6 +1,6 @@
 # 0015. GDP-framed shm payload to preserve PTS and caps
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0019
 - **Date:** 2026-06-24
 
 ## Context

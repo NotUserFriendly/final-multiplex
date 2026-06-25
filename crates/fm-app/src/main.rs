@@ -31,6 +31,28 @@ fn main() -> iced::Result {
         );
     }
 
+    // Group 1 — test-run isolation (ADR-0014):
+    // Reap dead orphan dirs, then refuse to launch if a live instance is
+    // already running (it holds camera sessions and pollutes logs).
+    fm_core::runtime::reap_orphans();
+    if let Some(pid) = fm_core::runtime::another_instance_running() {
+        eprintln!(
+            "final-multiplex already running as PID {pid} — \
+             stop it first; it holds camera sessions and pollutes logs"
+        );
+        std::process::exit(1);
+    }
+    // Create run dir; init session log (redirects stderr fd 2 to the file).
+    // Print the path first so the user can find it from the terminal.
+    if fm_core::runtime::ensure_dirs().is_ok() {
+        eprintln!(
+            "[fm-core] logging to {}",
+            fm_core::runtime::session_log_path().display()
+        );
+        let _ = fm_core::runtime::init_session_log();
+        eprintln!("[fm-core] session log open for PID {}", std::process::id());
+    }
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "scene.toml".to_string());

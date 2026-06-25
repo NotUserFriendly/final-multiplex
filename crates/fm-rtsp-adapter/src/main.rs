@@ -1,21 +1,21 @@
 //! fm-rtsp-adapter — RTSP source adapter for Final Multiplex (Phase 2 Step 5 / ADR-0013 / ADR-0014).
 //!
 //! Decodes an RTSP stream (H.264/H.265/MJPEG video + AAC/G.711 audio) into raw
-//! RGBA video and S16LE PCM audio delivered to shmsink sockets consumed by the
-//! core's shmsrc elements.  Slaved to the core's GstNetTimeProvider.
+//! RGBA video and S16LE PCM audio delivered via unixfdsink (ADR-0019) consumed
+//! by the core's unixfdsrc elements.  Slaved to the core's GstNetTimeProvider.
 //!
 //! Startup order (ADR-0014): wait for Configure on stdin → slave clock →
 //! open sockets → emit Ready.  The URI is never placed in argv.
 //!
 //! Recovery (ADR-0013): on source drop, emits Reconnecting and performs
-//! in-process partial restart (rtspsrc + decodebin3 only); shmsink chains stay
-//! PLAYING so the core's shmsrc stays connected.  Emits StreamsChanged if the
-//! stream topology changes across a reconnect.
+//! in-process partial restart (rtspsrc + decodebin3 only); unixfdsink chains
+//! stay PLAYING so the core's unixfdsrc stays connected.  Emits StreamsChanged
+//! if the stream topology changes across a reconnect.
 //!
 //! Launch args:
 //!   --clock-addr   host:port   GstNetClientClock endpoint
-//!   --video-shm    path        shmsink socket path for video
-//!   --audio-shm    path        shmsink socket path for audio
+//!   --video-shm    path        unixfdsink socket path for video
+//!   --audio-shm    path        unixfdsink socket path for audio
 //!   --source-id    id          identifier echoed in telemetry
 //!   --video-width  px          production resolution width  (ADR-0012)
 //!   --video-height px          production resolution height (ADR-0012)
@@ -583,7 +583,7 @@ fn build_video_chain(
     // errors with "output caps are unfixed".
     let vrate = make("videorate", "vrate");
     let vcaps = make("capsfilter", "vcaps");
-    let vshmsink = make("shmsink", "vshmsink");
+    let vunixfdsink = make("unixfdsink", "vunixfdsink");
 
     vcaps.set_property(
         "caps",
@@ -595,18 +595,17 @@ fn build_video_chain(
             .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );
-    vshmsink.set_property_from_str("socket-path", shm_path);
-    vshmsink.set_property("sync", false);
-    vshmsink.set_property("wait-for-connection", false);
+    vunixfdsink.set_property_from_str("socket-path", shm_path);
+    vunixfdsink.set_property("sync", false);
 
-    pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
-    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
+    pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink])?;
+    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink])?;
 
-    for elem in [&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink] {
+    for elem in [&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink] {
         let _ = elem.sync_state_with_parent();
     }
 
-    // BUFFER probe on vcaps:src counts every frame written toward shmsink.
+    // BUFFER probe on vcaps:src counts every frame delivered to unixfdsink.
     if let Some(vcaps_src) = vcaps.static_pad("src") {
         vcaps_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
             frame_counter.fetch_add(1, Ordering::Relaxed);
@@ -618,7 +617,7 @@ fn build_video_chain(
     eprintln!("[rtsp-adapter] video chain ready → {shm_path}");
     Ok(Chain {
         sink,
-        elements: vec![vconv, vdeint, vscale, vrate, vcaps, vshmsink],
+        elements: vec![vconv, vdeint, vscale, vrate, vcaps, vunixfdsink],
     })
 }
 
@@ -629,7 +628,7 @@ fn build_audio_chain(
     let aconv = make("audioconvert", "aconv");
     let aresamp = make("audioresample", "aresamp");
     let acaps = make("capsfilter", "acaps");
-    let ashmsink = make("shmsink", "ashmsink");
+    let aunixfdsink = make("unixfdsink", "aunixfdsink");
 
     acaps.set_property(
         "caps",
@@ -640,14 +639,13 @@ fn build_audio_chain(
             .field("layout", "interleaved")
             .build(),
     );
-    ashmsink.set_property_from_str("socket-path", shm_path);
-    ashmsink.set_property("sync", false);
-    ashmsink.set_property("wait-for-connection", false);
+    aunixfdsink.set_property_from_str("socket-path", shm_path);
+    aunixfdsink.set_property("sync", false);
 
-    pipeline.add_many([&aconv, &aresamp, &acaps, &ashmsink])?;
-    gstreamer::Element::link_many([&aconv, &aresamp, &acaps, &ashmsink])?;
+    pipeline.add_many([&aconv, &aresamp, &acaps, &aunixfdsink])?;
+    gstreamer::Element::link_many([&aconv, &aresamp, &acaps, &aunixfdsink])?;
 
-    for elem in [&aconv, &aresamp, &acaps, &ashmsink] {
+    for elem in [&aconv, &aresamp, &acaps, &aunixfdsink] {
         let _ = elem.sync_state_with_parent();
     }
 
@@ -655,7 +653,7 @@ fn build_audio_chain(
     eprintln!("[rtsp-adapter] audio chain ready → {shm_path}");
     Ok(Chain {
         sink,
-        elements: vec![aconv, aresamp, acaps, ashmsink],
+        elements: vec![aconv, aresamp, acaps, aunixfdsink],
     })
 }
 

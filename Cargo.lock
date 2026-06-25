@@ -1046,6 +1046,7 @@ dependencies = [
  "gstreamer-net",
  "gstreamer-pbutils",
  "gstreamer-video",
+ "libc",
  "serde",
  "toml",
  "toml_edit",

@@ -159,7 +159,7 @@ fn main() {
     let vconv = make("videoconvert", "vconv");
     let vscale = make("videoscale", "vscale");
     let vcaps = make("capsfilter", "vcaps");
-    let vshmsink = make("shmsink", "vshmsink");
+    let vunixfdsink = make("unixfdsink", "vunixfdsink");
 
     vsrc.set_property_from_str("pattern", "ball");
     vsrc.set_property("is-live", true);
@@ -173,16 +173,15 @@ fn main() {
             .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );
-    vshmsink.set_property_from_str("socket-path", &video_shm);
-    vshmsink.set_property("sync", false);
-    vshmsink.set_property("wait-for-connection", false);
+    vunixfdsink.set_property_from_str("socket-path", &video_shm);
+    vunixfdsink.set_property("sync", false);
 
     pipeline
-        .add_many([&vsrc, &vconv, &vscale, &vcaps, &vshmsink])
+        .add_many([&vsrc, &vconv, &vscale, &vcaps, &vunixfdsink])
         .unwrap();
-    gstreamer::Element::link_many([&vsrc, &vconv, &vscale, &vcaps, &vshmsink]).unwrap();
+    gstreamer::Element::link_many([&vsrc, &vconv, &vscale, &vcaps, &vunixfdsink]).unwrap();
 
-    // BUFFER probe on vcaps:src counts frames written toward shmsink.
+    // BUFFER probe on vcaps:src counts frames written toward unixfdsink.
     let frame_counter = Arc::new(AtomicU64::new(0));
     if let Some(vcaps_src) = vcaps.static_pad("src") {
         let fc = Arc::clone(&frame_counter);
@@ -196,7 +195,7 @@ fn main() {
     let aconv = make("audioconvert", "aconv");
     let aresamp = make("audioresample", "aresamp");
     let acaps = make("capsfilter", "acaps");
-    let ashmsink = make("shmsink", "ashmsink");
+    let aunixfdsink = make("unixfdsink", "aunixfdsink");
 
     asrc.set_property("is-live", true);
     asrc.set_property_from_str("wave", "sine");
@@ -209,14 +208,13 @@ fn main() {
             .field("layout", "interleaved")
             .build(),
     );
-    ashmsink.set_property_from_str("socket-path", &audio_shm);
-    ashmsink.set_property("sync", false);
-    ashmsink.set_property("wait-for-connection", false);
+    aunixfdsink.set_property_from_str("socket-path", &audio_shm);
+    aunixfdsink.set_property("sync", false);
 
     pipeline
-        .add_many([&asrc, &aconv, &aresamp, &acaps, &ashmsink])
+        .add_many([&asrc, &aconv, &aresamp, &acaps, &aunixfdsink])
         .unwrap();
-    gstreamer::Element::link_many([&asrc, &aconv, &aresamp, &acaps, &ashmsink]).unwrap();
+    gstreamer::Element::link_many([&asrc, &aconv, &aresamp, &acaps, &aunixfdsink]).unwrap();
 
     // Slave to the core's shared clock and align base time (ADR-0005).
     pipeline.use_clock(Some(&net_clock));

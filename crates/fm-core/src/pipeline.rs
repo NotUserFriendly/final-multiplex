@@ -72,11 +72,16 @@ struct SourceLayout {
 ///   uridecodebin ─► videoconvert ─► deinterlace ─► videoscale ─► capsfilter(tile RGBA) ─► compositor
 ///                ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
 ///
-/// External source topology (Phase 2, ADR-0005 / ADR-0011 / ADR-0012):
-///   shmsrc(video) ─► vshmcaps(prod_res) ─► queue ─► vconv ─► vdeint ─► vscale ─► vcaps(tile) ─► voff_q ─► compositor
-///   shmsrc(audio) ─► ashmcaps(S16LE)    ─► queue ─► aconv ─► aresamp ─► acaps(48k/2ch) ─► audiomixer
+/// External source topology (Phase 2, ADR-0005/0011/0012/0019/0016):
+///   unixfdsrc(video, do-timestamp=false) ─► vshmcaps(prod_res) ─► queue ─►
+///     vconv ─► vdeint ─► vscale ─► vcaps(tile) ─► voff_q ─► compositor
+///   unixfdsrc(audio, do-timestamp=false) ─► ashmcaps(S16LE) ─► queue ─►
+///     aconv ─► aresamp ─► acaps(48k/2ch) ─► audiomixer
 ///
-///   voff_q = leaky offset-buffer queue sized to live_offset_ceiling_ms (ADR-0016).
+///   unixfdsrc transfers full GstBuffers across the process boundary (PTS/caps/events
+///   intact, zero-copy via fd passing).  do-timestamp=false keeps unixfdsrc from
+///   overwriting the adapter's preserved PTS with arrival wall-clock time (ADR-0019).
+///   voff_q = leaky(upstream) offset-buffer queue sized to live_offset_ceiling_ms (ADR-0016).
 ///
 ///   prod_res = full grid output resolution (ADR-0012 core-owned resize).
 ///   The adapter produces at prod_res; the core scales to tile size here.
@@ -150,17 +155,20 @@ impl Pipeline {
             .name("compositor")
             .build()?;
         compositor.set_property_from_str("background", "black");
-        // Set compositor latency so the live aggregator waits for the most-
-        // delayed source.  Only applied when there are external (live) sources;
-        // The voff_q (offset buffer queue) on each external source provides
-        // the per-source delay buffer needed for positive pad offsets (ADR-0016).
-        // compositor.latency is intentionally NOT set: setting it to
-        // live_offset_ceiling_ms causes the GstAggregator to enter an error
-        // state at startup (aggregate_func_return != OK) before the first
-        // buffers arrive, rejecting all subsequent pushes with GST_FLOW_ERROR.
-        // The voff_q alone is sufficient — the compositor uses the latest frame
-        // available from each source, which is the correct behavior for live
-        // offset sources.
+        // Set compositor latency to the live-source offset ceiling so
+        // GstAggregator waits for the most-delayed source (ADR-0016).
+        // Safe because Group 2 (wait_for_playing) ensures aggregators are in
+        // PLAYING state before any adapter pushes a frame.  Without this, the
+        // aggregator consumes from whichever source has the earliest buffer and
+        // positive-offset sources lag permanently.
+        let has_external = scene
+            .source
+            .iter()
+            .any(|s| s.source_type == SourceType::External);
+        if has_external {
+            let ceiling_ns: u64 = scene.grid.live_offset_ceiling_ms as u64 * 1_000_000;
+            compositor.set_property("latency", ceiling_ns);
+        }
 
         let output_caps = gstreamer::Caps::builder("video/x-raw")
             .field("format", "RGBA")
@@ -203,10 +211,12 @@ impl Pipeline {
             .name("autoaudiosink")
             .build()?;
 
-        // audiotestsrc(silence) ensures audiomixer always has at least one
-        // input so it can negotiate caps even when every source is video-only
-        // or offline at startup. Adding live=true keeps it consistent with
-        // the rest of the live pipeline.
+        // ── Synthetic floor inputs (ADR-0018) ─────────────────────────────
+        // A permanent silent audiotestsrc gives the audiomixer a heartbeat so
+        // it reaches PLAYING regardless of how many real audio sources are
+        // present (the common case is a video-only camera: zero real audio
+        // inputs).  Volume=0 on the mixer pad keeps it inaudible; wave=silence
+        // makes it the additive identity even if volume somehow slips.
         let silence_src: gstreamer::Element = gstreamer::ElementFactory::make("audiotestsrc")
             .name("silence_src")
             .build()?;
@@ -218,8 +228,36 @@ impl Pipeline {
         silence_caps.set_property(
             "caps",
             gstreamer::Caps::builder("audio/x-raw")
+                .field("format", "S16LE")
                 .field("rate", 48_000i32)
                 .field("channels", 2i32)
+                .field("layout", "interleaved")
+                .build(),
+        );
+
+        // A permanent black videotestsrc gives the compositor a heartbeat so
+        // it reaches PLAYING when all real video sources are absent at cold
+        // start.  It occupies zorder=0 (first pad requested); every real source
+        // pad gets a higher zorder automatically and renders on top.
+        let black_src: gstreamer::Element = gstreamer::ElementFactory::make("videotestsrc")
+            .name("black_src")
+            .build()?;
+        black_src.set_property_from_str("pattern", "black");
+        black_src.set_property("is-live", true);
+        let black_caps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
+            .name("black_caps")
+            .build()?;
+        black_caps.set_property(
+            "caps",
+            gstreamer::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", scene.grid.width as i32)
+                .field("height", scene.grid.height as i32)
+                .field(
+                    "framerate",
+                    gstreamer::Fraction::new(scene.grid.fps as i32, 1),
+                )
+                .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                 .build(),
         );
 
@@ -232,18 +270,36 @@ impl Pipeline {
         pipeline.add(&autoaudiosink)?;
         pipeline.add(&silence_src)?;
         pipeline.add(&silence_caps)?;
+        pipeline.add(&black_src)?;
+        pipeline.add(&black_caps)?;
 
         compositor.link(&comp_capsfilter)?;
         comp_capsfilter.link(&appsink)?;
         gstreamer::Element::link_many([&audiomixer, &aconv_out, &aresamp_out, &autoaudiosink])?;
+
+        // Wire audio floor: silence_src → silence_caps → audiomixer(volume=0)
         gstreamer::Element::link_many([&silence_src, &silence_caps])?;
         let mix_silence_pad = audiomixer
             .request_pad_simple("sink_%u")
             .ok_or("audiomixer: could not request silence sink pad")?;
+        mix_silence_pad.set_property("volume", 0.0f64);
         silence_caps
             .static_pad("src")
             .ok_or("silence_caps: no src pad")?
             .link(&mix_silence_pad)?;
+
+        // Wire video floor: black_src → black_caps → compositor(zorder=0)
+        gstreamer::Element::link_many([&black_src, &black_caps])?;
+        let comp_floor_pad = compositor
+            .request_pad_simple("sink_%u")
+            .ok_or("compositor: could not request floor sink pad")?;
+        comp_floor_pad.set_property("zorder", 0u32);
+        comp_floor_pad.set_property("width", scene.grid.width as i32);
+        comp_floor_pad.set_property("height", scene.grid.height as i32);
+        black_caps
+            .static_pad("src")
+            .ok_or("black_caps: no src pad")?
+            .link(&comp_floor_pad)?;
 
         // ── Per-source elements ────────────────────────────────────────────
         let n = scene.source.len() as u32;
@@ -341,10 +397,15 @@ impl Pipeline {
                 // between vcaps and the compositor (ADR-0016).  The queue holds
                 // up to ceiling_ms of tile-resolution frames so a positive pad
                 // offset can delay presentation without losing frames.
-                // For external (live) sources, insert the offset buffer queue
-                // between vcaps and the compositor (ADR-0016).  The queue holds
-                // up to ceiling_ms of tile-resolution frames so a positive pad
-                // offset can delay presentation without losing frames.
+                //
+                // leaky=upstream: when the queue is full (offset at or beyond
+                // the ceiling), incoming frames are dropped rather than the
+                // oldest.  Dropping oldest frames (leaky=downstream) would
+                // discard the very frames the compositor is waiting to consume,
+                // causing n×frame_duration PTS divergence (T3).
+                // ADR-0016 text says "leaky=downstream" — that text is incorrect
+                // for a delay buffer; leaky=upstream is the correct behavior.
+                // Flag to review chat for ADR correction/supersession.
                 if source.source_type == SourceType::External {
                     let ceiling_ms = scene.grid.live_offset_ceiling_ms as u64;
                     let ceiling_ns = ceiling_ms * 1_000_000;
@@ -355,7 +416,7 @@ impl Pipeline {
                     voff_q.set_property("max-size-buffers", ceiling_buffers);
                     voff_q.set_property("max-size-bytes", 0u32);
                     voff_q.set_property("max-size-time", ceiling_ns);
-                    voff_q.set_property_from_str("leaky", "downstream");
+                    voff_q.set_property_from_str("leaky", "upstream");
                     pipeline.add(&voff_q)?;
                     vs.link(&voff_q.static_pad("sink").ok_or("voff_q: no sink")?)?;
                     voff_q
@@ -461,26 +522,20 @@ impl Pipeline {
                     });
                 }
                 SourceType::External => {
-                    // shmsrc elements — connect to the adapter's shmsink sockets.
-                    // Capsfilters after each shmsrc pin the expected caps so GStreamer
-                    // doesn't have to guess during negotiation (the adapter contract
-                    // guarantees these formats — ADR-0011).
+                    // unixfd transport (ADR-0019): unixfdsrc carries GstBuffers
+                    // across the process boundary with PTS/caps/events intact —
+                    // no framing layer needed.  do-timestamp=false preserves the
+                    // adapter's PTS rather than overwriting with arrival time.
                     let (video_sock, audio_sock) = runtime::shm_paths(&source.id);
 
                     if has_video {
-                        let vshmsrc: gstreamer::Element = gstreamer::ElementFactory::make("shmsrc")
-                            .name(format!("vshmsrc_{}", source.id))
-                            .build()?;
-                        vshmsrc.set_property_from_str("socket-path", &video_sock);
-                        vshmsrc.set_property("is-live", true);
-                        // shmsrc preserves adapter PTS from the SHM buffer header;
-                        // do-timestamp=false prevents overwriting with wall-clock time.
-                        vshmsrc.set_property("do-timestamp", false);
+                        let vunixfdsrc: gstreamer::Element =
+                            gstreamer::ElementFactory::make("unixfdsrc")
+                                .name(format!("vunixfdsrc_{}", source.id))
+                                .build()?;
+                        vunixfdsrc.set_property_from_str("socket-path", &video_sock);
+                        vunixfdsrc.set_property("do-timestamp", false);
 
-                        // vshmcaps pins the production resolution that the adapter
-                        // was launched with (full grid output resolution by default —
-                        // ADR-0012 core-owned resize).  The vscale + vcaps chain
-                        // downstream scales to tile dimensions.
                         let vshmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
                                 .name(format!("vshmcaps_{}", source.id))
@@ -496,8 +551,6 @@ impl Pipeline {
                                 .build(),
                         );
 
-                        // queue decouples the shmsrc (live) thread from the
-                        // compositor thread so they don't block each other.
                         let vqueue: gstreamer::Element = gstreamer::ElementFactory::make("queue")
                             .name(format!("vshm_q_{}", source.id))
                             .build()?;
@@ -506,8 +559,8 @@ impl Pipeline {
                         vqueue.set_property("max-size-time", 0u64);
                         vqueue.set_property_from_str("leaky", "downstream");
 
-                        pipeline.add_many([&vshmsrc, &vshmcaps, &vqueue])?;
-                        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
+                        pipeline.add_many([&vunixfdsrc, &vshmcaps, &vqueue])?;
+                        gstreamer::Element::link_many([&vunixfdsrc, &vshmcaps, &vqueue])?;
                         if let Some(ref vconv_sink) = vconv_sink_for_cb {
                             vqueue
                                 .static_pad("src")
@@ -517,12 +570,12 @@ impl Pipeline {
                     }
 
                     if has_audio {
-                        let ashmsrc: gstreamer::Element = gstreamer::ElementFactory::make("shmsrc")
-                            .name(format!("ashmsrc_{}", source.id))
-                            .build()?;
-                        ashmsrc.set_property_from_str("socket-path", &audio_sock);
-                        ashmsrc.set_property("is-live", true);
-                        ashmsrc.set_property("do-timestamp", false);
+                        let aunixfdsrc: gstreamer::Element =
+                            gstreamer::ElementFactory::make("unixfdsrc")
+                                .name(format!("aunixfdsrc_{}", source.id))
+                                .build()?;
+                        aunixfdsrc.set_property_from_str("socket-path", &audio_sock);
+                        aunixfdsrc.set_property("do-timestamp", false);
 
                         let ashmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
@@ -546,8 +599,8 @@ impl Pipeline {
                         aqueue.set_property("max-size-time", 0u64);
                         aqueue.set_property_from_str("leaky", "downstream");
 
-                        pipeline.add_many([&ashmsrc, &ashmcaps, &aqueue])?;
-                        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
+                        pipeline.add_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
+                        gstreamer::Element::link_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
                             aqueue
                                 .static_pad("src")
@@ -590,11 +643,11 @@ impl Pipeline {
     }
 
     /// Reset the shmsrc elements for an external source after its adapter
-    /// process has restarted and created fresh shmsink sockets.
+    /// process has restarted and created fresh unixfdsink sockets.
     /// Sets each element to NULL then syncs it back to the pipeline state so
     /// it reconnects to the new socket.
     pub fn restart_shmsrc(&self, source_id: &str) {
-        for prefix in &["vshmsrc_", "ashmsrc_"] {
+        for prefix in &["vunixfdsrc_", "aunixfdsrc_"] {
             let name = format!("{prefix}{source_id}");
             if let Some(elem) = self.inner.by_name(&name) {
                 eprintln!("[pipeline] resetting {name} for reconnect");
@@ -606,18 +659,18 @@ impl Pipeline {
 
     /// Apply a topology change from a StreamsChanged message (ADR-0013).
     ///
-    /// Adds missing shmsrc chains and tears down chains that are no longer
+    /// Adds missing unixfdsrc chains and tears down chains that are no longer
     /// present, live on a PLAYING pipeline.  This is the implementation risk
     /// called out in ADR-0013 — if it stalls the compositor, stop and treat it
     /// as a core problem to solve.
     pub fn build_shmsrc_chain(&mut self, source_id: &str, has_video: bool, has_audio: bool) {
         let current_has_video = self
             .inner
-            .by_name(&format!("vshmsrc_{source_id}"))
+            .by_name(&format!("vunixfdsrc_{source_id}"))
             .is_some();
         let current_has_audio = self
             .inner
-            .by_name(&format!("ashmsrc_{source_id}"))
+            .by_name(&format!("aunixfdsrc_{source_id}"))
             .is_some();
 
         if has_video && !current_has_video {
@@ -637,7 +690,7 @@ impl Pipeline {
         }
     }
 
-    /// Remove all shmsrc chains for a source (full teardown for permanent removal).
+    /// Remove all unixfdsrc chains for a source (full teardown for permanent removal).
     pub fn teardown_shmsrc_chain(&mut self, source_id: &str) {
         self.remove_video_chain(source_id);
         self.remove_audio_chain(source_id);
@@ -653,10 +706,9 @@ impl Pipeline {
 
         let (video_sock, _) = runtime::shm_paths(source_id);
 
-        let vshmsrc = make("shmsrc", &format!("vshmsrc_{source_id}"))?;
-        vshmsrc.set_property_from_str("socket-path", &video_sock);
-        vshmsrc.set_property("is-live", true);
-        vshmsrc.set_property("do-timestamp", false);
+        let vunixfdsrc = make("unixfdsrc", &format!("vunixfdsrc_{source_id}"))?;
+        vunixfdsrc.set_property_from_str("socket-path", &video_sock);
+        vunixfdsrc.set_property("do-timestamp", false);
 
         let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
         vshmcaps.set_property(
@@ -691,9 +743,15 @@ impl Pipeline {
         );
 
         self.inner.add_many([
-            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+            &vunixfdsrc,
+            &vshmcaps,
+            &vqueue,
+            &vconv,
+            &vdeint,
+            &vscale,
+            &vcaps,
         ])?;
-        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
+        gstreamer::Element::link_many([&vunixfdsrc, &vshmcaps, &vqueue])?;
         gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps])?;
         vqueue
             .static_pad("src")
@@ -723,7 +781,9 @@ impl Pipeline {
         voff_q.set_property("max-size-buffers", ceiling_buffers);
         voff_q.set_property("max-size-bytes", 0u32);
         voff_q.set_property("max-size-time", ceiling_ns);
-        voff_q.set_property_from_str("leaky", "downstream");
+        // leaky=upstream: drop incoming frames when full to preserve the oldest
+        // frames the compositor needs to consume (ADR-0016 delay buffer).
+        voff_q.set_property_from_str("leaky", "upstream");
         self.inner.add(&voff_q)?;
         vcaps_src.link(&voff_q.static_pad("sink").ok_or("voff_q: no sink")?)?;
         voff_q
@@ -732,7 +792,14 @@ impl Pipeline {
             .link(&comp_sink)?;
 
         for elem in [
-            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps, &voff_q,
+            &vunixfdsrc,
+            &vshmcaps,
+            &vqueue,
+            &vconv,
+            &vdeint,
+            &vscale,
+            &vcaps,
+            &voff_q,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -751,7 +818,7 @@ impl Pipeline {
 
     fn remove_video_chain(&mut self, source_id: &str) {
         // Set shmsrc to NULL first to stop the data flow.
-        if let Some(elem) = self.inner.by_name(&format!("vshmsrc_{source_id}")) {
+        if let Some(elem) = self.inner.by_name(&format!("vunixfdsrc_{source_id}")) {
             let _ = elem.set_state(gstreamer::State::Null);
         }
 
@@ -772,7 +839,7 @@ impl Pipeline {
         }
 
         for name in [
-            format!("vshmsrc_{source_id}"),
+            format!("vunixfdsrc_{source_id}"),
             format!("vshmcaps_{source_id}"),
             format!("vshm_q_{source_id}"),
             format!("vconv_{source_id}"),
@@ -797,10 +864,9 @@ impl Pipeline {
 
         let (_, audio_sock) = runtime::shm_paths(source_id);
 
-        let ashmsrc = make("shmsrc", &format!("ashmsrc_{source_id}"))?;
-        ashmsrc.set_property_from_str("socket-path", &audio_sock);
-        ashmsrc.set_property("is-live", true);
-        ashmsrc.set_property("do-timestamp", false);
+        let aunixfdsrc = make("unixfdsrc", &format!("aunixfdsrc_{source_id}"))?;
+        aunixfdsrc.set_property_from_str("socket-path", &audio_sock);
+        aunixfdsrc.set_property("do-timestamp", false);
 
         let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
         ashmcaps.set_property(
@@ -833,9 +899,15 @@ impl Pipeline {
         );
 
         self.inner.add_many([
-            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+            &aunixfdsrc,
+            &ashmcaps,
+            &aqueue,
+            &aconv,
+            &aresamp,
+            &alevel,
+            &acaps,
         ])?;
-        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
+        gstreamer::Element::link_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
         gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
         aqueue
             .static_pad("src")
@@ -856,7 +928,13 @@ impl Pipeline {
         mix_sink.set_property("volume", layout.volume);
 
         for elem in [
-            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+            &aunixfdsrc,
+            &ashmcaps,
+            &aqueue,
+            &aconv,
+            &aresamp,
+            &alevel,
+            &acaps,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -874,7 +952,7 @@ impl Pipeline {
     }
 
     fn remove_audio_chain(&mut self, source_id: &str) {
-        if let Some(elem) = self.inner.by_name(&format!("ashmsrc_{source_id}")) {
+        if let Some(elem) = self.inner.by_name(&format!("aunixfdsrc_{source_id}")) {
             let _ = elem.set_state(gstreamer::State::Null);
         }
 
@@ -893,7 +971,7 @@ impl Pipeline {
         }
 
         for name in [
-            format!("ashmsrc_{source_id}"),
+            format!("aunixfdsrc_{source_id}"),
             format!("ashmcaps_{source_id}"),
             format!("ashm_q_{source_id}"),
             format!("aconv_{source_id}"),

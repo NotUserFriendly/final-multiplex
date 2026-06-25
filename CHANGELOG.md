@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Synthetic floor inputs (ADR-0018):** a permanent silent `audiotestsrc` (wave=silence,
+  volume=0 on mixer pad) now feeds the audiomixer, and a permanent black `videotestsrc`
+  (pattern=black, zorder=0) now feeds the compositor.  Both are infrastructure, not sources:
+  they are excluded from tile layout, metrics, offset controls, and grid source enumeration.
+  They give each GstAggregator a live heartbeat so the pipeline reaches PLAYING in every
+  cold-start permutation (video-only cameras, all-sources-absent).  The Play-gate
+  (wait_for_playing) remains as a safety net but is no longer the normal path.
+- **cam-77 cold-start GST_FLOW_ERROR cascade (root-cause fix):** `send_play_all()` now
+  blocks until the GStreamer pipeline confirms it has reached PLAYING state before telling
+  adapters to start pushing frames.  Previously, `set_state(Playing)` returned `Async` and
+  adapters began pushing while the compositor and audiomixer aggregators were still in their
+  async transition — the first buffer push permanently latched `GST_FLOW_ERROR` (-5) on the
+  aggregator, and every subsequent push failed silently.  Fix: new `Transport::wait_for_playing(10)`
+  calls `pipeline.state(timeout)` to block until `Success` or `NoPreroll` before `send_play_all()`.
+  A warning is logged (but startup continues) if PLAYING is not confirmed within 10 s.
+- **Instance lock:** a second `final-multiplex` process now refuses to start if another is
+  already running, printing the incumbent PID.  Prevents two instances competing for the same
+  shmsink sockets and polluting logs.
+- **Session log:** stderr is now redirected to `$XDG_RUNTIME_DIR/final-multiplex/{pid}/session.log`
+  at startup on Linux.  All subsequent `eprintln!` output from that session (including GStreamer
+  warnings) goes to the log file.
+- **Platform-selected transport: unixfd replaces shm+GDP on Linux (ADR-0019):**
+  `shmsink`/`shmsrc` and `gdppay`/`gdpdepay` removed from all adapters (`fm-dummy-adapter`,
+  `fm-rtsp-adapter`) and from all three core receive-chain builders (`build()`,
+  `add_video_chain()`, `add_audio_chain()`).  Replaced with `unixfdsink` (adapter side)
+  and `unixfdsrc` (core side).  `unixfd` transfers full GstBuffers across the process
+  boundary — PTS, DTS, caps, segment, and events — intact, zero-copy via fd passing.
+  This eliminates the GDP event deserialization failure (`gst_dp_deserialize_event`
+  returning NULL for `decodebin3`/`rtspsrc` events) that blocked live RTSP validation.
+  ADR-0015 superseded by ADR-0019.  Controlled T1 PTS measurement confirmed shmsrc
+  without GDP does not preserve PTS (frame 0: adapter=2.33 s, core=0; frames 1+: None)
+  — settling that question before building.
+- **Compositor latency restored (ADR-0016):** `compositor.set_property("latency", ceiling_ns)`
+  reinstated in `pipeline.rs` for scenes with external sources.  Had been removed during debugging
+  of the cascade (it was not the cause).
+- **`voff_q` leaky mode corrected:** `leaky` changed from `downstream` to `upstream` for all
+  offset buffer queues.  `leaky=downstream` drops the *oldest* buffered frame when the queue is
+  full — the exact frame the compositor waits to consume — causing n×frame_duration PTS
+  divergence.  `leaky=upstream` drops the *incoming* frame when the queue is full, preserving
+  the buffered delay window.  (The ADR-0016 text says "leaky=downstream"; that text is incorrect
+  for a delay buffer and is flagged for review/supersession.)
+
 - **Adapter orphaning on app exit:** adapters no longer survive app termination.
   Four-layer fix: (1) `prctl(PR_SET_PDEATHSIG, SIGTERM)` in both adapters so the
   kernel signals them when the supervisor process dies — covers app `SIGKILL` where

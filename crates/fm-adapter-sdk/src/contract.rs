@@ -3,7 +3,7 @@
 //! An adapter is a subprocess that:
 //!   1. Waits for [`Command::Configure`] on stdin before connecting to its source.
 //!   2. Slaves to the core's GstNetTimeProvider via GstNetClientClock.
-//!   3. Produces raw decoded frames to two shmsink sockets (video + audio).
+//!   3. Produces raw decoded frames to two unixfdsink sockets (video + audio) (ADR-0019).
 //!   4. Exchanges line-delimited JSON with the core over stdin/stdout.
 //!
 //! Startup order (ADR-0014): spawn → receive Configure → slave clock →
@@ -65,9 +65,9 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub mod args {
     /// GstNetClientClock endpoint: `"host:port"` (e.g. `"127.0.0.1:5637"`).
     pub const CLOCK_ADDR: &str = "--clock-addr";
-    /// shmsink socket path for the video stream.
+    /// unixfdsink socket path for the video stream (ADR-0019).
     pub const VIDEO_SHM: &str = "--video-shm";
-    /// shmsink socket path for the audio stream.
+    /// unixfdsink socket path for the audio stream (ADR-0019).
     pub const AUDIO_SHM: &str = "--audio-shm";
     /// Source identifier string; echoed back in [`SourceMetrics::source_id`].
     pub const SOURCE_ID: &str = "--source-id";
@@ -87,14 +87,14 @@ pub mod args {
 // Video / audio caps that cross the boundary (ADR-0011 / ADR-0012)
 // ---------------------------------------------------------------------------
 
-/// GStreamer caps template for the video shmsink the adapter must produce.
+/// GStreamer caps template for the video unixfdsink the adapter must produce.
 /// Substitute `{width}`, `{height}`, `{fps}` before passing to GStreamer.
-/// `pixel-aspect-ratio=1/1` is required; the core's post-shmsrc capsfilter
+/// `pixel-aspect-ratio=1/1` is required; the core's post-unixfdsrc capsfilter
 /// pins this field so negotiation is deterministic.
 pub const VIDEO_CAPS_TEMPLATE: &str =
     "video/x-raw,format=RGBA,width={width},height={height},framerate={fps}/1,pixel-aspect-ratio=1/1";
 
-/// GStreamer caps for the audio shmsink the adapter must produce.
+/// GStreamer caps for the audio unixfdsink the adapter must produce.
 pub const AUDIO_CAPS: &str = "audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved";
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,22 @@ impl Transport {
         Ok(())
     }
 
+    /// Block until the pipeline reaches PLAYING state (or the timeout expires).
+    /// Live pipelines return `Async` from `set_state(Playing)`; call this after
+    /// `play()` at startup to ensure all aggregators and sinks are PLAYING before
+    /// adapters push their first frame (Group 2 cascade fix).
+    /// Returns `true` if PLAYING was confirmed, `false` on timeout or failure.
+    pub fn wait_for_playing(&self, timeout_secs: u64) -> bool {
+        let (result, _, _) = self
+            .pipeline
+            .inner()
+            .state(Some(gstreamer::ClockTime::from_seconds(timeout_secs)));
+        matches!(
+            result,
+            Ok(gstreamer::StateChangeSuccess::Success | gstreamer::StateChangeSuccess::NoPreroll)
+        )
+    }
+
     pub fn pause(&self) -> Result<()> {
         self.pipeline.inner().set_state(gstreamer::State::Paused)?;
         Ok(())

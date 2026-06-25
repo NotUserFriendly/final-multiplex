@@ -295,19 +295,98 @@ error on the first push, which propagates back through the chain.
   return `StateChangeReturn::Async` from `set_state(Playing)` — the pipeline may not be
   fully playing when `send_play_all()` fires.
 
-### Hypotheses not yet tested
+### Attempt 5 — Gate send_play_all() on pipeline PLAYING (root cause fix, 2026-06-25)
 
-1. **Pipeline not fully PLAYING when play command fires** — Wait for the pipeline's
-   StateChanged(Playing) bus message before sending Play to adapters.  The adapters
-   only start writing frames after Play; if the aggregators haven't completed their
-   first cycle by then, the first push from shmsrc may land in an error-state aggregator.
+**Hypothesis:** `set_state(Playing)` on a live GStreamer pipeline returns
+`StateChangeReturn::Async` — the transition is still in progress.  `send_play_all()`
+fired immediately after, so adapters began pushing frames before the compositor
+and audiomixer aggregators had completed their first `aggregate()` cycle.  The first
+buffer push from a shmsrc landed in an aggregator that was mid-transition; the
+aggregator permanently latched `aggregate_func_return = GST_FLOW_ERROR`.
 
-2. **autoaudiosink / appsink not ready at first aggregate()** — The aggregator src task
-   races with the downstream sinks going to PLAYING.  A push to a PAUSED appsink blocks
-   briefly then returns OK (live mode), but a push to an unready sink returns ERROR.
-   Try `appsink sync=false` explicitly, or add `async=false` to autoaudiosink.
+**Action:** Added `Transport::wait_for_playing(10)` in `ui.rs` between `transport.play()`
+and `supervisor.send_play_all()`.  `wait_for_playing` calls `pipeline.state(timeout=10s)`
+which blocks until the pipeline returns `Success` or `NoPreroll`.  Only then are adapters
+told to start streaming.  Also fixed `StateChangeReturn::Success | NoPreroll` to the
+correct gstreamer 0.25 API: `Ok(StateChangeSuccess::Success | StateChangeSuccess::NoPreroll)`.
 
-3. **Audiomixer latency query failure is load-bearing** — The `Latency query failed` WARN
-   may cause the audiomixer to skip its internal latency setup, leaving the src task in
-   a broken state that returns GST_FLOW_ERROR on the first `aggregate()` call.  Try
-   adding a `tee` or `queue` after autoaudiosink to absorb the latency query path.
+**Notes:**
+- GDP removal (Attempt 2) was a dead end — GDP was not the cascade cause.  GDP was
+  subsequently **restored** (ADR-0015 compliance): `gdpdepay` after each shmsrc in the
+  core, `gdppay` before each shmsink in both adapters.
+- Compositor latency was **restored** (ADR-0016 compliance).  Its removal (Attempt 1)
+  was a dead end — it was not the cascade cause.
+- `voff_q` leaky mode corrected from `downstream` to `upstream` (see analysis in
+  the GDP spike log above).  ADR-0016 text says "leaky=downstream" but that drops
+  the oldest frame — the one the compositor needs — causing n×2800 ms PTS divergence.
+  Flagged for ADR supersession.
+
+**Result:** Cascade fix confirmed — GST_FLOW_ERROR (-5) no longer occurs.  Two new issues
+surfaced in the live run (2026-06-25):
+
+**Issue A — PLAYING gate times out (10 s).** cam-27 reported `video=true audio=false`
+(video-only camera, the common case).  The audiomixer had zero real inputs; GstAggregator
+will not produce output — and therefore will not reach PLAYING — without at least one live
+input.  The Play-gate correctly held `send_play_all()`, but then timed out because there was
+nothing to unblock it.  This is a chicken-and-egg between the gate and the aggregator.
+Fix: ADR-0018 synthetic audio floor (permanent silent `audiotestsrc`) gives the audiomixer
+a heartbeat input so it always reaches PLAYING.
+
+**Issue B — GDP event deserialization failure in GStreamer 1.28.2 (BLOCKER).**
+
+Progression of attempts after the PLAYING-gate fix:
+
+Run 1 (floors only, wait-for-connection=false): `gdpdepay_cam-27: Received a buffer without
+first receiving caps.`  Ring buffer (64 KB default) cycled past the caps packet before
+shmsrc's task thread started reading.
+
+Run 2 (floors + wait-for-connection=true, ring=64 KB): `gdpdepay: could not create event from
+GDP packet.`  Error changed — gdpdepay DID receive the caps correctly (no "without caps"
+error) but then failed to deserialize a downstream event packet.
+
+Run 3 (floors + wait-for-connection=true, ring=64 MB): SAME `could not create event from GDP
+packet` on all chains (cam-27 video, cam-77 video, cam-77 audio).  Ring size is not the
+cause; the event deserializer (`gst_dp_deserialize_event`) returns NULL for a specific event
+type emitted by the rtspsrc/decodebin3 pipeline (likely a tag or stream-collection event that
+the dummy-adapter's videotestsrc pipeline never emits).
+
+**This is the TaskBlock stop-and-report criterion:** GDP + shm transport fails in GStreamer
+1.28.2 with the rtsp-adapter pipeline, both before and after ring-size/wait-for-connection
+fixes.  The GDP spike T1 test passed only because it used the dummy adapter (videotestsrc),
+not rtspsrc + decodebin3.
+
+**Raised to review chat.** Decision required: (a) debug GDP event serialization for 1.28.2,
+(b) switch transport (unixfd-on-Linux fallback mentioned in TaskBlock), or (c) verify whether
+do-timestamp=false on shmsrc alone preserves PTS without GDP (the claim "it won't" in the
+TaskBlock was asserted without a fresh measurement with do-timestamp=false specifically).
+
+---
+
+### Resolution — unixfd transport (ADR-0019, 2026-06-25)
+
+Review chat authored ADR-0019: platform-selected transport; Linux = unixfd.
+
+**Group 1 controlled T1 measurement** settled option (c) before building:
+- Adapter PTS (frame 0): `0:00:02.328102754`
+- Core shmsrc PTS (frame 0, do-timestamp=false, no GDP): `0:00:00.000000000`
+- Frames 1+: core PTS = `None`
+- Immediate `ashmsrc` cascade error: shmsrc cannot negotiate caps without the GDP
+  caps envelope — without framing, the caps race is unavoidable.
+
+**Verdict (option c): No, do-timestamp=false on shmsrc alone does NOT preserve PTS.** The first
+frame gets PTS=0 (shmsrc default), subsequent frames get None. GDP was doing two separate jobs
+(caps negotiation AND PTS envelope); removing it breaks both.
+
+**Fix (option b) — unixfd transport implemented (2026-06-25):**
+- `shmsink`/`shmsrc` and `gdppay`/`gdpdepay` removed from all adapters and core.
+- `unixfdsink` (adapter) + `unixfdsrc` (core, do-timestamp=false) wired at both seams.
+- `is-live` property removed from unixfdsrc (not a valid property on GstUnixFdSrc).
+
+**Validation run results:**
+- Dummy adapter (scene-t1.toml): 15 s run, zero errors, both sockets created. ✓
+- RTSP scene (scene-step5.toml, cam-27 + cam-77): 30 s run, zero errors, zero GDP event
+  deserialization failures. Both cameras reached PLAYING and Play; both video sockets and the
+  cam-77 audio socket all created and connected. ✓
+
+**GDP saga closed.** All GDP-related entries in this file are historical. The transport is now
+unixfd on Linux (ADR-0019 supersedes ADR-0015).

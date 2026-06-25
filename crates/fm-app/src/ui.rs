@@ -684,7 +684,19 @@ fn try_init(
     }
     transport.play()?;
 
-    // Pipeline is playing; tell adapters to start streaming.
+    // Group 2 — cascade fix: wait for the pipeline to actually reach PLAYING
+    // before telling adapters to push frames.  Live pipelines return Async from
+    // set_state(Playing); if adapters push before aggregators are PLAYING, the
+    // first buffer returns GST_FLOW_ERROR and the aggregator permanently latches
+    // that error, rejecting all subsequent pushes with -5.
+    if !transport.wait_for_playing(10) {
+        eprintln!(
+            "[app] WARNING: pipeline did not reach PLAYING within 10 s — \
+             cascade possible"
+        );
+    }
+
+    // Pipeline is confirmed PLAYING; safe to tell adapters to start streaming.
     let supervisor = if let Some(mut sup) = supervisor {
         sup.send_play_all();
         Some(sup)

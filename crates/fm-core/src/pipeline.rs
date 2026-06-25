@@ -19,7 +19,7 @@ type ExternalCaps = HashMap<String, (bool, bool)>;
 /// headroom regardless of source framerate.  This is framerate-independent —
 /// no hardcoded frame count, no assumed frame period.
 ///
-/// **Canary behaviour:** silent when `|running−pts − expected_offset| ≤ 50 ms`.
+/// **Canary behaviour:** silent when `|running−pts − expected_offset| ≤ 150 ms`.
 /// Emits one `[offset-canary] WARN` line per diverging sample over a 20-buffer
 /// window, then goes silent for the rest of the chain's lifetime.
 ///
@@ -45,12 +45,16 @@ fn add_offset_canary(
     // chain latency (e.g. 419 ms measured for 500 ms offset).  150 ms covers
     // this structural bias while still catching a full TOML-revert regression
     // (≥300 ms error).
+    // TODO(pre-Phase-3 metrics pass): 150 ms implicitly assumes ~30 fps — the
+    // bias is (frame_period + chain_latency), so at ~15 fps the frame period
+    // doubles and the bias approaches ~165 ms, which can tip a correct offset
+    // over this threshold and emit a false WARN.  Fix alongside fps_in once
+    // the real source framerate is available to the core.
     const TOLERANCE_MS: i64 = 150;
     const SAMPLE_COUNT: u32 = 20;
 
     // u64::MAX = "not yet recorded"; running time is always > 0 in practice.
-    let chain_start_ns =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let chain_start_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
     let samples_taken = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {

@@ -112,12 +112,33 @@ fn main() {
         clock_port,
         gstreamer::ClockTime::ZERO,
     );
+    // Gate production on clock sync (ADR-0005): without a synced
+    // GstNetClientClock the adapter's pipeline reports local time (~0)
+    // instead of the core's running time, so all frames carry PTS≈0.
+    // The compositor discards those as minutes-late, the socket backs up,
+    // fps_in drops to 0, and the 120 s frame watchdog fires — respawn loop.
+    // On cold-start both sides come up together and 5 s was enough; on
+    // respawn against a long-running provider the NTP-like calibration needs
+    // more rounds.  Measure actual convergence time here so the timeout can
+    // be set to a safe margin (Group 2A) or the calibration seeded (Group 2B).
     eprintln!("[rtsp-adapter] syncing to clock {clock_host}:{clock_port}");
-    if net_clock
-        .wait_for_sync(gstreamer::ClockTime::from_seconds(5))
-        .is_err()
-    {
-        eprintln!("[rtsp-adapter] WARNING: clock sync timed out — proceeding");
+    let sync_start = Instant::now();
+    match net_clock.wait_for_sync(gstreamer::ClockTime::from_seconds(60)) {
+        Ok(()) => eprintln!(
+            "[rtsp-adapter] clock synced in {}ms",
+            sync_start.elapsed().as_millis()
+        ),
+        Err(_) => {
+            // Group 1 measurement: did not converge in 60s.
+            // Distinguish genuine calibration failure from a stuck is-synced flag:
+            // compare the net clock's time to the local system clock.
+            let net_t = net_clock.time();
+            let sys_t = gstreamer::SystemClock::obtain().time();
+            eprintln!(
+                "[rtsp-adapter] clock sync: did not converge in 60s \
+                 (net_clock={net_t:?} sys_clock={sys_t:?})"
+            );
+        }
     }
 
     // ── Config ────────────────────────────────────────────────────────────

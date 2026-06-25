@@ -139,3 +139,42 @@ lands.
    before the first buffer arrives where the pad offset may be stale.
 
 Flagged to review chat before any fix is attempted.
+
+---
+
+**Attempt 1 — Group 1 measurement complete (2026-06-25).** Group 2B confirmed required.
+
+Cold-start adapters (attempt=0) sync in **<400ms** (147ms cam-27, 397ms cam-77).
+Respawned adapters (attempt≥1) **do not sync in 60s** — observed at session age ~2 min.
+Second measurement at 15 min was not needed; the result at 2 min is already decisive.
+
+Time-comparison probe at the 60s timeout:
+```
+net_clock=0:01:00.000300475   sys_clock=21:55:59.779191696
+```
+The `net_clock` value is exactly 60 s after the clock was created from ZERO — no NTP
+offset has been applied at all.  The `sys_clock` is at ~21h55m (GStreamer monotonic
+epoch).  The NTP packets are either not reaching the provider, not getting responses,
+or the calibration is rejecting every sample.
+
+**Why cold-start syncs but respawn doesn't (hypothesis):** At cold-start, the
+`GstNetTimeProvider` starts serving and the adapter's `GstNetClientClock` is created
+within seconds of each other.  The provider's initial reported time is `base_time_ns`
+(~21h55m), but `GstNetClientClock` is seeded with ZERO — a ~21h offset — and yet it
+syncs in 147ms.  At respawn the conditions look identical, yet it never syncs.  The
+asymmetry is not explained by offset magnitude alone.  Possible causes: GStreamer
+calibration algorithm treats the initial seed more conservatively when prior samples
+have been collected (even across processes, via some global GST_CLOCK state), or
+there is a known `GstNetClientClock` behavior where it does not re-calibrate correctly
+in a child process that inherits certain GStreamer global state from the parent.
+
+**Proposed fix (Group 2B):** Seed `GstNetClientClock::new` with
+`gstreamer::SystemClock::obtain().time()` instead of `ClockTime::ZERO`.  Since both
+adapter and core run on the same machine, the system clock is the same clock the
+provider is serving — seeding at the current time gives the NTP algorithm an initial
+estimate within microseconds of the truth, so calibration should converge in 1–2
+packet exchanges.  No new launch args or protocol changes needed.
+
+Also: gate production on actual sync (remove the "proceeding" fallback path).
+
+Needs review-chat sign-off before implementation (TaskBlock Group 2B clause).

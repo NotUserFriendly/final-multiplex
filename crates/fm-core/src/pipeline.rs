@@ -809,8 +809,8 @@ impl Pipeline {
         let voff_src = voff_q.static_pad("src").ok_or("voff_q: no src")?;
         voff_src.link(&comp_sink)?;
 
-        // Group 1: log first PTS vs pipeline running time so reconnect PTS gaps
-        // appear in the log.  Fires once per chain build (cold-start and reconnect).
+        // One-shot probe: log first PTS vs pipeline running time so PTS gaps at
+        // reconnect are visible in the session log.
         {
             let pipeline_weak = self.inner.downgrade();
             let sid = source_id.to_string();
@@ -818,8 +818,8 @@ impl Pipeline {
             voff_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
                 if !done.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     if let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data {
-                        if let Some(pipeline) = pipeline_weak.upgrade() {
-                            let running = pipeline.current_running_time();
+                        if let Some(p) = pipeline_weak.upgrade() {
+                            let running = p.current_running_time();
                             eprintln!(
                                 "[reconnect-pts] '{}' first_pts={:?} pipeline_running={:?}",
                                 sid,

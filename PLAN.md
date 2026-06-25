@@ -60,6 +60,45 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 - **Exit:** kill the RTSP process mid-play — the core survives, the tile holds, the
   source auto-recovers, and A/V sync is intact after recovery.
 
+### Phase 2.1 — Recovery hardening  *(complete)*
+- **Deliverable:** the reconnect/recovery path made solid on real hardware, well beyond
+  Phase 2's exit bar. Transport moved from GDP-framed shm to **unixfd** (ADR-0019), carrying
+  PTS/caps/events natively, behind a per-platform **transport seam** (SDK output builder +
+  core receive builder). **Synthetic floor inputs** (ADR-0018) let live aggregators reach
+  PLAYING with sources absent; Play is gated on PLAYING (cascade fix). **Live-source offset
+  model** (ADR-0016: positive-only, bounded, tile-res buffering, configurable ceiling) with
+  **adapter-declared capabilities** (ADR-0017); offset and mute **survive reconnect**
+  (`source_layouts` kept in sync with live pads). Adapter clock **seeded with system time**
+  so respawned processes timestamp correctly (single-machine); reconnect **rebuilds the
+  chain** to clear the stale aggregator timeline. **Delivery watchdog** (ADR-0020) bounds
+  adapter-recovery deference; ForReview Issues 1 (missing `StreamsChanged`) and 2 (EOS churn)
+  fixed. Permanent **offset reconnect canary**, **test-run isolation** (refuse-launch +
+  PID-tied `session.log`), dummy-adapter event enrichment.
+- **Exit (met):** unplug/replug a live RTSP camera mid-session at depth — core survives,
+  tile recovers, offset and mute persist, no respawn loop; the watchdog backstops a stuck
+  divergence and stays silent against a genuinely-absent source. Hardware-validated.
+
+### Phase 2.2 — Pre-Phase-3 cleanup
+- **Deliverable:** close instrumentation and hygiene gaps before a second adapter type.
+  - **RTSP metrics:** fix `fps_in` (pinned at 30 — report the *actual* rate); add a
+    bad/incomplete-frame counter for RTSP; window dropped + bad over a rolling interval
+    (e.g. last 60 s) for live sources, keep cumulative totals for finite media. Shares the
+    "actual source framerate" dependency with the offset canary's tolerance — do them together.
+  - **Adapter binary location:** a deterministic, permanent path the core always resolves,
+    regardless of who launches it. Removes the per-launch "hunt" and the class of mistakes
+    from launching the executable differently across runs.
+  - **UI gaps:** clamp the stats/control overlay to its tile's region (currently falls to the
+    display bottom); surface the existing per-feature min/max bounds visually (offset etc. are
+    clamped in code but invisible to the user).
+  - **SIGNAL LOST overlay:** a translucent state indicator over a tile so a dead stream is
+    distinguishable from a live black frame. SIGNAL LOST is buildable now (Reconnecting/Error/
+    no-frames states exist); FILE TERMINATED needs an EOS/Ended state; PAUSED waits for
+    play/pause (Phase 5). Build SIGNAL LOST now, extend as the states arrive.
+  - **Adapter reboot control:** a UI button to manually 'down' and re-establish a misbehaving
+    RTSP feed (reuses the supervisor respawn the watchdog already drives).
+- **Exit:** metrics read true for live RTSP; adapter launch is deterministic; the UI gaps are
+  closed; a flaky feed can be manually rebooted.
+
 ### Phase 3 — YouTube adapter
 - **Deliverable:** yt-dlp resolver subprocess + stream ingest + periodic re-resolve on
   URL expiry, as an out-of-process adapter.
@@ -117,6 +156,14 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 ### Later
 Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources.
 
+**Cross-machine / distributed deployment.** Net-clock calibration fails on supervisor-respawned
+adapters (ForReview Issue 3): the system-clock seed (ADR-0005, single-machine) is load-bearing on
+every reconnect and masks it. Single-machine is unaffected — the system clock is the genuine
+shared timebase. Cross-machine deployments cannot rely on the seed. **Trigger:** when core and
+adapters run on different machines. Likely resolved by ADR-0005's `GstPtpClock` upgrade path
+rather than root-causing the `GstNetClientClock` respawn failure (root cause unconfirmed,
+suspected GStreamer child-process clock state).
+
 ## Open questions
 
 - **Runtime decode failure / stall resilience:** the build-time stall is **resolved** —
@@ -146,6 +193,15 @@ Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources
   the control channel. ADR-0008 says per-source telemetry originates in the adapter, but
   level is a cheap post-decode measurement that's simplest taken at one core-side spot —
   resolve when the Phase-2 contract is concrete.
+- **File offset bound:** files cost nothing to offset (seekable, not real-time), so they do
+  not need the live buffering ceiling (ADR-0016) — but an *unbounded* value invites fat-finger
+  errors and offsetting past a clip's own length is meaningless (the source just never overlaps
+  the composition window). Recommendation: bound file offset to the **media's duration** where
+  known, rather than the live ceiling or infinity. Small ADR-0016 follow-up if adopted; the live
+  bound is unchanged.
+- **Per-source volume tag (resolved):** the scene already carries a per-source `volume`
+  (default 1.0); `0.0` already produces silence on the audiomixer sink pad, so "0 = mute" holds
+  today. Live volume *sliders* remain the separate open question below.
 - **shm bandwidth:** the core scales full-resolution frames per source (ADR-0012
   core-owned resize — adapter produces at full grid resolution, core scales to tile).
   At 1920×1080 @ 30 fps that is ~240 MB/s per source over shared memory.  Acceptable on

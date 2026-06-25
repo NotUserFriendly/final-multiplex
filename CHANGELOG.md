@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   When an adapter reports `fps_in > 0` but the core has no active chain for that source,
   and the divergence persists beyond the timeout, the supervisor force-respawns the adapter
   via the proven cold-start path.  Lower = faster backstop but more false-respawn risk;
-  must exceed the normal recovery + RTSP connect window.
+  must exceed the normal recovery + RTSP connect window.  Hardware validated at 10 s:
+  bark-test (suppressed recovery) → watchdog fires → respawn → chain rebuilt ✓;
+  dead-source no-loop (camera absent, `fps_in = 0`) → watchdog silent across 60 s ✓.
 - **Offset reconnect canary (`[offset-canary]`):** a permanent, always-on probe on
   `voff_q:src` verifies the applied pad offset matches `source_layouts` on every chain
   rebuild.  Samples 20 buffers after the voff_q fill phase (windowed by `ceiling_ms +

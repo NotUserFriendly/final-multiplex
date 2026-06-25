@@ -47,6 +47,8 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    /// Window close button clicked or SIGTERM received — run graceful teardown.
+    Exit,
     TogglePlay,
     /// Typed text in an offset box; commits on valid parse.
     OffsetEdit {
@@ -100,7 +102,22 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Exit => {
+                if let Some(mut sup) = self.supervisor.take() {
+                    sup.shutdown_all();
+                }
+                return iced::exit();
+            }
+
             Message::Tick => {
+                #[cfg(unix)]
+                if crate::SIGTERM_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(mut sup) = self.supervisor.take() {
+                        sup.shutdown_all();
+                    }
+                    return iced::exit();
+                }
+
                 self.tick_count = self.tick_count.wrapping_add(1);
 
                 if let Some(frame) = bridge::latest_frame(&self.frame_store, &mut self.frame_gen) {
@@ -410,21 +427,26 @@ impl App {
 
 // ── Standalone helpers ────────────────────────────────────────────────────────
 
-/// Route window open/resize events to Message::Resized.
+/// Route window events to messages.
 fn on_window_event(
     event: iced::Event,
     _status: iced::event::Status,
     _id: iced::window::Id,
 ) -> Option<Message> {
-    let size = match event {
-        iced::Event::Window(iced::window::Event::Resized(s)) => s,
-        iced::Event::Window(iced::window::Event::Opened { size: s, .. }) => s,
-        _ => return None,
-    };
-    Some(Message::Resized {
-        width: size.width,
-        height: size.height,
-    })
+    match event {
+        iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Exit),
+        iced::Event::Window(iced::window::Event::Resized(s)) => Some(Message::Resized {
+            width: s.width,
+            height: s.height,
+        }),
+        iced::Event::Window(iced::window::Event::Opened { size: s, .. }) => {
+            Some(Message::Resized {
+                width: s.width,
+                height: s.height,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// LED-style segmented audio level meter spanning DB_FLOOR → 0 dBFS.

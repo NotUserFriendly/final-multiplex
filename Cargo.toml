@@ -30,6 +30,8 @@ toml             = "1"
 toml_edit        = "0.25"
 # wgpu — explicit dep so video.rs can name its types directly
 wgpu             = "27"
+# System calls (prctl, signal) — Unix only
+libc             = "0.2"
 # Internal crates
 fm-adapter-sdk   = { path = "crates/fm-adapter-sdk" }
 fm-core          = { path = "crates/fm-core" }

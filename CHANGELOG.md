@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Adapter orphaning on app exit:** adapters no longer survive app termination.
+  Four-layer fix: (1) `prctl(PR_SET_PDEATHSIG, SIGTERM)` in both adapters so the
+  kernel signals them when the supervisor process dies — covers app `SIGKILL` where
+  no app-side code can run; (2) app-side `SIGTERM` handler sets a flag checked in
+  the iced `Tick` loop to call `shutdown_all()` before exiting; (3) iced
+  `CloseRequested` event now calls `shutdown_all()` via `Message::Exit` instead of
+  relying on the default exit path; (4) `Drop` on `Supervisor` as backstop for
+  unwind paths. Verified: SIGTERM and SIGKILL of the app both leave zero orphan
+  adapter processes; stale runtime dirs from a hard-killed session are reaped at
+  next startup.
+
 ### Added
 - **Adapter-owned recovery (ADR-0013):** adapters now signal in-process reconnects with
   `Reconnecting { attempt }` so the supervisor's frame-flow watchdog does not kill an

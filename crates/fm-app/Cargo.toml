@@ -18,3 +18,6 @@ gstreamer-video.workspace = true
 iced.workspace            = true
 wgpu.workspace            = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+

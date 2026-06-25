@@ -58,6 +58,9 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
 <!-- Move items here on fix. Format:
 - [x] [area] symptom — fix summary. (fixed YYYY-MM-DD)
 -->
+- [x] [supervisor] Adapter processes orphaned on app exit: `prctl(PR_SET_PDEATHSIG)` +
+      `SIGTERM` handler + `CloseRequested` handler + `Drop` on Supervisor. Verified:
+      SIGTERM and SIGKILL of the app leave zero orphan adapters. (fixed 2026-06-24)
 - [x] [rtsp-adapter] Reconnect storm after SIGKILL: supervisor-initiated kills now send
       `Shutdown` and wait 3 s for RTSP TEARDOWN before force-killing.  Validated by
       Group F Gate 3: SIGKILL detected, 1 s backoff, respawn, Configure delivered,

@@ -2,6 +2,17 @@ mod bridge;
 mod ui;
 mod video;
 
+// Layer 2: set by the SIGTERM signal handler so the iced Tick loop can
+// call shutdown_all() on the main thread where it is safe to do so.
+#[cfg(unix)]
+pub(crate) static SIGTERM_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn sigterm_handler(_: libc::c_int) {
+    SIGTERM_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn boot() -> ui::App {
     let config_path = std::env::args()
         .nth(1)
@@ -10,6 +21,16 @@ fn boot() -> ui::App {
 }
 
 fn main() -> iced::Result {
+    // Install SIGTERM handler before starting the iced event loop so that
+    // killing the app process triggers graceful adapter teardown via Tick.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            sigterm_handler as *const () as libc::sighandler_t,
+        );
+    }
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "scene.toml".to_string());
@@ -27,5 +48,6 @@ fn main() -> iced::Result {
         .title("Final Multiplex")
         .subscription(ui::App::subscription)
         .window_size(initial_size)
+        .exit_on_close_request(false)
         .run()
 }

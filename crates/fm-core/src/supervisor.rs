@@ -531,6 +531,14 @@ impl Supervisor {
     }
 }
 
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        if !self.live.is_empty() {
+            self.shutdown_all();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_msg(
     source_id: &str,

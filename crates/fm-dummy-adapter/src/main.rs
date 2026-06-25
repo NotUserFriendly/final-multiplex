@@ -38,6 +38,25 @@ use std::time::{Duration, Instant};
 fn main() {
     let args = parse_args();
 
+    // Layer 1: signal SIGTERM to this process when the parent (supervisor) dies,
+    // covering the SIGKILL-of-app case where no app-side handler can run.
+    // Race: if parent died between fork and prctl, getppid() will return 1 (init
+    // adopted us); exit immediately before doing anything expensive.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGTERM as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+        if libc::getppid() == 1 {
+            std::process::exit(1);
+        }
+    }
+    // TODO(windows): assign to a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+
     gstreamer::init().expect("GStreamer init failed");
 
     // ── Stdin command reader — started before Configure so the channel

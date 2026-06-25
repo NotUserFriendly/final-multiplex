@@ -32,8 +32,12 @@ Treat live-source offset as a bounded, positive-only delay backed by an explicit
   In-core file sources keep the existing signed ±60 s range and Phase-1 semantics.
 - **Buffer at tile resolution.** The offset-buffering queue sits after `videoscale`, near
   the compositor sink pad where the offset is applied, so it holds small tile-sized frames,
-  not full production-resolution frames. Size it to the ceiling, non-leaky within the
-  ceiling, `leaky=downstream` beyond it (the anti-stall safety the original queue provided).
+  not full production-resolution frames. Size it to the ceiling and use **`leaky=upstream`**:
+  a delay line must retain the *oldest* frames (they are scheduled for presentation at
+  PTS+offset) and, when full, drop the *newest* incoming frame. That preserves the delayed
+  frames and avoids back-pressuring the live source. (`leaky=downstream` drops the oldest
+  frames — the ones about to be presented — which reproduces the offset divergence; it is the
+  wrong mode for a delay buffer.)
 - **Compositor latency** is set to the ceiling so the live aggregator actually waits for the
   most-delayed source.
 - **The ceiling is a configurable parameter** (config-driven), defaulting to 2000 ms. A user

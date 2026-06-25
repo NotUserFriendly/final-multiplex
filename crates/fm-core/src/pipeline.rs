@@ -40,6 +40,19 @@ fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
         .map_err(|e| format!("missing GStreamer element '{factory}': {e}").into())
 }
 
+/// Platform-selected transport source (ADR-0019 receive seam).
+/// On Linux: `unixfdsrc` with `do-timestamp=false` so the adapter's PTS
+/// passes through unmodified rather than being overwritten with arrival time.
+/// Adding a new platform means adding a new `cfg` branch here and in
+/// `fm-adapter-sdk/src/transport.rs`.
+#[cfg(target_os = "linux")]
+fn make_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Element> {
+    let src = make("unixfdsrc", name)?;
+    src.set_property_from_str("socket-path", socket_path);
+    src.set_property("do-timestamp", false);
+    Ok(src)
+}
+
 /// Source-side pad references for a single source.
 ///
 /// `gst_pad_set_offset` only works reliably on **source** pads, so we store
@@ -531,12 +544,8 @@ impl Pipeline {
                     let (video_sock, audio_sock) = runtime::shm_paths(&source.id);
 
                     if has_video {
-                        let vunixfdsrc: gstreamer::Element =
-                            gstreamer::ElementFactory::make("unixfdsrc")
-                                .name(format!("vunixfdsrc_{}", source.id))
-                                .build()?;
-                        vunixfdsrc.set_property_from_str("socket-path", &video_sock);
-                        vunixfdsrc.set_property("do-timestamp", false);
+                        let vunixfdsrc =
+                            make_transport_src(&format!("vunixfdsrc_{}", source.id), &video_sock)?;
 
                         let vshmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
@@ -572,12 +581,8 @@ impl Pipeline {
                     }
 
                     if has_audio {
-                        let aunixfdsrc: gstreamer::Element =
-                            gstreamer::ElementFactory::make("unixfdsrc")
-                                .name(format!("aunixfdsrc_{}", source.id))
-                                .build()?;
-                        aunixfdsrc.set_property_from_str("socket-path", &audio_sock);
-                        aunixfdsrc.set_property("do-timestamp", false);
+                        let aunixfdsrc =
+                            make_transport_src(&format!("aunixfdsrc_{}", source.id), &audio_sock)?;
 
                         let ashmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
@@ -708,9 +713,7 @@ impl Pipeline {
 
         let (video_sock, _) = runtime::shm_paths(source_id);
 
-        let vunixfdsrc = make("unixfdsrc", &format!("vunixfdsrc_{source_id}"))?;
-        vunixfdsrc.set_property_from_str("socket-path", &video_sock);
-        vunixfdsrc.set_property("do-timestamp", false);
+        let vunixfdsrc = make_transport_src(&format!("vunixfdsrc_{source_id}"), &video_sock)?;
 
         let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
         vshmcaps.set_property(
@@ -866,9 +869,7 @@ impl Pipeline {
 
         let (_, audio_sock) = runtime::shm_paths(source_id);
 
-        let aunixfdsrc = make("unixfdsrc", &format!("aunixfdsrc_{source_id}"))?;
-        aunixfdsrc.set_property_from_str("socket-path", &audio_sock);
-        aunixfdsrc.set_property("do-timestamp", false);
+        let aunixfdsrc = make_transport_src(&format!("aunixfdsrc_{source_id}"), &audio_sock)?;
 
         let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
         ashmcaps.set_property(

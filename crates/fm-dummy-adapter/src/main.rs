@@ -159,7 +159,7 @@ fn main() {
     let vconv = make("videoconvert", "vconv");
     let vscale = make("videoscale", "vscale");
     let vcaps = make("capsfilter", "vcaps");
-    let vunixfdsink = make("unixfdsink", "vunixfdsink");
+    let vunixfdsink = fm_adapter_sdk::transport::make_output_sink("vunixfdsink", &video_shm);
 
     vsrc.set_property_from_str("pattern", "ball");
     vsrc.set_property("is-live", true);
@@ -173,8 +173,6 @@ fn main() {
             .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );
-    vunixfdsink.set_property_from_str("socket-path", &video_shm);
-    vunixfdsink.set_property("sync", false);
 
     pipeline
         .add_many([&vsrc, &vconv, &vscale, &vcaps, &vunixfdsink])
@@ -195,7 +193,7 @@ fn main() {
     let aconv = make("audioconvert", "aconv");
     let aresamp = make("audioresample", "aresamp");
     let acaps = make("capsfilter", "acaps");
-    let aunixfdsink = make("unixfdsink", "aunixfdsink");
+    let aunixfdsink = fm_adapter_sdk::transport::make_output_sink("aunixfdsink", &audio_shm);
 
     asrc.set_property("is-live", true);
     asrc.set_property_from_str("wave", "sine");
@@ -208,8 +206,6 @@ fn main() {
             .field("layout", "interleaved")
             .build(),
     );
-    aunixfdsink.set_property_from_str("socket-path", &audio_shm);
-    aunixfdsink.set_property("sync", false);
 
     pipeline
         .add_many([&asrc, &aconv, &aresamp, &acaps, &aunixfdsink])
@@ -240,6 +236,7 @@ fn main() {
     let mut last_metrics = Instant::now();
     let mut ingest_state = IngestState::Idle;
     let mut prev_frames: u64 = 0;
+    let mut events_injected = false;
 
     loop {
         // Process pending commands.
@@ -271,12 +268,21 @@ fn main() {
         // Drain bus messages.
         while let Some(msg) = bus.pop() {
             use gstreamer::MessageView;
-            if let MessageView::Error(e) = msg.view() {
-                let desc = e.error().to_string();
-                eprintln!("[dummy-adapter] GStreamer error: {desc}");
-                emit(AdapterMessage::Error { description: desc });
-                pipeline.set_state(gstreamer::State::Null).unwrap();
-                return;
+            match msg.view() {
+                MessageView::Error(e) => {
+                    let desc = e.error().to_string();
+                    eprintln!("[dummy-adapter] GStreamer error: {desc}");
+                    emit(AdapterMessage::Error { description: desc });
+                    pipeline.set_state(gstreamer::State::Null).unwrap();
+                    return;
+                }
+                MessageView::StateChanged(s)
+                    if !events_injected && s.current() == gstreamer::State::Playing =>
+                {
+                    events_injected = true;
+                    inject_decodebin3_events(&source_id, &vcaps, &acaps);
+                }
+                _ => {}
             }
         }
 
@@ -313,6 +319,54 @@ fn emit(msg: AdapterMessage) {
     let mut lock = out.lock();
     let _ = lock.write_all(line.as_bytes());
     let _ = lock.flush();
+}
+
+/// Push `stream-collection` and `tags` events on the video and audio output pads,
+/// matching the event shape a real `decodebin3` source produces.  Called once
+/// when the pipeline first reaches PLAYING, so transport-payload bugs surface on
+/// the cheap deterministic dummy path rather than only against live cameras.
+fn inject_decodebin3_events(
+    source_id: &str,
+    vcaps: &gstreamer::Element,
+    acaps: &gstreamer::Element,
+) {
+    use gstreamer::prelude::*;
+
+    let video_stream = gstreamer::Stream::new(
+        Some(&format!("{source_id}/video/0")),
+        None::<&gstreamer::Caps>,
+        gstreamer::StreamType::VIDEO,
+        gstreamer::StreamFlags::SELECT,
+    );
+    let audio_stream = gstreamer::Stream::new(
+        Some(&format!("{source_id}/audio/0")),
+        None::<&gstreamer::Caps>,
+        gstreamer::StreamType::AUDIO,
+        gstreamer::StreamFlags::SELECT,
+    );
+    let collection = gstreamer::StreamCollection::builder(None)
+        .stream(video_stream)
+        .stream(audio_stream)
+        .build();
+
+    let encoder_tag = format!("fm-dummy-adapter/{source_id}");
+    let mut tag_list = gstreamer::TagList::new();
+    {
+        let t = tag_list.get_mut().unwrap();
+        t.add::<gstreamer::tags::Encoder>(&encoder_tag.as_str(), gstreamer::TagMergeMode::Replace);
+    }
+
+    let coll_ev = gstreamer::event::StreamCollection::builder(&collection).build();
+    let tag_ev = gstreamer::event::Tag::builder(tag_list).build();
+
+    if let Some(pad) = vcaps.static_pad("src") {
+        pad.push_event(coll_ev);
+        pad.push_event(tag_ev.clone());
+    }
+    if let Some(pad) = acaps.static_pad("src") {
+        pad.push_event(tag_ev);
+    }
+    eprintln!("[dummy-adapter] injected stream-collection + tags (decodebin3 shape)");
 }
 
 fn make(factory: &str, name: &str) -> gstreamer::Element {

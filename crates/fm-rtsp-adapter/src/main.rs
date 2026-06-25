@@ -583,7 +583,7 @@ fn build_video_chain(
     // errors with "output caps are unfixed".
     let vrate = make("videorate", "vrate");
     let vcaps = make("capsfilter", "vcaps");
-    let vunixfdsink = make("unixfdsink", "vunixfdsink");
+    let vunixfdsink = fm_adapter_sdk::transport::make_output_sink("vunixfdsink", shm_path);
 
     vcaps.set_property(
         "caps",
@@ -595,8 +595,6 @@ fn build_video_chain(
             .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );
-    vunixfdsink.set_property_from_str("socket-path", shm_path);
-    vunixfdsink.set_property("sync", false);
 
     pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink])?;
     gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink])?;
@@ -628,7 +626,7 @@ fn build_audio_chain(
     let aconv = make("audioconvert", "aconv");
     let aresamp = make("audioresample", "aresamp");
     let acaps = make("capsfilter", "acaps");
-    let aunixfdsink = make("unixfdsink", "aunixfdsink");
+    let aunixfdsink = fm_adapter_sdk::transport::make_output_sink("aunixfdsink", shm_path);
 
     acaps.set_property(
         "caps",
@@ -639,8 +637,6 @@ fn build_audio_chain(
             .field("layout", "interleaved")
             .build(),
     );
-    aunixfdsink.set_property_from_str("socket-path", shm_path);
-    aunixfdsink.set_property("sync", false);
 
     pipeline.add_many([&aconv, &aresamp, &acaps, &aunixfdsink])?;
     gstreamer::Element::link_many([&aconv, &aresamp, &acaps, &aunixfdsink])?;

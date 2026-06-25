@@ -1,99 +1,68 @@
-# Task Block — swap Linux transport to unixfd (ADR-0019), then finish the offset path
+# Task Block — Phase 2 close-out: seam, reconnect-freeze, dummy enrichment, log clear
 
-**What changed:** GDP can't carry decodebin3's event stream on 1.28.2. Per ADR-0019 the
-transport becomes platform-selected behind two seams; Linux uses `unixfd`. This removes the
-shm + GDP path on Linux and unblocks everything that was stuck behind it.
+Phase 2's gate is met (T3 flat offset on live RTSP). These are the close-out items before
+Phase 3. None should change the validated offset behavior — Group 1 is a behavior-preserving
+refactor, and T3 on live RTSP is the regression gate for it.
 
-**Done — do NOT redo:** synthetic floors (ADR-0018, PLAYING timeout resolved), the cascade
-fix (Play gated on PLAYING). Both confirmed working.
+## Group 1 — finish the transport seam (ADR-0019)
 
-**Still pending (was blocked behind the transport):** compositor latency, `voff_q`
-correction, cam-77 cold-start, validation, test isolation.
+Right now both adapters call `make("unixfdsink")` directly and the core builds `unixfdsrc`
+inline — the per-platform element choice is hardcoded, not behind the seam ADR-0019 specified.
+Realize the seam so adding a platform is one match arm at each end, not an edit per adapter:
 
-Order: settle the premise (Group 1), confirm the tool (Group 2), build the seam + unixfd
-(Group 3), then the pending offset items, then validate on **real RTSP**.
+- **SDK output builder.** Add a function in `fm-adapter-sdk` that, given a video/audio output
+  request (socket path + caps), creates and returns the platform's sink — `unixfdsink` on
+  Linux, behind a single `cfg(target_os)` / platform switch. Both adapters call this instead
+  of constructing the sink themselves.
+- **Core receive builder.** The matching selection for the source side: `unixfdsrc` on Linux,
+  behind the same single switch, in the one place the receive chain is built.
+- **Refactor `fm-dummy-adapter` and `fm-rtsp-adapter`** to use the SDK builder; remove their
+  direct `unixfdsink` construction.
+- This is a **behavior-preserving refactor** — same elements, same properties, relocated. Do
+  not change the transport behavior. **Regression gate: T3 must still pass flat at +2000 ms on
+  live RTSP after the refactor.**
 
-## Group 1 — settle the do-timestamp question, once, with a measurement
+## Group 2 — confirm the cam-77 reconnect-freeze (HUMAN-IN-THE-LOOP)
 
-Before building anything, run the controlled test that was asserted but never cleanly
-isolated. Dummy adapter, **no framing**, plain `shmsrc` `do-timestamp=false`, probe core PTS
-against adapter PTS.
-- **If PTS does NOT cross** (expected — documented shm behavior): proceed to unixfd. The
-  question is now settled; do not revisit it.
-- **If PTS DOES cross** (unexpected): **stop and report** — the whole framing/transport swap
-  may be unnecessary and ADR-0019's premise needs revisiting before you build.
+The original cam-77 freeze (recv_q backpressure after a long reconnect cycle) was never
+root-caused and predates unixfd. unixfd changes the backpressure dynamics, so re-confirm
+whether it recurs.
 
-## Group 2 — confirm unixfd is available
+- **STOP-AND-WAIT: this test needs a physical unplug/replug of cam-77, which only the
+  maintainer can do. You cannot perform it yourself.** Set up the test, then **stop and
+  explicitly ask the maintainer to unplug the camera, and wait for confirmation before
+  continuing. Do not simulate the disconnect, do not assume it happened, do not proceed as if
+  the cable moved.** Same again for the replug. The maintainer is not able to teleport on your
+  schedule — pause and hand control back at each physical step.
+- Procedure: run with cam-77 streaming and confirm live → ask maintainer to **unplug cam-77**,
+  wait → observe the adapter goes Reconnecting, other sources unaffected → ask maintainer to
+  **replug cam-77**, wait → confirm video resumes and does **not** freeze.
+- If it freezes: capture `recv_q` (via `ss -tnp` on the RTSP socket) and adapter CPU, and
+  **report back** — do not chase it solo. This is the multi-attempt bug from before; if it
+  survives unixfd it's a review-chat discussion, not a quick patch.
 
-- `gst-inspect-1.0 unixfdsink` and `unixfdsrc` resolve on the dev box (need GStreamer ≥ 1.24;
-  box is 1.28.2). If absent, stop and report — do not substitute silently.
+## Group 3 — enrich the dummy adapter with real events
 
-## Group 3 — transport seam + unixfd (ADR-0019)
+The dummy adapter emits a minimal event stream, which is exactly why it hid the GDP bug for
+three rounds. Make it emit `decodebin3`-like events so transport-payload bugs surface on the
+cheap deterministic path:
 
-- **Introduce the seam.** SDK exposes an output builder ("give me a video/audio output") that
-  selects the platform sink; the core's receive-chain builder selects the matching source.
-  Adapters call the builder and **never name the transport element** — they stay OS-agnostic.
-- **Linux path = unixfd.** Adapter side: `… → unixfdsink`. Core side: `unixfdsrc → …`.
-- **Remove the shm + GDP path on Linux:** drop `gdppay`/`gdpdepay` and `shmsink`/`shmsrc` from
-  the Linux build. `unixfd` carries PTS/caps/segment/events natively — no framing, and
-  `do-timestamp` is irrelevant (metadata arrives intact).
-- **Socket lives in the runtime dir** (ADR-0014): unix-domain socket path under the per-PID
-  dir, 0600, credentials never in argv. Reuse the existing runtime-dir plumbing.
-- Carry over the connection-ordering guarantee (`unixfd`'s equivalent of wait-for-connection /
-  the adapter pushing only after `Play`) so a fresh stream never pushes into an unconnected
-  consumer.
+- Emit `stream-start`, `stream-collection`, and `tags` events on the dummy adapter's output,
+  matching the shape a real `decodebin3` source produces.
+- After enrichment, re-run **T1 and T3 on the dummy path** and confirm the events pass through
+  unixfd cleanly (they should — unixfd carries events natively) and the offset still holds.
+  This proves the dummy now exercises the event path a real source would.
 
-## Group 4 — compositor latency + voff_q correction (ADR-0016) — still pending
+## Group 4 — housekeeping
 
-- **Re-add compositor `latency` = ceiling** (still unset in pushed code). With floors + the
-  Play-gate + unixfd, re-test it no longer errors. If it still errors, stop and report.
-- **`voff_q` is `leaky=downstream` always** (~line 358) with a comment claiming "voff_q alone
-  is sufficient — the compositor uses the latest frame." That comment *is* the T3 failure:
-  "uses the latest frame" is the leaky drop that makes the offset diverge. Make `voff_q`
-  **non-leaky within the ceiling**, leaky only beyond it, and delete that comment. The offset
-  holds only with both the latency (aggregator waits) and the non-leaky-within-ceiling queue.
-
-## Group 5 — cam-77 cold-start (still pending)
-
-- `build_shmsrc_chain` (now an `unixfdsrc` chain) builds a complete, queued, offset-capable
-  chain **live** on `StreamsChanged` and links it to the compositor/mixer. Validate offline →
-  online populates the tile without stalling others; dummy adapter first, then real RTSP.
-
-## Group 6 — test-run isolation (carry-over, still not landed)
-
-Polluted logs from surviving instances already caused one wrong conclusion. Land this:
-- **Refuse to launch if an instance is already running** (scan runtime root for live-PID dirs
-  via `runtime::is_pid_alive`; clear message + non-zero exit).
-- **PID-tied `session.log`** under the per-PID runtime dir.
-
-## Group 7 — validation — ON THE REAL RTSP PATH, not just dummy
-
-The dummy path is exactly what hid the GDP bug. Validate the transport against a live camera's
-full event stream.
-- **T1:** PTS crosses (adapter PTS == core PTS) over unixfd.
-- **T3 (the gate):** offset holds **flat at +2000 ms** within the ceiling on a **live RTSP
-  source**, normal frame delivery — not n×2800 divergence. Phase 2 is not done until this
-  passes on a live source.
-- **Beyond ceiling** clamped; **live negative** clamps to 0, no dead input.
-- **cam-77 cold-start:** offline → start → online → tile populates, others unstalled.
-- **RTSP smoke:** live camera plays, a 1–2 s offset visibly and stably delays it, no freeze,
-  no caps/event errors (the unixfd path should have none).
-
-## Group 8 — enrich the dummy adapter (process fix)
-
-- Make the dummy adapter emit `decodebin3`-like events (stream-collection, tags, stream-start)
-  so transport-payload bugs surface on the cheap deterministic path next time, instead of only
-  against a live camera. This is the lesson from the GDP miss, made permanent.
-
-## Group 9 — housekeeping
-
-- ADR-0019 authored (review chat) — implement against it. **Change ADR-0015's status line to
-  "Superseded by ADR-0019"** — that one-line status edit is the only permitted change to an
-  accepted ADR.
-- CHANGELOG: transport seam + unixfd on Linux, GDP removed, latency + voff_q correction.
-- BUGS.md: move offset-divergence and cam-77 cold-start to `## Fixed` once Group 7 confirms.
-- troubleshooting.md: close out the GDP saga (superseded by unixfd), keep nothing stale.
-- **Standing rule (still in force):** don't remove validated architecture to clear a symptom —
-  flag it. (This time the architecture genuinely was the problem, and it was diagnosed and
-  escalated correctly rather than ripped out — that's the right pattern.)
-- DoD checklist per commit; commit in chunks (seam+unixfd; offset items; cold-start; isolation).
+- **Clear `troubleshooting.md`.** The cam-77-freeze and GDP-spike sections are resolved or
+  superseded (unixfd replaced GDP; cold-start fixed). Reset the file to just its header/purpose
+  block so it's a clean scratchpad for the next active bug. (The maintainer has delegated this
+  clear to you for this round.)
+- **ADR-0016** has been corrected by the maintainer (the `leaky=downstream` text was a factual
+  error; the correct mode is `leaky=upstream`, which the code already does). No code change —
+  just be aware the ADR text now matches the code.
+- CHANGELOG: transport seam realized (ADR-0019), dummy adapter event enrichment, and the
+  cam-77 reconnect-freeze result (once Group 2 produces one).
+- DoD checklist per commit; commit in chunks (seam refactor; dummy enrichment; housekeeping).
+  Group 2's result is reported to the review chat, not self-resolved.

@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Transport seam realized (ADR-0019):** The platform-specific element names
+  (`unixfdsink`, `unixfdsrc`) are now behind a single `cfg(target_os = "linux")`
+  guard each.  Adapter output: `fm_adapter_sdk::transport::make_output_sink()` in
+  `fm-adapter-sdk/src/transport.rs`.  Core receive: `make_transport_src()` in
+  `fm-core/src/pipeline.rs`.  Both adapters (`fm-dummy-adapter`, `fm-rtsp-adapter`)
+  call the SDK function; the core calls the pipeline-local function.  Adding a
+  new platform is now one match arm at each seam, not an edit per adapter.
+  Behavior-preserving — same elements, same properties, same T3 result.
+- **Dummy adapter enriched with decodebin3-like events:** `fm-dummy-adapter` now
+  pushes `stream-collection` (with video + audio `GstStream` entries) and `tags`
+  events on its output pads when the pipeline first reaches PLAYING — matching the
+  event shape a real `decodebin3` source produces.  Transport-payload bugs that only
+  manifest on the event path (such as the GDP event deserialization failure) now
+  surface on the cheap deterministic path, not only against live cameras.
+
 ### Fixed
 - **Cold-start: offline source now populates tile on reconnect:** When a source reports
   `Ready(video=false audio=false)` at startup (camera offline), its tile layout (xpos,

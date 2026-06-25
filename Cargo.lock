@@ -1017,6 +1017,7 @@ dependencies = [
 name = "fm-adapter-sdk"
 version = "0.1.0"
 dependencies = [
+ "gstreamer",
  "serde",
  "serde_json",
 ]

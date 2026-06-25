@@ -50,10 +50,25 @@ pub struct GridConfig {
     /// the default is generous.  Units: seconds.
     #[serde(default = "default_adapter_ready_timeout")]
     pub adapter_ready_timeout_secs: u64,
+    /// Maximum live-source offset in milliseconds (ADR-0016).
+    ///
+    /// An offset buffer of this depth is inserted after `videoscale` for each
+    /// external source.  A larger value allows aligning more out-of-sync
+    /// cameras but costs proportionally more memory (~tile_frame_size × ceiling
+    /// × fps per source at tile resolution).  Must be ≥ the largest per-source
+    /// `offset_ms` in the scene, or that offset will be clamped.
+    ///
+    /// Default: 2000 ms (enough to align camera latency differences).
+    #[serde(default = "default_live_offset_ceiling_ms")]
+    pub live_offset_ceiling_ms: u32,
 }
 
 fn default_adapter_ready_timeout() -> u64 {
     30
+}
+
+fn default_live_offset_ceiling_ms() -> u32 {
+    2000
 }
 
 #[derive(Debug, Deserialize)]

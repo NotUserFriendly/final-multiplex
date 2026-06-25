@@ -26,7 +26,7 @@
 //! stdin:  line-delimited JSON fm_adapter_sdk::contract::Command
 //! stdout: line-delimited JSON fm_adapter_sdk::contract::AdapterMessage
 
-use fm_adapter_sdk::contract::{AdapterMessage, Command, PROTOCOL_VERSION};
+use fm_adapter_sdk::contract::{AdapterMessage, Command, OffsetPolarity, PROTOCOL_VERSION};
 use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
@@ -237,6 +237,8 @@ fn main() {
         has_video: true,
         has_audio: true,
         protocol_version: PROTOCOL_VERSION,
+        offset_polarity: OffsetPolarity::PositiveOnly,
+        max_offset_ms: 2000,
     });
 
     // ── Main loop ─────────────────────────────────────────────────────────

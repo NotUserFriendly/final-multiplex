@@ -24,12 +24,33 @@ use crate::metrics::SourceMetrics;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Offset capability (ADR-0016 / ADR-0017)
+// ---------------------------------------------------------------------------
+
+/// Direction of the per-source offset range declared by an adapter.
+///
+/// The adapter *declares* its natural constraint; the core reconciles this
+/// against its own ceiling and builds the UI from the effective bounds.
+/// An adapter never sets or enforces an offset — that is the core's job
+/// (ADR-0004 / ADR-0017).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OffsetPolarity {
+    /// Only non-negative offsets are meaningful — delaying a live source
+    /// into the future to compensate for latency differences.  This is the
+    /// natural constraint for real-time sources (cameras, capture cards).
+    PositiveOnly,
+    /// Signed offset range, e.g. for seekable file-backed adapters.
+    Signed,
+}
+
+// ---------------------------------------------------------------------------
 // Protocol version
 // ---------------------------------------------------------------------------
 
 /// Bump this when the wire format changes in a backward-incompatible way.
 /// The core rejects adapters that send a different version in [`AdapterMessage::Ready`].
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Launch argument names
@@ -111,10 +132,20 @@ pub enum AdapterMessage {
     /// The core wires only the pads for present streams (same logic as the
     /// Phase-1 discoverer probe).  A video-only adapter sets `has_audio: false`
     /// and must not create the audio shmsink socket.
+    ///
+    /// `offset_polarity` / `max_offset_ms` declare the source's natural offset
+    /// constraints (ADR-0017).  The core reconciles these against its own ceiling
+    /// and builds the UI from the effective bounds; the adapter never enforces
+    /// or applies an offset itself.
     Ready {
         has_video: bool,
         has_audio: bool,
         protocol_version: u32,
+        /// Declared offset direction (ADR-0016 / ADR-0017).
+        offset_polarity: OffsetPolarity,
+        /// Maximum offset this source can meaningfully support, in ms.
+        /// The core caps this at its own `live_offset_ceiling_ms`.
+        max_offset_ms: u32,
     },
     /// Source dropped; adapter is recovering in-process (ADR-0013).
     ///

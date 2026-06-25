@@ -17,7 +17,7 @@
 
 use crate::net_clock::NetClock;
 use crate::runtime;
-use fm_adapter_sdk::contract::{self, AdapterMessage, Command, PROTOCOL_VERSION};
+use fm_adapter_sdk::contract::{self, AdapterMessage, Command, OffsetPolarity, PROTOCOL_VERSION};
 use fm_adapter_sdk::metrics::SourceMetrics;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -68,6 +68,10 @@ pub struct AdapterStatus {
     /// watchdog to catch adapters that claim has_video=true but never produce a
     /// single frame (last_frame_at stays None).
     pub running_since: Option<Instant>,
+    /// Offset capability declared in the adapter's Ready message (ADR-0017).
+    /// None until Ready is received.
+    pub offset_polarity: Option<OffsetPolarity>,
+    pub max_offset_ms: Option<u32>,
 }
 
 impl AdapterStatus {
@@ -82,6 +86,8 @@ impl AdapterStatus {
             is_reconnecting: false,
             last_any_msg_at: None,
             running_since: None,
+            offset_polarity: None,
+            max_offset_ms: None,
         }
     }
 }
@@ -498,6 +504,8 @@ impl Supervisor {
             entry.last_frame_at = None;
             entry.last_any_msg_at = None;
             entry.running_since = None;
+            entry.offset_polarity = None;
+            entry.max_offset_ms = None;
             if attempt > 0 {
                 entry.restart_count += 1;
             }
@@ -561,6 +569,8 @@ fn handle_msg(
             has_video,
             has_audio,
             protocol_version,
+            offset_polarity,
+            max_offset_ms,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 eprintln!(
@@ -572,7 +582,8 @@ fn handle_msg(
             }
             eprintln!(
                 "[supervisor] '{source_id}': Ready \
-                 (video={has_video} audio={has_audio})"
+                 (video={has_video} audio={has_audio} \
+                 offset_polarity={offset_polarity:?} max_offset_ms={max_offset_ms})"
             );
             let is_restart = entry.restart_count > 0;
             let prev_caps = (entry.has_video, entry.has_audio);
@@ -581,6 +592,8 @@ fn handle_msg(
             entry.has_audio = Some(has_audio);
             entry.is_reconnecting = false;
             entry.running_since = Some(Instant::now());
+            entry.offset_polarity = Some(offset_polarity);
+            entry.max_offset_ms = Some(max_offset_ms);
 
             if *playing.lock().unwrap() {
                 let line = contract::encode_command(&Command::Play);

@@ -96,6 +96,9 @@ pub struct Pipeline {
     grid_fps: i32,
     /// Tile layout per external source — needed when building chains dynamically.
     source_layouts: HashMap<String, SourceLayout>,
+    /// Configured live-source offset ceiling in milliseconds (ADR-0016).
+    /// Used to size the per-source offset buffer queues.
+    ceiling_ms: u32,
 }
 
 impl Pipeline {
@@ -145,6 +148,17 @@ impl Pipeline {
             .name("compositor")
             .build()?;
         compositor.set_property_from_str("background", "black");
+        // Set compositor latency so the live aggregator waits for the most-
+        // delayed source.  Only applied when there are external (live) sources;
+        // a file-only scene keeps latency at 0 to avoid a startup delay.
+        let has_external = scene
+            .source
+            .iter()
+            .any(|s| s.source_type == SourceType::External);
+        if has_external {
+            let ceiling_ns = scene.grid.live_offset_ceiling_ms as u64 * 1_000_000;
+            compositor.set_property("latency", ceiling_ns);
+        }
 
         let output_caps = gstreamer::Caps::builder("video/x-raw")
             .field("format", "RGBA")
@@ -320,7 +334,31 @@ impl Pipeline {
 
                 let vs = vcaps.static_pad("src").ok_or("vcaps: no src pad")?;
                 vs.set_offset(offset_ns);
-                vs.link(&comp_sink)?;
+
+                // For external (live) sources, insert the offset buffer queue
+                // between vcaps and the compositor (ADR-0016).  The queue holds
+                // up to ceiling_ms of tile-resolution frames so a positive pad
+                // offset can delay presentation without losing frames.
+                if source.source_type == SourceType::External {
+                    let ceiling_ms = scene.grid.live_offset_ceiling_ms as u64;
+                    let ceiling_ns = ceiling_ms * 1_000_000;
+                    let ceiling_buffers = (ceiling_ms * scene.grid.fps as u64 / 1000 + 4) as u32;
+                    let voff_q: gstreamer::Element = gstreamer::ElementFactory::make("queue")
+                        .name(format!("voff_q_{}", source.id))
+                        .build()?;
+                    voff_q.set_property("max-size-buffers", ceiling_buffers);
+                    voff_q.set_property("max-size-bytes", 0u32);
+                    voff_q.set_property("max-size-time", ceiling_ns);
+                    voff_q.set_property_from_str("leaky", "downstream");
+                    pipeline.add(&voff_q)?;
+                    vs.link(&voff_q.static_pad("sink").ok_or("voff_q: no sink")?)?;
+                    voff_q
+                        .static_pad("src")
+                        .ok_or("voff_q: no src")?
+                        .link(&comp_sink)?;
+                } else {
+                    vs.link(&comp_sink)?;
+                }
 
                 comp_sink_pads.insert(source.id.clone(), comp_sink);
                 vconv_sink_for_cb = Some(vconv.static_pad("sink").ok_or("vconv: no sink pad")?);
@@ -537,6 +575,7 @@ impl Pipeline {
             grid_h,
             grid_fps,
             source_layouts,
+            ceiling_ms: scene.grid.live_offset_ceiling_ms,
         })
     }
 
@@ -684,10 +723,24 @@ impl Pipeline {
 
         let vcaps_src = vcaps.static_pad("src").ok_or("vcaps: no src")?;
         vcaps_src.set_offset(layout.offset_ns);
-        vcaps_src.link(&comp_sink)?;
+
+        let ceiling_ms = self.ceiling_ms as u64;
+        let ceiling_ns = ceiling_ms * 1_000_000;
+        let ceiling_buffers = (ceiling_ms * self.grid_fps as u64 / 1000 + 4) as u32;
+        let voff_q = make("queue", &format!("voff_q_{source_id}"))?;
+        voff_q.set_property("max-size-buffers", ceiling_buffers);
+        voff_q.set_property("max-size-bytes", 0u32);
+        voff_q.set_property("max-size-time", ceiling_ns);
+        voff_q.set_property_from_str("leaky", "downstream");
+        self.inner.add(&voff_q)?;
+        vcaps_src.link(&voff_q.static_pad("sink").ok_or("voff_q: no sink")?)?;
+        voff_q
+            .static_pad("src")
+            .ok_or("voff_q: no src")?
+            .link(&comp_sink)?;
 
         for elem in [
-            &vshmsrc, &vgdpdepay, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+            &vshmsrc, &vgdpdepay, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps, &voff_q,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -710,11 +763,12 @@ impl Pipeline {
             let _ = elem.set_state(gstreamer::State::Null);
         }
 
-        // Unlink and release compositor pad.
+        // Unlink and release compositor pad.  With the offset buffer queue,
+        // voff_q:src is what links to comp_sink (not vcaps_src directly).
         if let Some(comp_sink) = self.comp_sink_pads.remove(source_id) {
-            if let Some(sp) = self.source_pads.get(source_id) {
-                if let Some(ref vcaps_src) = sp.video_src {
-                    let _ = vcaps_src.unlink(&comp_sink);
+            if let Some(voff_q) = self.inner.by_name(&format!("voff_q_{source_id}")) {
+                if let Some(voff_src) = voff_q.static_pad("src") {
+                    let _ = voff_src.unlink(&comp_sink);
                 }
             }
             if let Some(compositor) = self.inner.by_name("compositor") {
@@ -734,6 +788,7 @@ impl Pipeline {
             format!("vdeint_{source_id}"),
             format!("vscale_{source_id}"),
             format!("vcaps_{source_id}"),
+            format!("voff_q_{source_id}"),
         ] {
             if let Some(elem) = self.inner.by_name(&name) {
                 let _ = elem.set_state(gstreamer::State::Null);

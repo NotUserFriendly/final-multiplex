@@ -2,20 +2,49 @@ use crate::metrics::{AudioLevel, AudioStore};
 use crate::pipeline::Pipeline;
 use fm_adapter_sdk::metrics::DB_FLOOR;
 use gstreamer::prelude::*;
+use std::collections::HashMap;
 use std::time::Instant;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Per-source effective offset bounds (in milliseconds, inclusive) derived from
+/// the adapter's declared capability and the core's ceiling (ADR-0016/0017).
+pub struct SourceBounds {
+    pub min_ms: i64,
+    pub max_ms: i64,
+}
 
 /// Master transport: play / pause / seek-all / per-source pad offset.
 ///
 /// All timing decisions live here, never in source adapters (ADR-0004).
 pub struct Transport {
     pipeline: Pipeline,
+    /// Effective per-source offset bounds, populated at startup from supervisor
+    /// Ready data.  Sources not in this map use file-source defaults (±60 s).
+    source_bounds: HashMap<String, SourceBounds>,
 }
 
 impl Transport {
     pub fn new(pipeline: Pipeline) -> Self {
-        Self { pipeline }
+        Self {
+            pipeline,
+            source_bounds: HashMap::new(),
+        }
+    }
+
+    /// Register effective offset bounds for a source (call after Ready is received).
+    pub fn set_source_bounds(&mut self, source_id: &str, min_ms: i64, max_ms: i64) {
+        self.source_bounds
+            .insert(source_id.to_string(), SourceBounds { min_ms, max_ms });
+    }
+
+    /// Effective bounds for a source, or file-source defaults if not registered.
+    pub fn source_bounds(&self, source_id: &str) -> (i64, i64) {
+        if let Some(b) = self.source_bounds.get(source_id) {
+            (b.min_ms, b.max_ms)
+        } else {
+            (-60_000, 60_000)
+        }
     }
 
     pub fn play(&self) -> Result<()> {
@@ -50,7 +79,9 @@ impl Transport {
             .source_pads()
             .get(source_id)
             .ok_or_else(|| format!("unknown source id: {source_id}"))?;
-        let offset_ns = offset_ms * 1_000_000;
+        let (min_ms, max_ms) = self.source_bounds(source_id);
+        let clamped_ms = offset_ms.clamp(min_ms, max_ms);
+        let offset_ns = clamped_ms * 1_000_000;
         if let Some(ref p) = pads.video_src {
             p.set_offset(offset_ns);
         }

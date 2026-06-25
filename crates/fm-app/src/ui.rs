@@ -18,6 +18,10 @@ struct SourceRow {
     muted: bool,
     /// Truncated uri basename for display.
     display_name: String,
+    /// Effective per-source offset bounds derived from adapter capability + core ceiling.
+    /// File sources: ±60 000 ms; live sources: [0, min(declared_max, ceiling)].
+    min_offset_ms: i32,
+    max_offset_ms: i32,
 }
 
 pub struct App {
@@ -184,7 +188,7 @@ impl App {
                 if let Some(src) = self.sources.get_mut(index) {
                     src.offset_buf = text.clone();
                     if let Ok(ms) = text.trim().parse::<i32>() {
-                        src.offset_ms = ms.clamp(MIN_OFFSET_MS, MAX_OFFSET_MS);
+                        src.offset_ms = ms.clamp(src.min_offset_ms, src.max_offset_ms);
                         if let Some(t) = &self.transport {
                             let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
                         }
@@ -205,7 +209,7 @@ impl App {
                     src.offset_ms = src
                         .offset_ms
                         .saturating_add(delta)
-                        .clamp(MIN_OFFSET_MS, MAX_OFFSET_MS);
+                        .clamp(src.min_offset_ms, src.max_offset_ms);
                     src.offset_buf = src.offset_ms.to_string();
                     if let Some(t) = &self.transport {
                         let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
@@ -523,17 +527,21 @@ fn try_init(
     let rows = (n.max(1) + cols - 1) / cols;
     let grid_ar = scene.grid.width as f32 / scene.grid.height as f32;
 
-    let sources: Vec<SourceRow> = scene
+    // Per-source bounds are finalised after the Ready wait loop; start with
+    // file-source defaults and overwrite for external sources below.
+    let file_min = MIN_OFFSET_MS;
+    let file_max = MAX_OFFSET_MS;
+    let mut sources: Vec<SourceRow> = scene
         .source
         .iter()
         .map(|s| SourceRow {
             id: s.id.clone(),
-            offset_ms: s
-                .offset_ms
-                .clamp(MIN_OFFSET_MS as i64, MAX_OFFSET_MS as i64) as i32,
+            offset_ms: s.offset_ms.clamp(file_min as i64, file_max as i64) as i32,
             offset_buf: s.offset_ms.to_string(),
             muted: false,
             display_name: uri_display_name(s.uri.as_deref().unwrap_or("")),
+            min_offset_ms: file_min,
+            max_offset_ms: file_max,
         })
         .collect();
 
@@ -620,18 +628,42 @@ fn try_init(
 
     // Collect has_video/has_audio per external source from the Ready messages
     // received during the wait above.  The pipeline wires only present streams.
+    // Also collect declared offset capability for per-source UI bounds (ADR-0017).
     let mut external_caps: std::collections::HashMap<String, (bool, bool)> =
+        std::collections::HashMap::new();
+    // effective bounds: (min_ms, max_ms)
+    let mut source_effective_bounds: std::collections::HashMap<String, (i32, i32)> =
         std::collections::HashMap::new();
     if let Some(sup) = &supervisor {
         let s = sup.status_handle();
         let s = s.lock().unwrap();
+        let ceiling = scene.grid.live_offset_ceiling_ms;
         for id in &external_ids {
             if let Some(a) = s.get(id) {
                 external_caps.insert(
                     id.clone(),
                     (a.has_video.unwrap_or(true), a.has_audio.unwrap_or(true)),
                 );
+                // Reconcile declared max with core ceiling (ADR-0016/0017).
+                let declared_max = a.max_offset_ms.unwrap_or(ceiling);
+                let effective_max = declared_max.min(ceiling) as i32;
+                // Live (PositiveOnly) sources: [0, effective_max]; Signed: unclamped at 0.
+                use fm_adapter_sdk::contract::OffsetPolarity;
+                let min = match &a.offset_polarity {
+                    Some(OffsetPolarity::Signed) => -(effective_max),
+                    _ => 0, // PositiveOnly or unset → no negative offsets
+                };
+                source_effective_bounds.insert(id.clone(), (min, effective_max));
             }
+        }
+    }
+    // Apply effective bounds to sources (external sources only; file sources keep defaults).
+    for src in &mut sources {
+        if let Some(&(min, max)) = source_effective_bounds.get(&src.id) {
+            src.min_offset_ms = min;
+            src.max_offset_ms = max;
+            src.offset_ms = src.offset_ms.clamp(min, max);
+            src.offset_buf = src.offset_ms.to_string();
         }
     }
 
@@ -641,7 +673,10 @@ fn try_init(
 
     bridge::install(pipeline.appsink(), frame_store.clone());
 
-    let transport = fm_core::transport::Transport::new(pipeline);
+    let mut transport = fm_core::transport::Transport::new(pipeline);
+    for (id, (min, max)) in &source_effective_bounds {
+        transport.set_source_bounds(id, *min as i64, *max as i64);
+    }
     transport.play()?;
 
     // Pipeline is playing; tell adapters to start streaming.

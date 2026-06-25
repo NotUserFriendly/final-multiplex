@@ -38,8 +38,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful teardown on all core-initiated kills (ADR-0013):** watchdog and restart paths
   now send `Shutdown` and wait up to 3 s for the adapter to release its source (RTSP
   TEARDOWN) before force-killing.  Prevents orphaned camera sessions on the respawn path.
-- **Protocol version bump:** `PROTOCOL_VERSION` → 2 (wire format changed: new message
-  types, `--uri` flag removed from argv).
+- **Protocol version bump:** `PROTOCOL_VERSION` → 3 (Ready message extended with
+  `offset_polarity` and `max_offset_ms`; GDP-framed shm transport; see below).
+- **GDP-framed shm transport (ADR-0015):** adapters now wrap each buffer in a GStreamer
+  Data Protocol envelope (`gdppay`) before writing to `shmsink`; the core unwraps with
+  `gdpdepay` after `shmsrc`.  PTS, DTS, and caps survive the process boundary without
+  re-timestamping (`do-timestamp=false` on `shmsrc`).  Eliminates PTS discontinuities
+  that caused the compositor to stall after adapter reconnects.
+- **Live source offset model (ADR-0016):** a configurable offset-buffer queue
+  (`live_offset_ceiling_ms`, default 2000 ms) is inserted after `videoscale` for each
+  external source.  The compositor `latency` is set to the ceiling so it waits for the
+  most-delayed source.  Positive offsets up to the ceiling are now stable and frame-
+  continuous; the n×2800 ms PTS divergence from the pre-fix leaky-queue design is fixed.
+- **Adapter-declared capability (ADR-0017):** `AdapterMessage::Ready` now carries
+  `offset_polarity` (`positive_only` | `signed`) and `max_offset_ms`.  The core
+  reconciles against the ceiling (`effective_max = min(declared_max, ceiling_ms)`) so a
+  greedy adapter cannot force an oversized buffer.  Per-source offset controls in the UI
+  now reflect these effective bounds: live sources clamp to `[0, effective_max]`, file
+  sources keep `[−60 000, 60 000]`.
+- **Protocol version bump:** `PROTOCOL_VERSION` previously bumped to 2; now corrected
+  history — current version is 3.
 - `fm-rtsp-adapter`: credential scrubbing — `user:pass@` is masked in all stderr log
   lines; the raw URI never reaches log output.
 - `fm-rtsp-adapter`: emits `StreamsChanged` after each reconnect's stability window if the

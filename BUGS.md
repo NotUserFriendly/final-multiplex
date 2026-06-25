@@ -53,6 +53,11 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
 <!-- Move items here on fix. Format:
 - [x] [area] symptom — fix summary. (fixed YYYY-MM-DD)
 -->
+- [x] [pipeline] Cold-start: offline source tile never populated — tile layout was not
+      stored for sources skipped at startup (Ready with no streams), so `add_video_chain`
+      / `add_audio_chain` failed with "no layout" on later `StreamsChanged`.  Fix: store
+      layout before the no-streams `continue` in `build()`.  Validated 2026-06-25.
+      (fixed 2026-06-25)
 - [x] [supervisor] Adapter processes orphaned on app exit: `prctl(PR_SET_PDEATHSIG)` +
       `SIGTERM` handler + `CloseRequested` handler + `Drop` on Supervisor. Verified:
       SIGTERM and SIGKILL of the app leave zero orphan adapters. (fixed 2026-06-24)

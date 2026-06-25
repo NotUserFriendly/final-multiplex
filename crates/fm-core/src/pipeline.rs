@@ -322,19 +322,13 @@ impl Pipeline {
         for (idx, source) in scene.source.iter().enumerate() {
             let (has_video, has_audio) = stream_caps[idx];
 
-            if !has_video && !has_audio {
-                eprintln!(
-                    "[fm-core] skipping source '{}' — no usable streams (corrupt or empty)",
-                    source.id
-                );
-                continue;
-            }
-
             let xpos = ((idx as u32 % cols) * tile_w as u32) as i32;
             let ypos = ((idx as u32 / cols) * tile_h as u32) as i32;
             let offset_ns = source.offset_ms * 1_000_000;
 
-            // Store layout for later dynamic chain builds.
+            // Store layout for ALL sources — including offline ones — so that
+            // add_video_chain / add_audio_chain can populate the tile later when
+            // a source comes online via StreamsChanged after initial build().
             source_layouts.insert(
                 source.id.clone(),
                 SourceLayout {
@@ -346,6 +340,14 @@ impl Pipeline {
                     volume: source.volume,
                 },
             );
+
+            if !has_video && !has_audio {
+                eprintln!(
+                    "[fm-core] skipping source '{}' — no usable streams (corrupt or empty)",
+                    source.id
+                );
+                continue;
+            }
 
             // ── Video chain (only when probe confirmed video) ──────────────
             let mut vcaps_src: Option<gstreamer::Pad> = None;

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Cold-start: offline source now populates tile on reconnect:** When a source reports
+  `Ready(video=false audio=false)` at startup (camera offline), its tile layout (xpos,
+  ypos, tile dimensions, offset) was not stored, so `add_video_chain`/`add_audio_chain`
+  failed with "no layout" when the source later came online via `StreamsChanged`.  Fix:
+  store layout for all configured sources before the no-streams skip.  Validated: cam-77
+  offline at startup → cam-27 live and unaffected → cam-77 plugged in → both chains added
+  cleanly without stalling cam-27.
 - **T3 offset accuracy validated on live RTSP (2026-06-25):** With the unixfd transport,
   voff_q leaky=upstream, and compositor latency=ceiling_ns, both cameras deliver at steady
   30 fps (33 ms frame intervals, no burst-gap pattern).  The n×2800 ms PTS divergence from

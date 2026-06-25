@@ -50,3 +50,16 @@ stale TOML value — 0 for both cameras in scene-step5.toml.
 Alternatively, `Pipeline` can expose a mutable reference to `source_layouts` or
 move offset tracking into `Transport` itself.  Not patching here — flagged to review
 chat to decide the right ownership model before implementing.
+
+**Smoke test — hardware confirmed (2026-06-25).** T3-COMP probe on `voff_q:src`
+in `add_video_chain`, frames 60–79 (steady state, after the 2000 ms voff_q fill
+phase), at session age ~8 min post-reconnect:
+
+```
+running - pts = 83–152 ms  (mean ≈ 100 ms)
+```
+
+Expected if 2000 ms offset were preserved: ~2000 ms.
+Actual: ~0 ms (pipeline jitter only).  `source_layouts.offset_ns = 0` was applied
+by `add_video_chain`; the 2000 ms the user had set via the UI was silently discarded.
+Visual: cam-77 lost its delay immediately after reconnect.

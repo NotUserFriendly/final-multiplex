@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest on the event path (such as the GDP event deserialization failure) now
   surface on the cheap deterministic path, not only against live cameras.
 
+### Added
+- **Offset reconnect canary (`[offset-canary]`):** a permanent, always-on probe on
+  `voff_q:src` verifies the applied pad offset matches `source_layouts` on every chain
+  rebuild.  Samples 20 buffers after the voff_q fill phase (windowed by `ceiling_ms +
+  500 ms` of elapsed running time — framerate-independent, adapts to the configured
+  ceiling automatically).  Silent when `|running − pts − expected_offset| ≤ 150 ms`;
+  emits one grep-able `[offset-canary] WARN` line per diverging sample.  Validated:
+  correct 500 ms offset → silent; simulated apply-bug (0 ms applied, 500 ms expected)
+  → deviation 336–420 ms → WARN fires on all 20 samples.  Off-rate source check
+  untested (no off-rate source available); the time-window removes the framerate
+  dependency.
+
 ### Fixed
 - **Per-source offset and mute survive reconnect:** `transport::set_source_offset` and
   `set_source_mute` now write back to `source_layouts` (via `Pipeline::update_source_layout_offset`

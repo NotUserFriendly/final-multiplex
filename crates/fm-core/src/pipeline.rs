@@ -5,6 +5,97 @@ use std::collections::HashMap;
 
 type ExternalCaps = HashMap<String, (bool, bool)>;
 
+/// Attach a permanent offset-accuracy canary to `pad` (a `voff_q:src` pad).
+///
+/// **What it measures:** `running_time − pts` for buffers exiting the offset
+/// buffer queue.  In steady state this equals the active pad offset because the
+/// compositor (GstAggregator) creates backpressure: it accepts one buffer per
+/// sink pad at a time and pops only when `running_time ≈ pts + pad_offset`,
+/// causing the queue to block until the compositor is ready.
+///
+/// **Windowing:** sampling starts after `ceiling_ms + 500 ms` of chain running
+/// time have elapsed.  `ceiling_ms` is the worst-case fill-phase duration (the
+/// voff_q holds at most `ceiling_ms` of frames); the 500 ms margin provides
+/// headroom regardless of source framerate.  This is framerate-independent —
+/// no hardcoded frame count, no assumed frame period.
+///
+/// **Canary behaviour:** silent when `|running−pts − expected_offset| ≤ 50 ms`.
+/// Emits one `[offset-canary] WARN` line per diverging sample over a 20-buffer
+/// window, then goes silent for the rest of the chain's lifetime.
+///
+/// Note: actual source framerate is a shared question with the `fps_in` metric
+/// and is deferred to the pre-Phase-3 metrics pass; the time-window avoids
+/// depending on it here.
+fn add_offset_canary(
+    pad: &gstreamer::Pad,
+    source_id: &str,
+    expected_offset_ns: i64,
+    ceiling_ms: u64,
+    pipeline_weak: gstreamer::glib::WeakRef<gstreamer::Pipeline>,
+) {
+    let sid = source_id.to_string();
+    let expected_ms = expected_offset_ns / 1_000_000;
+    // Sampling window opens after the fill phase: ceiling_ms (worst-case) + 500 ms margin.
+    let window_start_ns = ceiling_ms as i64 * 1_000_000 + 500_000_000i64;
+    // 150 ms tolerance, not the naive ±1-frame (~33 ms).
+    // The probe fires when the compositor accepts the *next* buffer after
+    // popping the current one; the measured running-pts is therefore
+    // approximately (offset − frame_period − pipeline_latency).  Empirically
+    // this reads ~80 ms below the configured offset at 30 fps with ~100 ms
+    // chain latency (e.g. 419 ms measured for 500 ms offset).  150 ms covers
+    // this structural bias while still catching a full TOML-revert regression
+    // (≥300 ms error).
+    const TOLERANCE_MS: i64 = 150;
+    const SAMPLE_COUNT: u32 = 20;
+
+    // u64::MAX = "not yet recorded"; running time is always > 0 in practice.
+    let chain_start_ns =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let samples_taken = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        if samples_taken.load(std::sync::atomic::Ordering::Relaxed) >= SAMPLE_COUNT {
+            return gstreamer::PadProbeReturn::Ok;
+        }
+        let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data else {
+            return gstreamer::PadProbeReturn::Ok;
+        };
+        let Some(p) = pipeline_weak.upgrade() else {
+            return gstreamer::PadProbeReturn::Ok;
+        };
+        let Some(running) = p.current_running_time() else {
+            return gstreamer::PadProbeReturn::Ok;
+        };
+        let Some(pts) = buf.pts() else {
+            return gstreamer::PadProbeReturn::Ok;
+        };
+        let running_ns = running.nseconds() as i64;
+
+        // Latch chain start on the first buffer.
+        let start = chain_start_ns.load(std::sync::atomic::Ordering::Relaxed);
+        if start == u64::MAX {
+            chain_start_ns.store(running_ns as u64, std::sync::atomic::Ordering::Relaxed);
+            return gstreamer::PadProbeReturn::Ok;
+        }
+
+        // Stay silent until past the fill phase.
+        if running_ns - (start as i64) < window_start_ns {
+            return gstreamer::PadProbeReturn::Ok;
+        }
+
+        let diff_ms = (running_ns - pts.nseconds() as i64) / 1_000_000;
+        let deviation = (diff_ms - expected_ms).abs();
+        if deviation > TOLERANCE_MS {
+            eprintln!(
+                "[offset-canary] WARN '{}' expected {}ms got {}ms (deviation {}ms)",
+                sid, expected_ms, diff_ms, deviation
+            );
+        }
+        samples_taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        gstreamer::PadProbeReturn::Ok
+    });
+}
+
 /// Discover which stream types a URI contains before building the pipeline.
 /// Returns (has_video, has_audio). Runs with a 2-second timeout per source.
 /// Called in parallel threads, one per source, in `Pipeline::build`.
@@ -851,6 +942,13 @@ impl Pipeline {
                 gstreamer::PadProbeReturn::Ok
             });
         }
+        add_offset_canary(
+            &voff_src,
+            source_id,
+            layout.offset_ns,
+            self.ceiling_ms as u64,
+            self.inner.downgrade(),
+        );
 
         for elem in [
             &vunixfdsrc,

@@ -429,7 +429,16 @@ impl Pipeline {
                             .build()?;
                         vshmsrc.set_property_from_str("socket-path", &video_sock);
                         vshmsrc.set_property("is-live", true);
-                        vshmsrc.set_property("do-timestamp", true);
+                        // GDP headers carry PTS from the adapter; don't overwrite.
+                        vshmsrc.set_property("do-timestamp", false);
+
+                        // gdpdepay restores the buffer PTS and caps serialized by
+                        // the adapter's gdppay — the adapter's clock-coherent PTS
+                        // is what we want to use for timing.
+                        let vgdpdepay: gstreamer::Element =
+                            gstreamer::ElementFactory::make("gdpdepay")
+                                .name(format!("vgdpdepay_{}", source.id))
+                                .build()?;
 
                         // vshmcaps pins the production resolution that the adapter
                         // was launched with (full grid output resolution by default —
@@ -460,8 +469,8 @@ impl Pipeline {
                         vqueue.set_property("max-size-time", 0u64);
                         vqueue.set_property_from_str("leaky", "downstream");
 
-                        pipeline.add_many([&vshmsrc, &vshmcaps, &vqueue])?;
-                        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
+                        pipeline.add_many([&vshmsrc, &vgdpdepay, &vshmcaps, &vqueue])?;
+                        gstreamer::Element::link_many([&vshmsrc, &vgdpdepay, &vshmcaps, &vqueue])?;
                         if let Some(ref vconv_sink) = vconv_sink_for_cb {
                             vqueue
                                 .static_pad("src")
@@ -476,7 +485,12 @@ impl Pipeline {
                             .build()?;
                         ashmsrc.set_property_from_str("socket-path", &audio_sock);
                         ashmsrc.set_property("is-live", true);
-                        ashmsrc.set_property("do-timestamp", true);
+                        ashmsrc.set_property("do-timestamp", false);
+
+                        let agdpdepay: gstreamer::Element =
+                            gstreamer::ElementFactory::make("gdpdepay")
+                                .name(format!("agdpdepay_{}", source.id))
+                                .build()?;
 
                         let ashmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
@@ -500,8 +514,8 @@ impl Pipeline {
                         aqueue.set_property("max-size-time", 0u64);
                         aqueue.set_property_from_str("leaky", "downstream");
 
-                        pipeline.add_many([&ashmsrc, &ashmcaps, &aqueue])?;
-                        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
+                        pipeline.add_many([&ashmsrc, &agdpdepay, &ashmcaps, &aqueue])?;
+                        gstreamer::Element::link_many([&ashmsrc, &agdpdepay, &ashmcaps, &aqueue])?;
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
                             aqueue
                                 .static_pad("src")
@@ -609,7 +623,9 @@ impl Pipeline {
         let vshmsrc = make("shmsrc", &format!("vshmsrc_{source_id}"))?;
         vshmsrc.set_property_from_str("socket-path", &video_sock);
         vshmsrc.set_property("is-live", true);
-        vshmsrc.set_property("do-timestamp", true);
+        vshmsrc.set_property("do-timestamp", false);
+
+        let vgdpdepay = make("gdpdepay", &format!("vgdpdepay_{source_id}"))?;
 
         let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
         vshmcaps.set_property(
@@ -644,9 +660,9 @@ impl Pipeline {
         );
 
         self.inner.add_many([
-            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+            &vshmsrc, &vgdpdepay, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
         ])?;
-        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
+        gstreamer::Element::link_many([&vshmsrc, &vgdpdepay, &vshmcaps, &vqueue])?;
         gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps])?;
         vqueue
             .static_pad("src")
@@ -671,7 +687,7 @@ impl Pipeline {
         vcaps_src.link(&comp_sink)?;
 
         for elem in [
-            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+            &vshmsrc, &vgdpdepay, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -711,6 +727,7 @@ impl Pipeline {
 
         for name in [
             format!("vshmsrc_{source_id}"),
+            format!("vgdpdepay_{source_id}"),
             format!("vshmcaps_{source_id}"),
             format!("vshm_q_{source_id}"),
             format!("vconv_{source_id}"),
@@ -737,7 +754,9 @@ impl Pipeline {
         let ashmsrc = make("shmsrc", &format!("ashmsrc_{source_id}"))?;
         ashmsrc.set_property_from_str("socket-path", &audio_sock);
         ashmsrc.set_property("is-live", true);
-        ashmsrc.set_property("do-timestamp", true);
+        ashmsrc.set_property("do-timestamp", false);
+
+        let agdpdepay = make("gdpdepay", &format!("agdpdepay_{source_id}"))?;
 
         let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
         ashmcaps.set_property(
@@ -770,9 +789,9 @@ impl Pipeline {
         );
 
         self.inner.add_many([
-            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+            &ashmsrc, &agdpdepay, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
         ])?;
-        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
+        gstreamer::Element::link_many([&ashmsrc, &agdpdepay, &ashmcaps, &aqueue])?;
         gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
         aqueue
             .static_pad("src")
@@ -793,7 +812,7 @@ impl Pipeline {
         mix_sink.set_property("volume", layout.volume);
 
         for elem in [
-            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+            &ashmsrc, &agdpdepay, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -831,6 +850,7 @@ impl Pipeline {
 
         for name in [
             format!("ashmsrc_{source_id}"),
+            format!("agdpdepay_{source_id}"),
             format!("ashmcaps_{source_id}"),
             format!("ashm_q_{source_id}"),
             format!("aconv_{source_id}"),

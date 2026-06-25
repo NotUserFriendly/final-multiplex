@@ -89,7 +89,11 @@ impl Transport {
     /// the source's content appears relative to t=0; negative makes it lead.
     /// No seek is issued, so the offset is source-agnostic and unaffected by
     /// file duration or seekability — it survives the Phase-2 RTSP boundary.
-    pub fn set_source_offset(&self, source_id: &str, offset_ms: i64) -> Result<()> {
+    ///
+    /// source_layouts is also updated so the offset survives a chain rebuild
+    /// (reconnect); without this write-back, add_video/audio_chain would
+    /// re-apply the stale TOML value and silently reset the offset to 0.
+    pub fn set_source_offset(&mut self, source_id: &str, offset_ms: i64) -> Result<()> {
         let pads = self
             .pipeline
             .source_pads()
@@ -104,15 +108,22 @@ impl Transport {
         if let Some(ref p) = pads.audio_src {
             p.set_offset(offset_ns);
         }
+        self.pipeline
+            .update_source_layout_offset(source_id, offset_ns);
         Ok(())
     }
 
     /// Mute or unmute a source's audiomixer sink pad.
     /// Independent of the configured volume; muting/unmuting does not alter it.
-    pub fn set_source_mute(&self, source_id: &str, muted: bool) -> Result<()> {
+    ///
+    /// source_layouts.muted is also updated so the state survives a chain
+    /// rebuild (reconnect); without this write-back, add_audio_chain would
+    /// always start the new pad unmuted.
+    pub fn set_source_mute(&mut self, source_id: &str, muted: bool) -> Result<()> {
         if let Some(pad) = self.pipeline.mixer_sink_pads().get(source_id) {
             pad.set_property("mute", muted);
         }
+        self.pipeline.update_source_layout_mute(source_id, muted);
         Ok(())
     }
 

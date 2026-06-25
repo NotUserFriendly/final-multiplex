@@ -77,6 +77,8 @@ struct SourceLayout {
     tile_h: i32,
     offset_ns: i64,
     volume: f64,
+    /// Survives chain rebuild — source_layouts is what add_audio_chain re-applies.
+    muted: bool,
 }
 
 /// The in-core GStreamer pipeline (Phase 1 + Phase 2).
@@ -351,6 +353,7 @@ impl Pipeline {
                     tile_h,
                     offset_ns,
                     volume: source.volume,
+                    muted: false,
                 },
             );
 
@@ -647,6 +650,22 @@ impl Pipeline {
 
     pub fn mixer_sink_pads(&self) -> &HashMap<String, gstreamer::Pad> {
         &self.mixer_sink_pads
+    }
+
+    /// Keep source_layouts in sync so add_video/audio_chain re-applies the
+    /// correct offset on the next chain rebuild (reconnect path).
+    pub fn update_source_layout_offset(&mut self, source_id: &str, offset_ns: i64) {
+        if let Some(layout) = self.source_layouts.get_mut(source_id) {
+            layout.offset_ns = offset_ns;
+        }
+    }
+
+    /// Keep source_layouts in sync so add_audio_chain re-applies the correct
+    /// mute state on the next chain rebuild (reconnect path).
+    pub fn update_source_layout_mute(&mut self, source_id: &str, muted: bool) {
+        if let Some(layout) = self.source_layouts.get_mut(source_id) {
+            layout.muted = muted;
+        }
     }
 
     /// Reset the shmsrc elements for an external source after its adapter
@@ -966,6 +985,7 @@ impl Pipeline {
         acaps_src.set_offset(layout.offset_ns);
         acaps_src.link(&mix_sink)?;
         mix_sink.set_property("volume", layout.volume);
+        mix_sink.set_property("mute", layout.muted);
 
         for elem in [
             &aunixfdsrc,

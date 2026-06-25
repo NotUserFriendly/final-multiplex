@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface on the cheap deterministic path, not only against live cameras.
 
 ### Fixed
+- **Per-source offset and mute survive reconnect:** `transport::set_source_offset` and
+  `set_source_mute` now write back to `source_layouts` (via `Pipeline::update_source_layout_offset`
+  / `update_source_layout_mute`) in addition to updating the live pads.  Previously,
+  `add_video/audio_chain` re-applied the stale TOML value on every chain rebuild, silently
+  discarding any UI-set offset or mute state.  Hardware-confirmed (2026-06-25): offset changed
+  to 0 ms via UI → adapter respawned → rebuilt chain read 0 ms from `source_layouts` → cam-77
+  back in sync with real life.
 - **cam-77 replug — adapter clock seeded with system time; respawn loop eliminated
   (ADR-0005):** Respawned adapter processes consistently failed `GstNetClientClock`
   calibration: `wait_for_sync` timed out every time while cold-start adapters synced in

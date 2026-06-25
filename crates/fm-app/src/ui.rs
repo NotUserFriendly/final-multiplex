@@ -189,7 +189,7 @@ impl App {
                     src.offset_buf = text.clone();
                     if let Ok(ms) = text.trim().parse::<i32>() {
                         src.offset_ms = ms.clamp(src.min_offset_ms, src.max_offset_ms);
-                        if let Some(t) = &self.transport {
+                        if let Some(t) = &mut self.transport {
                             let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
                         }
                         persist_change = Some((src.id.clone(), src.offset_ms as i64));
@@ -211,7 +211,7 @@ impl App {
                         .saturating_add(delta)
                         .clamp(src.min_offset_ms, src.max_offset_ms);
                     src.offset_buf = src.offset_ms.to_string();
-                    if let Some(t) = &self.transport {
+                    if let Some(t) = &mut self.transport {
                         let _ = t.set_source_offset(&src.id, src.offset_ms as i64);
                     }
                     persist_change = Some((src.id.clone(), src.offset_ms as i64));
@@ -227,7 +227,7 @@ impl App {
             Message::ToggleMute { index } => {
                 if let Some(src) = self.sources.get_mut(index) {
                     src.muted = !src.muted;
-                    if let Some(t) = &self.transport {
+                    if let Some(t) = &mut self.transport {
                         let _ = t.set_source_mute(&src.id, src.muted);
                     }
                 }

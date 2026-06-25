@@ -61,6 +61,17 @@ pub struct GridConfig {
     /// Default: 2000 ms (enough to align camera latency differences).
     #[serde(default = "default_live_offset_ceiling_ms")]
     pub live_offset_ceiling_ms: u32,
+    /// Delivery watchdog timeout in milliseconds (ADR-0020).
+    ///
+    /// When an adapter reports `fps_in > 0` but the core has no active chain
+    /// for that source, and this divergence persists beyond this timeout, the
+    /// supervisor force-respawns the adapter.  Lower values give faster
+    /// recovery but risk false respawns if normal reconnect takes longer than
+    /// expected.  Must exceed the normal recovery + RTSP connect window.
+    ///
+    /// Default: 30 000 ms (30 s).
+    #[serde(default = "default_delivery_watchdog_ms")]
+    pub delivery_watchdog_ms: u64,
 }
 
 fn default_adapter_ready_timeout() -> u64 {
@@ -69,6 +80,10 @@ fn default_adapter_ready_timeout() -> u64 {
 
 fn default_live_offset_ceiling_ms() -> u32 {
     2000
+}
+
+fn default_delivery_watchdog_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize)]

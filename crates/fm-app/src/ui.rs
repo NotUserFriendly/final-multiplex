@@ -46,6 +46,8 @@ pub struct App {
     last_offset_change: Option<Instant>,
     /// Tick counter for supervisor polling (poll every ~500 ms at 60 Hz ticks).
     tick_count: u64,
+    /// IDs of external sources — used to query chain state for delivery watchdog.
+    external_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,7 @@ impl App {
                     config_persist: None,
                     last_offset_change: None,
                     tick_count: 0,
+                    external_source_ids: Vec::new(),
                 }
             }
         }
@@ -160,6 +163,14 @@ impl App {
                             if let Some(t) = &mut self.transport {
                                 t.apply_streams_changed(&id, has_video, has_audio);
                             }
+                        }
+                        // Update chain state for the delivery watchdog (ADR-0020).
+                        for id in &self.external_source_ids {
+                            let has_chain = self
+                                .transport
+                                .as_ref()
+                                .map_or(false, |t| t.pipeline().source_has_chain(id));
+                            sup.update_chain_state(id, has_chain);
                         }
                     }
                 }
@@ -569,6 +580,7 @@ fn try_init(
     let (supervisor, external_ids) = if has_external {
         let net = fm_core::net_clock::NetClock::new()?;
         let mut sup = fm_core::supervisor::Supervisor::new();
+        sup.set_delivery_watchdog_ms(scene.grid.delivery_watchdog_ms);
         let mut ids: Vec<String> = Vec::new();
         for s in &scene.source {
             if s.source_type != fm_core::config::SourceType::External {
@@ -727,5 +739,6 @@ fn try_init(
         config_persist,
         last_offset_change: None,
         tick_count: 0,
+        external_source_ids: external_ids,
     })
 }

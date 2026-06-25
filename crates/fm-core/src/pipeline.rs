@@ -743,6 +743,14 @@ impl Pipeline {
         &self.source_pads
     }
 
+    /// True if the core pipeline has an active video chain for `source_id`.
+    /// Used by the delivery watchdog (ADR-0020) to detect producing-but-no-chain.
+    pub fn source_has_chain(&self, source_id: &str) -> bool {
+        self.inner
+            .by_name(&format!("vunixfdsrc_{source_id}"))
+            .is_some()
+    }
+
     pub fn mixer_sink_pads(&self) -> &HashMap<String, gstreamer::Pad> {
         &self.mixer_sink_pads
     }

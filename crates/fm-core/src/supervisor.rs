@@ -38,6 +38,12 @@ const WATCHDOG_SECS: u64 = 120;
 const SILENCE_TIMEOUT_SECS: u64 = 60;
 /// Wait this long for a graceful Shutdown response before force-killing.
 const TEARDOWN_WINDOW_SECS: u64 = 3;
+/// Grace period for StreamsChanged(false,false) events.  A full-drop event
+/// is held for this long before the core chain is torn down.  This absorbs
+/// EOS churn where the camera EOSes but reconnects within a second or two.
+/// Must exceed the adapter's first reconnect delay (1 s) plus RTSP connect
+/// time for fast cameras; 3 s matches the adapter's PAD_STABILITY_SECS.
+const STREAMS_GRACE_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterState {
@@ -72,6 +78,12 @@ pub struct AdapterStatus {
     /// None until Ready is received.
     pub offset_polarity: Option<OffsetPolarity>,
     pub max_offset_ms: Option<u32>,
+    /// Whether the core pipeline currently has an active chain for this source.
+    /// Updated from ui.rs after each supervisor poll.  Used by delivery watchdog.
+    pub has_core_chain: bool,
+    /// When adapter-producing-but-no-core-chain divergence was first observed.
+    /// None means no active divergence; set by the delivery watchdog in poll().
+    pub delivery_diverge_since: Option<Instant>,
 }
 
 impl AdapterStatus {
@@ -88,6 +100,8 @@ impl AdapterStatus {
             running_since: None,
             offset_polarity: None,
             max_offset_ms: None,
+            has_core_chain: false,
+            delivery_diverge_since: None,
         }
     }
 }
@@ -136,9 +150,15 @@ pub struct Supervisor {
     /// Topology changes signalled by StreamsChanged messages.
     /// Drained by `take_streams_changed()`.
     streams_changed: Arc<Mutex<Vec<(String, bool, bool)>>>,
+    /// StreamsChanged(false,false) events held for STREAMS_GRACE_MS to absorb
+    /// EOS churn.  A recovery event cancels the pending drop.
+    /// Shared with reader threads via Arc so handle_msg can write to it.
+    pending_streams: Arc<Mutex<HashMap<String, (bool, bool, Instant)>>>,
     /// Whether the supervisor is in the play state; new/restarted adapters
     /// that send Ready automatically receive Play when this is true.
     playing: Arc<Mutex<bool>>,
+    /// Delivery watchdog timeout (ADR-0020).  0 = disabled.
+    delivery_watchdog_ms: u64,
 }
 
 impl Supervisor {
@@ -154,7 +174,27 @@ impl Supervisor {
             status: Arc::new(Mutex::new(HashMap::new())),
             restarted: Arc::new(Mutex::new(Vec::new())),
             streams_changed: Arc::new(Mutex::new(Vec::new())),
+            pending_streams: Arc::new(Mutex::new(HashMap::new())),
             playing: Arc::new(Mutex::new(false)),
+            delivery_watchdog_ms: 30_000,
+        }
+    }
+
+    /// Override the delivery watchdog timeout (call after new(), before spawn()).
+    pub fn set_delivery_watchdog_ms(&mut self, ms: u64) {
+        self.delivery_watchdog_ms = ms;
+    }
+
+    /// Update whether the core pipeline has an active chain for `source_id`.
+    /// Called from ui.rs after each poll cycle.  Clears delivery divergence
+    /// tracking when a chain exists.
+    pub fn update_chain_state(&self, source_id: &str, has_chain: bool) {
+        let mut s = self.status.lock().unwrap();
+        if let Some(entry) = s.get_mut(source_id) {
+            entry.has_core_chain = has_chain;
+            if has_chain {
+                entry.delivery_diverge_since = None;
+            }
         }
     }
 
@@ -336,12 +376,67 @@ impl Supervisor {
                     }
                 }
             }
+
+            // Delivery watchdog (ADR-0020): adapter producing but core has no
+            // chain.  Needs a mutable borrow, so separate from the read pass.
+            if self.delivery_watchdog_ms > 0 {
+                let wdog_ms = self.delivery_watchdog_ms;
+                let mut s = self.status.lock().unwrap();
+                for (id, handle) in &self.live {
+                    if handle.shutdown_deadline.is_some() {
+                        continue;
+                    }
+                    let Some(status) = s.get_mut(id) else {
+                        continue;
+                    };
+                    if status.state != AdapterState::Running || status.is_reconnecting {
+                        status.delivery_diverge_since = None;
+                        continue;
+                    }
+                    let producing = status
+                        .latest_metrics
+                        .as_ref()
+                        .map_or(false, |m| m.fps_in > 0.0);
+                    if producing && !status.has_core_chain {
+                        let since = status.delivery_diverge_since.get_or_insert(now);
+                        if since.elapsed() >= Duration::from_millis(wdog_ms) {
+                            eprintln!(
+                                "[supervisor] '{id}' delivery watchdog: producing but no \
+                                 core chain for {wdog_ms}ms — force-respawn"
+                            );
+                            to_shutdown.push(id.clone());
+                            status.delivery_diverge_since = None;
+                        }
+                    } else {
+                        status.delivery_diverge_since = None;
+                    }
+                }
+            }
+
+            to_shutdown.dedup();
             for id in to_shutdown {
                 self.graceful_shutdown_live(&id);
             }
         }
 
-        // ── Phase 4: fire expired pending restarts ────────────────────────────
+        // ── Phase 4: promote debounced StreamsChanged(false) events ──────────
+        {
+            let mut pending = self.pending_streams.lock().unwrap();
+            let mut sc = self.streams_changed.lock().unwrap();
+            pending.retain(|id, (_hv, _ha, received_at)| {
+                if received_at.elapsed() >= Duration::from_millis(STREAMS_GRACE_MS) {
+                    eprintln!(
+                        "[supervisor] '{id}' StreamsChanged grace expired — tearing down chain"
+                    );
+                    sc.push((id.clone(), false, false));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // ── Phase 5: fire expired pending restarts ───────────────────────────
         let ready: Vec<String> = self
             .pending
             .iter()
@@ -464,6 +559,7 @@ impl Supervisor {
         let source_id = spec.source_id.clone();
         let status = Arc::clone(&self.status);
         let streams_changed = Arc::clone(&self.streams_changed);
+        let pending_streams = Arc::clone(&self.pending_streams);
         let playing = Arc::clone(&self.playing);
         let stdin_for_reader = Arc::clone(&stdin);
         std::thread::spawn(move || {
@@ -479,6 +575,7 @@ impl Supervisor {
                         msg,
                         &status,
                         &streams_changed,
+                        &pending_streams,
                         &playing,
                         &stdin_for_reader,
                     ),
@@ -490,6 +587,9 @@ impl Supervisor {
             eprintln!("[supervisor] '{source_id}': stdout EOF");
         });
 
+        // Cancel any pending debounced drop event — the process is being
+        // respawned, so the Ready message will establish fresh state.
+        self.pending_streams.lock().unwrap().remove(&spec.source_id);
         {
             let mut s = self.status.lock().unwrap();
             let entry = s
@@ -550,6 +650,7 @@ fn handle_msg(
     msg: AdapterMessage,
     status: &Arc<Mutex<HashMap<String, AdapterStatus>>>,
     streams_changed: &Arc<Mutex<Vec<(String, bool, bool)>>>,
+    pending_streams: &Arc<Mutex<HashMap<String, (bool, bool, Instant)>>>,
     playing: &Arc<Mutex<bool>>,
     stdin: &Arc<Mutex<std::process::ChildStdin>>,
 ) {
@@ -602,6 +703,9 @@ fn handle_msg(
                 // even when has_video/audio are unchanged, which releases the
                 // compositor sink pad and resets its PTS timeline (fixes the
                 // ~20 s reconnect freeze; see pipeline.rs build_shmsrc_chain).
+                // Also cancel any pending debounced drop event — the process
+                // restarted cleanly; Ready supersedes it.
+                pending_streams.lock().unwrap().remove(source_id);
                 streams_changed
                     .lock()
                     .unwrap()
@@ -628,10 +732,21 @@ fn handle_msg(
             entry.is_reconnecting = false;
             entry.has_video = Some(has_video);
             entry.has_audio = Some(has_audio);
-            streams_changed
-                .lock()
-                .unwrap()
-                .push((source_id.to_string(), has_video, has_audio));
+            if !has_video && !has_audio {
+                // Hold full-drop events for STREAMS_GRACE_MS to absorb EOS churn
+                // where the camera reconnects before the core needs to tear down.
+                pending_streams.lock().unwrap().insert(
+                    source_id.to_string(),
+                    (has_video, has_audio, Instant::now()),
+                );
+            } else {
+                // Recovery event: cancel any pending drop and apply immediately.
+                pending_streams.lock().unwrap().remove(source_id);
+                streams_changed
+                    .lock()
+                    .unwrap()
+                    .push((source_id.to_string(), has_video, has_audio));
+            }
         }
 
         AdapterMessage::Metrics(m) => {

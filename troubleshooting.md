@@ -22,3 +22,58 @@ not logged as a clean win — that distinction is the whole reason this log is v
 to review.
 
 Format. One section per bug. Under it: Attempt N — Hypothesis / Action / Result.
+
+## cam-77 reconnect freeze (~20s chunks, single frame updates)
+
+**Symptom:** After cam-77 is unplugged mid-session and replugged, its tile freezes
+for ~20-second stretches, delivers a single frame, then freezes again. cam-27 is
+unaffected throughout.
+
+**Not present on the cold-start path.** If cam-77 is offline at launch and plugged in
+later (the `StreamsChanged` / `add_video_chain` path), video is live immediately.
+Confirmed 2026-06-25: session age ~208s, cam-77 connected at T+60s via `StreamsChanged`,
+socket clean (RecvQ=0 SendQ=0), adapter at 47.5% CPU, frames moving on screen.
+
+**Present on the replug / adapter-restart path.** Confirmed 2026-06-25:
+session age ~14 minutes, cam-77 unplugged → adapter exhausted retries → supervisor
+respawned adapter → new process connected → `resetting vunixfdsrc_cam-77` → freeze.
+Socket snapshot during freeze:
+```
+cam-77.vid.sock  adapter side  RecvQ=1712   SendQ=213504  ← adapter blocked
+                 core side     RecvQ=21406  SendQ=164352  ← core recv backed up
+cam-27.vid.sock  adapter side  RecvQ=0      SendQ=0       ← clear, unaffected
+```
+
+**What the two paths differ on:** On cold-start, the compositor's cam-77 sink pad is
+newly requested (`add_video_chain` calls `compositor.request_pad_simple("sink_%u")`).
+The aggregator has no prior PTS expectation for that pad — it starts accepting buffers
+from whatever PTS they arrive with.
+
+On replug, the compositor's cam-77 sink pad was created at `build()` time and has been
+live for the full session. The aggregator has an established PTS timeline for cam-77.
+When the adapter restarts and the new RTSP stream begins at PTS≈0, the aggregator
+stalls waiting for cam-77's PTS+offset to reach the current session running time
+(e.g., 14 min − 2 s = 13:58). Frames arrive at PTS=0 and must advance ~838 seconds
+before the aggregator will present them — which never happens within a human timescale.
+
+The ~20s single-frame pulses are the aggregator's timeout path forcing one frame out,
+then stalling again.
+
+**Socket backlog is a symptom, not the cause.** unixfdsrc consumes from the socket
+continuously; the vshm_q (leaky=downstream) and voff_q (leaky=upstream) absorb and
+drop the frames. Backpressure only propagates to the socket once both queues are full
+AND the aggregator's thread stops pulling entirely.
+
+**Hypothesis for fix:** When `restart_shmsrc` resets the unixfdsrc element after a
+reconnect, also reset the compositor sink pad's PTS expectations. Three options worth
+discussing:
+1. Release and re-request the compositor sink pad (same as the cold-start path — the
+   aggregator treats it as a new source).
+2. Inject a `GST_EVENT_FLUSH_START/STOP` + new `GST_EVENT_SEGMENT` on the compositor
+   sink pad to reset its PTS base to "now."
+3. Update the pad offset at reconnect time to compensate for the PTS discontinuity
+   (`new_offset = session_running_time − new_stream_pts`).
+
+Option 1 is the most defensible because it matches the already-working cold-start
+behavior exactly. Options 2 and 3 are more surgical but require careful segment/offset
+arithmetic. This is a decision for the review chat — flagged.

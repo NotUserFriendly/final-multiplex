@@ -583,7 +583,6 @@ fn build_video_chain(
     // errors with "output caps are unfixed".
     let vrate = make("videorate", "vrate");
     let vcaps = make("capsfilter", "vcaps");
-    let vgdppay = make("gdppay", "vgdppay");
     let vshmsink = make("shmsink", "vshmsink");
 
     vcaps.set_property(
@@ -600,16 +599,10 @@ fn build_video_chain(
     vshmsink.set_property("sync", false);
     vshmsink.set_property("wait-for-connection", false);
 
-    pipeline.add_many([
-        &vconv, &vdeint, &vscale, &vrate, &vcaps, &vgdppay, &vshmsink,
-    ])?;
-    gstreamer::Element::link_many([
-        &vconv, &vdeint, &vscale, &vrate, &vcaps, &vgdppay, &vshmsink,
-    ])?;
+    pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
+    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink])?;
 
-    for elem in [
-        &vconv, &vdeint, &vscale, &vrate, &vcaps, &vgdppay, &vshmsink,
-    ] {
+    for elem in [&vconv, &vdeint, &vscale, &vrate, &vcaps, &vshmsink] {
         let _ = elem.sync_state_with_parent();
     }
 
@@ -625,7 +618,7 @@ fn build_video_chain(
     eprintln!("[rtsp-adapter] video chain ready → {shm_path}");
     Ok(Chain {
         sink,
-        elements: vec![vconv, vdeint, vscale, vrate, vcaps, vgdppay, vshmsink],
+        elements: vec![vconv, vdeint, vscale, vrate, vcaps, vshmsink],
     })
 }
 
@@ -636,7 +629,6 @@ fn build_audio_chain(
     let aconv = make("audioconvert", "aconv");
     let aresamp = make("audioresample", "aresamp");
     let acaps = make("capsfilter", "acaps");
-    let agdppay = make("gdppay", "agdppay");
     let ashmsink = make("shmsink", "ashmsink");
 
     acaps.set_property(
@@ -652,10 +644,10 @@ fn build_audio_chain(
     ashmsink.set_property("sync", false);
     ashmsink.set_property("wait-for-connection", false);
 
-    pipeline.add_many([&aconv, &aresamp, &acaps, &agdppay, &ashmsink])?;
-    gstreamer::Element::link_many([&aconv, &aresamp, &acaps, &agdppay, &ashmsink])?;
+    pipeline.add_many([&aconv, &aresamp, &acaps, &ashmsink])?;
+    gstreamer::Element::link_many([&aconv, &aresamp, &acaps, &ashmsink])?;
 
-    for elem in [&aconv, &aresamp, &acaps, &agdppay, &ashmsink] {
+    for elem in [&aconv, &aresamp, &acaps, &ashmsink] {
         let _ = elem.sync_state_with_parent();
     }
 
@@ -663,7 +655,7 @@ fn build_audio_chain(
     eprintln!("[rtsp-adapter] audio chain ready → {shm_path}");
     Ok(Chain {
         sink,
-        elements: vec![aconv, aresamp, acaps, agdppay, ashmsink],
+        elements: vec![aconv, aresamp, acaps, ashmsink],
     })
 }
 

@@ -640,9 +640,14 @@ fn try_init(
         let ceiling = scene.grid.live_offset_ceiling_ms;
         for id in &external_ids {
             if let Some(a) = s.get(id) {
+                // If the adapter never sent Ready (has_video is None — startup
+                // timeout fired while it was still reconnecting), default to
+                // false so we don't build a chain for a non-existent socket.
+                // The chain arrives later via StreamsChanged when the source
+                // comes online.
                 external_caps.insert(
                     id.clone(),
-                    (a.has_video.unwrap_or(true), a.has_audio.unwrap_or(true)),
+                    (a.has_video.unwrap_or(false), a.has_audio.unwrap_or(false)),
                 );
                 // Reconcile declared max with core ceiling (ADR-0016/0017).
                 let declared_max = a.max_offset_ms.unwrap_or(ceiling);

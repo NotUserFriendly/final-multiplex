@@ -73,8 +73,10 @@ struct SourceLayout {
 ///                ─► audioconvert ─► audioresample ─► capsfilter(48k/2ch) ─► audiomixer
 ///
 /// External source topology (Phase 2, ADR-0005 / ADR-0011 / ADR-0012):
-///   shmsrc(video) ─► vshmcaps(prod_res) ─► queue ─► vconv ─► vdeint ─► vscale ─► vcaps(tile) ─► compositor
+///   shmsrc(video) ─► vshmcaps(prod_res) ─► queue ─► vconv ─► vdeint ─► vscale ─► vcaps(tile) ─► voff_q ─► compositor
 ///   shmsrc(audio) ─► ashmcaps(S16LE)    ─► queue ─► aconv ─► aresamp ─► acaps(48k/2ch) ─► audiomixer
+///
+///   voff_q = leaky offset-buffer queue sized to live_offset_ceiling_ms (ADR-0016).
 ///
 ///   prod_res = full grid output resolution (ADR-0012 core-owned resize).
 ///   The adapter produces at prod_res; the core scales to tile size here.
@@ -150,15 +152,15 @@ impl Pipeline {
         compositor.set_property_from_str("background", "black");
         // Set compositor latency so the live aggregator waits for the most-
         // delayed source.  Only applied when there are external (live) sources;
-        // a file-only scene keeps latency at 0 to avoid a startup delay.
-        let has_external = scene
-            .source
-            .iter()
-            .any(|s| s.source_type == SourceType::External);
-        if has_external {
-            let ceiling_ns = scene.grid.live_offset_ceiling_ms as u64 * 1_000_000;
-            compositor.set_property("latency", ceiling_ns);
-        }
+        // The voff_q (offset buffer queue) on each external source provides
+        // the per-source delay buffer needed for positive pad offsets (ADR-0016).
+        // compositor.latency is intentionally NOT set: setting it to
+        // live_offset_ceiling_ms causes the GstAggregator to enter an error
+        // state at startup (aggregate_func_return != OK) before the first
+        // buffers arrive, rejecting all subsequent pushes with GST_FLOW_ERROR.
+        // The voff_q alone is sufficient — the compositor uses the latest frame
+        // available from each source, which is the correct behavior for live
+        // offset sources.
 
         let output_caps = gstreamer::Caps::builder("video/x-raw")
             .field("format", "RGBA")
@@ -339,6 +341,10 @@ impl Pipeline {
                 // between vcaps and the compositor (ADR-0016).  The queue holds
                 // up to ceiling_ms of tile-resolution frames so a positive pad
                 // offset can delay presentation without losing frames.
+                // For external (live) sources, insert the offset buffer queue
+                // between vcaps and the compositor (ADR-0016).  The queue holds
+                // up to ceiling_ms of tile-resolution frames so a positive pad
+                // offset can delay presentation without losing frames.
                 if source.source_type == SourceType::External {
                     let ceiling_ms = scene.grid.live_offset_ceiling_ms as u64;
                     let ceiling_ns = ceiling_ms * 1_000_000;
@@ -467,16 +473,9 @@ impl Pipeline {
                             .build()?;
                         vshmsrc.set_property_from_str("socket-path", &video_sock);
                         vshmsrc.set_property("is-live", true);
-                        // GDP headers carry PTS from the adapter; don't overwrite.
+                        // shmsrc preserves adapter PTS from the SHM buffer header;
+                        // do-timestamp=false prevents overwriting with wall-clock time.
                         vshmsrc.set_property("do-timestamp", false);
-
-                        // gdpdepay restores the buffer PTS and caps serialized by
-                        // the adapter's gdppay — the adapter's clock-coherent PTS
-                        // is what we want to use for timing.
-                        let vgdpdepay: gstreamer::Element =
-                            gstreamer::ElementFactory::make("gdpdepay")
-                                .name(format!("vgdpdepay_{}", source.id))
-                                .build()?;
 
                         // vshmcaps pins the production resolution that the adapter
                         // was launched with (full grid output resolution by default —
@@ -507,8 +506,8 @@ impl Pipeline {
                         vqueue.set_property("max-size-time", 0u64);
                         vqueue.set_property_from_str("leaky", "downstream");
 
-                        pipeline.add_many([&vshmsrc, &vgdpdepay, &vshmcaps, &vqueue])?;
-                        gstreamer::Element::link_many([&vshmsrc, &vgdpdepay, &vshmcaps, &vqueue])?;
+                        pipeline.add_many([&vshmsrc, &vshmcaps, &vqueue])?;
+                        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
                         if let Some(ref vconv_sink) = vconv_sink_for_cb {
                             vqueue
                                 .static_pad("src")
@@ -524,11 +523,6 @@ impl Pipeline {
                         ashmsrc.set_property_from_str("socket-path", &audio_sock);
                         ashmsrc.set_property("is-live", true);
                         ashmsrc.set_property("do-timestamp", false);
-
-                        let agdpdepay: gstreamer::Element =
-                            gstreamer::ElementFactory::make("gdpdepay")
-                                .name(format!("agdpdepay_{}", source.id))
-                                .build()?;
 
                         let ashmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
@@ -552,8 +546,8 @@ impl Pipeline {
                         aqueue.set_property("max-size-time", 0u64);
                         aqueue.set_property_from_str("leaky", "downstream");
 
-                        pipeline.add_many([&ashmsrc, &agdpdepay, &ashmcaps, &aqueue])?;
-                        gstreamer::Element::link_many([&ashmsrc, &agdpdepay, &ashmcaps, &aqueue])?;
+                        pipeline.add_many([&ashmsrc, &ashmcaps, &aqueue])?;
+                        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
                             aqueue
                                 .static_pad("src")
@@ -664,8 +658,6 @@ impl Pipeline {
         vshmsrc.set_property("is-live", true);
         vshmsrc.set_property("do-timestamp", false);
 
-        let vgdpdepay = make("gdpdepay", &format!("vgdpdepay_{source_id}"))?;
-
         let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
         vshmcaps.set_property(
             "caps",
@@ -699,9 +691,9 @@ impl Pipeline {
         );
 
         self.inner.add_many([
-            &vshmsrc, &vgdpdepay, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
+            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps,
         ])?;
-        gstreamer::Element::link_many([&vshmsrc, &vgdpdepay, &vshmcaps, &vqueue])?;
+        gstreamer::Element::link_many([&vshmsrc, &vshmcaps, &vqueue])?;
         gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps])?;
         vqueue
             .static_pad("src")
@@ -740,7 +732,7 @@ impl Pipeline {
             .link(&comp_sink)?;
 
         for elem in [
-            &vshmsrc, &vgdpdepay, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps, &voff_q,
+            &vshmsrc, &vshmcaps, &vqueue, &vconv, &vdeint, &vscale, &vcaps, &voff_q,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -781,7 +773,6 @@ impl Pipeline {
 
         for name in [
             format!("vshmsrc_{source_id}"),
-            format!("vgdpdepay_{source_id}"),
             format!("vshmcaps_{source_id}"),
             format!("vshm_q_{source_id}"),
             format!("vconv_{source_id}"),
@@ -810,8 +801,6 @@ impl Pipeline {
         ashmsrc.set_property_from_str("socket-path", &audio_sock);
         ashmsrc.set_property("is-live", true);
         ashmsrc.set_property("do-timestamp", false);
-
-        let agdpdepay = make("gdpdepay", &format!("agdpdepay_{source_id}"))?;
 
         let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
         ashmcaps.set_property(
@@ -844,9 +833,9 @@ impl Pipeline {
         );
 
         self.inner.add_many([
-            &ashmsrc, &agdpdepay, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
         ])?;
-        gstreamer::Element::link_many([&ashmsrc, &agdpdepay, &ashmcaps, &aqueue])?;
+        gstreamer::Element::link_many([&ashmsrc, &ashmcaps, &aqueue])?;
         gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
         aqueue
             .static_pad("src")
@@ -867,7 +856,7 @@ impl Pipeline {
         mix_sink.set_property("volume", layout.volume);
 
         for elem in [
-            &ashmsrc, &agdpdepay, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
+            &ashmsrc, &ashmcaps, &aqueue, &aconv, &aresamp, &alevel, &acaps,
         ] {
             let _ = elem.sync_state_with_parent();
         }
@@ -905,7 +894,6 @@ impl Pipeline {
 
         for name in [
             format!("ashmsrc_{source_id}"),
-            format!("agdpdepay_{source_id}"),
             format!("ashmcaps_{source_id}"),
             format!("ashm_q_{source_id}"),
             format!("aconv_{source_id}"),

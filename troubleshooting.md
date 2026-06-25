@@ -200,3 +200,114 @@ GDP fixes the PTS crossing (T1) but the offset divergence (T3) remains — cause
 the `leaky=downstream` queue keeping only the 2 freshest frames while the compositor
 waits for the PTS-coherent window.  The queue strategy (not the GDP framing) is
 the next decision point.
+
+---
+
+## Group G gate: cam-77 cold-start — shmsrc cascade failure (ongoing, 2026-06-24–25)
+
+**Gate procedure:** Start app with cam-77 unplugged → verify cam-27 shows live video
+→ plug cam-77 back in → verify its tile populates without stalling other sources.
+
+**Symptom:** All shmsrc elements (`vshmsrc_cam-27`, `vshmsrc_cam-77`, `ashmsrc_cam-77`)
+fail within ~60 ms of `transport.play()` being called:
+
+```
+[fm-core] error from Some("ashmsrc_cam-77"): Internal data stream error.
+gst_base_src_loop: streaming stopped, reason error (-5)
+[fm-core] error from Some("vshmsrc_cam-27"): Internal data stream error.
+gst_base_src_loop: streaming stopped, reason error (-5)
+```
+
+The push from each shmsrc → downstream returns `GST_FLOW_ERROR` (-5).  The compositor
+or audiomixer enters an error state and rejects all subsequent sink pad pushes.
+
+---
+
+### Attempt 1 — Remove compositor `latency` property
+
+**Hypothesis:** `compositor.set_property("latency", ceiling_ns)` causes GstAggregator
+to enter an error state before the first buffers arrive.  With live sources and a
+2000 ms latency target, the aggregator times out waiting and sets
+`aggregate_func_return = GST_FLOW_ERROR`.  All subsequent sink pad pushes see the
+stored error and return -5.
+
+**Action:** Removed the `compositor.latency` set block.  Added explanatory comment.
+
+**Result:** Non-deterministic.  In one "bisect-nolatency" run where cam-77 reported
+`video=true audio=true`, video shmsrc worked and only the audio shmsrc errored.
+In subsequent runs (same code), all three shmsrc elements errored.  The latency
+removal is confirmed correct (setting it was definitely wrong) but is not the sole
+cause.
+
+---
+
+### Attempt 2 — Revert all GDP elements
+
+**Hypothesis:** `gdpdepay` in the core fails when shmsrc reconnects mid-stream
+because gdppay writes caps only once at stream start; the caps packet is overwritten
+in the ring buffer before a late-connecting shmsrc reads it.  This causes
+`GDP packet header does not validate` errors.
+
+**Action:** Removed `vgdpdepay` and `agdpdepay` from the core pipeline; removed
+`gdppay` from both adapters.  `do-timestamp=false` on shmsrc is sufficient to
+preserve the adapter's PTS from the SHM buffer header.
+
+**Result:** GDP errors gone.  The shmsrc cascade failure (`GST_FLOW_ERROR`) still
+occurs — GDP was a separate bug, not the cause of the cascade.
+
+---
+
+### Attempt 3 — Remove `alevel` from initial build path (bisect)
+
+**Hypothesis:** `alevel` (GstLevel) in the audio chain fires
+`assertion 'num_int_samples % channels == 0' failed` on the first buffer from
+ashmsrc, which is not stereo-aligned.  The assertion abort kills the thread,
+leaving the audiomixer in error state and cascading to video via some bus mechanism.
+
+**Action:** Removed `alevel` from the initial (not dynamic) audio chain build path
+(TEST edit in pipeline.rs).
+
+**Result:** `ashmsrc_cam-77` still errors with GST_FLOW_ERROR.  `vshmsrc_cam-27`
+still errors.  alevel is not the cascade mechanism.  TEST edit reverted in cleanup.
+
+---
+
+### Attempt 4 — Remove `voff_q` from initial build path (bisect)
+
+**Hypothesis:** The voff_q leaky queue somehow causes the compositor to return an
+error on the first push, which propagates back through the chain.
+
+**Action:** Removed `voff_q` from the initial video chain build path (TEST edit).
+
+**Result:** Same cascade.  voff_q is not the cause.  TEST edit reverted in cleanup.
+
+---
+
+### What is known
+
+- `audiomixer: Latency query failed` appears in aggregator debug (`GST_DEBUG=aggregator:5`)
+  immediately at pipeline start.  This is a WARN from gstaggregator.c:2355 and fires before
+  any shmsrc buffers arrive.
+- The compositor src task starts and the first call to `aggregate()` pushes a frame to
+  appsink or autoaudiosink.  If those sinks are not yet in PLAYING state, the push may
+  fail, setting `aggregate_func_return = GST_FLOW_ERROR` permanently.
+- The error arrives within ~60 ms of `set_state(Playing)`.  GStreamer live pipelines
+  return `StateChangeReturn::Async` from `set_state(Playing)` — the pipeline may not be
+  fully playing when `send_play_all()` fires.
+
+### Hypotheses not yet tested
+
+1. **Pipeline not fully PLAYING when play command fires** — Wait for the pipeline's
+   StateChanged(Playing) bus message before sending Play to adapters.  The adapters
+   only start writing frames after Play; if the aggregators haven't completed their
+   first cycle by then, the first push from shmsrc may land in an error-state aggregator.
+
+2. **autoaudiosink / appsink not ready at first aggregate()** — The aggregator src task
+   races with the downstream sinks going to PLAYING.  A push to a PAUSED appsink blocks
+   briefly then returns OK (live mode), but a push to an unready sink returns ERROR.
+   Try `appsink sync=false` explicitly, or add `async=false` to autoaudiosink.
+
+3. **Audiomixer latency query failure is load-bearing** — The `Latency query failed` WARN
+   may cause the audiomixer to skip its internal latency setup, leaving the src task in
+   a broken state that returns GST_FLOW_ERROR on the first `aggregate()` call.  Try
+   adding a `tee` or `queue` after autoaudiosink to absorb the latency query path.

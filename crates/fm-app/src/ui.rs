@@ -581,6 +581,7 @@ fn try_init(
         let net = fm_core::net_clock::NetClock::new()?;
         let mut sup = fm_core::supervisor::Supervisor::new();
         sup.set_delivery_watchdog_ms(scene.grid.delivery_watchdog_ms);
+        sup.set_adapter_dir(scene.grid.adapter_dir.clone());
         let mut ids: Vec<String> = Vec::new();
         for s in &scene.source {
             if s.source_type != fm_core::config::SourceType::External {

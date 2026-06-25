@@ -72,6 +72,15 @@ pub struct GridConfig {
     /// Default: 30 000 ms (30 s).
     #[serde(default = "default_delivery_watchdog_ms")]
     pub delivery_watchdog_ms: u64,
+    /// Override directory for adapter binaries (ADR-0022, tier 1).
+    ///
+    /// When set, the resolver checks this directory before the XDG user dir
+    /// and the bundled `adapters/` dir.  Useful for pointing at a custom
+    /// adapter build (e.g. `adapter_dir = "target/debug"` in a dev scene).
+    /// `FM_ADAPTER_DIR` env var has the same effect without touching the scene
+    /// file.  If absent the normal search path applies.
+    #[serde(default)]
+    pub adapter_dir: Option<String>,
 }
 
 fn default_adapter_ready_timeout() -> u64 {

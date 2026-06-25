@@ -15,6 +15,7 @@
 //! wait TEARDOWN_WINDOW_SECS for the adapter to release its source (e.g. RTSP
 //! TEARDOWN) before force-killing.
 
+use crate::adapter_resolver;
 use crate::net_clock::NetClock;
 use crate::runtime;
 use fm_adapter_sdk::contract::{self, AdapterMessage, Command, OffsetPolarity, PROTOCOL_VERSION};
@@ -159,6 +160,9 @@ pub struct Supervisor {
     playing: Arc<Mutex<bool>>,
     /// Delivery watchdog timeout (ADR-0020).  0 = disabled.
     delivery_watchdog_ms: u64,
+    /// Scene-level adapter dir override (ADR-0022 tier 1).  None = use the
+    /// normal search path (FM_ADAPTER_DIR → XDG user dir → bundled).
+    adapter_dir: Option<String>,
 }
 
 impl Supervisor {
@@ -167,6 +171,7 @@ impl Supervisor {
         if let Err(e) = runtime::ensure_dirs() {
             eprintln!("[supervisor] WARNING: could not create runtime dirs: {e}");
         }
+        adapter_resolver::ensure_user_dir();
         Self {
             live: HashMap::new(),
             pending: HashMap::new(),
@@ -177,12 +182,19 @@ impl Supervisor {
             pending_streams: Arc::new(Mutex::new(HashMap::new())),
             playing: Arc::new(Mutex::new(false)),
             delivery_watchdog_ms: 30_000,
+            adapter_dir: None,
         }
     }
 
     /// Override the delivery watchdog timeout (call after new(), before spawn()).
     pub fn set_delivery_watchdog_ms(&mut self, ms: u64) {
         self.delivery_watchdog_ms = ms;
+    }
+
+    /// Set the scene-level adapter dir override (ADR-0022 tier 1).
+    /// Call after new(), before spawn().
+    pub fn set_adapter_dir(&mut self, dir: Option<String>) {
+        self.adapter_dir = dir;
     }
 
     /// Update whether the core pipeline has an active chain for `source_id`.
@@ -232,9 +244,13 @@ impl Supervisor {
         fps: u32,
         uri: Option<&str>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let resolved = adapter_resolver::resolve(binary, self.adapter_dir.as_deref())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
+        let binary_path = resolved.to_string_lossy().into_owned();
+        eprintln!("[supervisor] adapter '{binary}' → {binary_path}");
         let (video_shm, audio_shm) = runtime::shm_paths(source_id);
         let spec = LaunchSpec {
-            binary: binary.to_string(),
+            binary: binary_path,
             source_id: source_id.to_string(),
             clock_addr: format!("127.0.0.1:{}", net.port.max(0) as u32),
             video_shm,

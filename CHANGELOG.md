@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Adapter discovery search path (ADR-0022):** adapters are now resolved via a
+  defined three-tier search path instead of relying on `$PATH` or cwd.  Order:
+  (1) scene `adapter_dir` config key, (2) `FM_ADAPTER_DIR` env var, (3) XDG data
+  user dir (`~/.local/share/final-multiplex/adapters` on Linux), (4) bundled
+  `adapters/` subdirectory next to the core executable.  Resolution is deterministic
+  regardless of launcher or working directory.  The user data dir is created on first
+  run if absent.  `Makefile` targets (`make dev` / `make release`) build the workspace
+  and populate `target/{debug,release}/adapters/` so the bundled path resolves in dev.
+
 ### Changed
 - **Transport seam realized (ADR-0019):** The platform-specific element names
   (`unixfdsink`, `unixfdsrc`) are now behind a single `cfg(target_os = "linux")`

@@ -29,11 +29,34 @@ use fm_adapter_sdk::contract::{AdapterMessage, Command, OffsetPolarity, PROTOCOL
 use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Rolling 60-second window of per-second frame counts.
+struct RollingWindow {
+    buckets: VecDeque<u64>,
+}
+impl RollingWindow {
+    fn new() -> Self {
+        Self {
+            buckets: VecDeque::with_capacity(60),
+        }
+    }
+    /// Push this second's count. Drops entries older than 60 s.
+    fn push(&mut self, count: u64) {
+        self.buckets.push_back(count);
+        if self.buckets.len() > 60 {
+            self.buckets.pop_front();
+        }
+    }
+    fn sum(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+}
 
 // After the first decoded pad appears, wait this long for additional pads
 // (video + audio usually arrive within ~500 ms of each other).
@@ -220,7 +243,11 @@ fn main() {
     // needs `shared`, avoiding a block if sync_state_with_parent stalls
     // inside a pad-added callback or reconnect thread.
     let reconnect_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let video_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // Pre-videorate counter — actual camera frame rate.
+    let source_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // Post-videorate counter — used to compute videorate drops.
+    let output_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let bad_frames_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     // Prevents concurrent reconnect attempts when the pipeline generates
     // multiple Error/EOS messages in quick succession.
     let reconnecting: Arc<std::sync::atomic::AtomicBool> =
@@ -249,7 +276,9 @@ fn main() {
         let shared_c = Arc::clone(&shared);
         let video_shm_c = video_shm.clone();
         let audio_shm_c = audio_shm.clone();
-        let video_frames_c = Arc::clone(&video_frames);
+        let source_frames_c = Arc::clone(&source_frames);
+        let output_frames_c = Arc::clone(&output_frames);
+        let bad_frames_c = Arc::clone(&bad_frames_count);
 
         decodebin.connect("pad-added", false, move |args| {
             let pad = args[1].get::<gstreamer::Pad>().unwrap();
@@ -287,7 +316,9 @@ fn main() {
                         prod_w,
                         prod_h,
                         fps,
-                        Arc::clone(&video_frames_c),
+                        Arc::clone(&source_frames_c),
+                        Arc::clone(&output_frames_c),
+                        Arc::clone(&bad_frames_c),
                     ) {
                         Ok(chain) => {
                             if let Err(e) = pad.link(&chain.sink) {
@@ -348,7 +379,11 @@ fn main() {
     let bus = pipeline.bus().unwrap();
     let mut ingest_state = IngestState::Running;
     let mut last_metrics = Instant::now();
-    let mut prev_video_frames: u64 = 0;
+    let mut prev_source_frames: u64 = 0;
+    let mut prev_output_frames: u64 = 0;
+    let mut prev_bad_frames: u64 = 0;
+    let mut dropped_window = RollingWindow::new();
+    let mut bad_window = RollingWindow::new();
 
     let hard_deadline = Instant::now() + Duration::from_secs(30);
 
@@ -582,16 +617,32 @@ fn main() {
             let elapsed = last_metrics.elapsed().as_secs_f64();
             last_metrics = Instant::now();
 
-            let current_frames = video_frames.load(Ordering::Relaxed);
-            let fps_in = current_frames.saturating_sub(prev_video_frames) as f64 / elapsed;
-            prev_video_frames = current_frames;
+            let cur_src = source_frames.load(Ordering::Relaxed);
+            let cur_out = output_frames.load(Ordering::Relaxed);
+            let cur_bad = bad_frames_count.load(Ordering::Relaxed);
+
+            let src_delta = cur_src.saturating_sub(prev_source_frames);
+            let out_delta = cur_out.saturating_sub(prev_output_frames);
+            let bad_delta = cur_bad.saturating_sub(prev_bad_frames);
+
+            prev_source_frames = cur_src;
+            prev_output_frames = cur_out;
+            prev_bad_frames = cur_bad;
+
+            // fps_in = actual camera rate (pre-videorate).
+            let fps_in = src_delta as f64 / elapsed;
+            // Dropped = source frames videorate discarded (source faster than target).
+            let dropped_this_sec = src_delta.saturating_sub(out_delta);
+            dropped_window.push(dropped_this_sec);
+            bad_window.push(bad_delta);
 
             let rc = reconnect_count.load(Ordering::Relaxed) as u32;
             emit(AdapterMessage::Metrics(SourceMetrics {
                 source_id: source_id.clone(),
                 fps_in,
                 fps_out: 0.0,
-                dropped_frames: 0,
+                dropped_frames: dropped_window.sum(),
+                bad_frames: bad_window.sum(),
                 offset_vs_master_ms: 0,
                 state: ingest_state.clone(),
                 reconnect_count: rc,
@@ -634,7 +685,9 @@ fn build_video_chain(
     prod_w: i32,
     prod_h: i32,
     fps: i32,
-    frame_counter: Arc<AtomicU64>,
+    source_counter: Arc<AtomicU64>,
+    output_counter: Arc<AtomicU64>,
+    bad_counter: Arc<AtomicU64>,
 ) -> Result<Chain, Box<dyn std::error::Error + Send + Sync>> {
     let vconv = make("videoconvert", "vconv");
     let vdeint = make("deinterlace", "vdeint");
@@ -665,18 +718,31 @@ fn build_video_chain(
         let _ = elem.sync_state_with_parent();
     }
 
-    // BUFFER probe on vcaps:src counts every frame delivered to unixfdsink.
+    // BUFFER probe on vconv:sink — counts actual decoded frames from the camera
+    // (pre-videorate) and flags corrupt buffers (RTP packet loss).
+    let sink_pad = vconv.static_pad("sink").ok_or("vconv: no sink pad")?;
+    sink_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        if let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data {
+            source_counter.fetch_add(1, Ordering::Relaxed);
+            if buf.flags().contains(gstreamer::BufferFlags::CORRUPTED) {
+                bad_counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        gstreamer::PadProbeReturn::Ok
+    });
+
+    // BUFFER probe on vcaps:src — counts frames after videorate resampling.
+    // Used to compute the per-second videorate drop count.
     if let Some(vcaps_src) = vcaps.static_pad("src") {
         vcaps_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
-            frame_counter.fetch_add(1, Ordering::Relaxed);
+            output_counter.fetch_add(1, Ordering::Relaxed);
             gstreamer::PadProbeReturn::Ok
         });
     }
 
-    let sink = vconv.static_pad("sink").ok_or("vconv: no sink pad")?;
     eprintln!("[rtsp-adapter] video chain ready → {shm_path}");
     Ok(Chain {
-        sink,
+        sink: sink_pad,
         elements: vec![vconv, vdeint, vscale, vrate, vcaps, vunixfdsink],
     })
 }

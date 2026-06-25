@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **RTSP metrics: real `fps_in`, bad-frame counter, windowed rates:**
+  - `fps_in` now reflects the actual camera frame rate (probe on `vconv:sink`,
+    pre-`videorate`) instead of the configured/resampled output rate. A camera
+    running at 25 fps now reports ~25, not 30.
+  - `bad_frames` added to `SourceMetrics`: counts buffers arriving from the
+    decoder with `GST_BUFFER_FLAG_CORRUPTED` set (RTP packet loss).
+  - Both `dropped_frames` (videorate discards) and `bad_frames` are reported
+    over a rolling 60-second window for live (RTSP) sources, so a long-running
+    stream does not accumulate unbounded counts.
+  - Off-rate canary tolerance now derived from the measured source frame period
+    (`frame_period_ms + 100 ms`, floor 150 ms) so cameras running below 30 fps
+    no longer trip false WARN lines.
 - **Adapter discovery search path (ADR-0022):** adapters are now resolved via a
   defined three-tier search path instead of relying on `$PATH` or cwd.  Order:
   (1) scene `adapter_dir` config key, (2) `FM_ADAPTER_DIR` env var, (3) XDG data

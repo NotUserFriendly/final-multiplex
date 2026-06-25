@@ -300,6 +300,7 @@ fn main() {
                 fps_in,
                 fps_out: 0.0,
                 dropped_frames: 0,
+                bad_frames: 0,
                 offset_vs_master_ms: 0,
                 state: ingest_state.clone(),
                 reconnect_count: 0,

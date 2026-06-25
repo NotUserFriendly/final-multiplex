@@ -161,7 +161,15 @@ impl App {
                         // Apply live topology changes from StreamsChanged messages.
                         for (id, has_video, has_audio) in sup.take_streams_changed() {
                             if let Some(t) = &mut self.transport {
-                                t.apply_streams_changed(&id, has_video, has_audio);
+                                let fps = sup
+                                    .status_handle()
+                                    .lock()
+                                    .unwrap()
+                                    .get(&id)
+                                    .and_then(|s| s.latest_metrics.as_ref())
+                                    .map(|m| m.fps_in)
+                                    .unwrap_or(0.0);
+                                t.apply_streams_changed(&id, has_video, has_audio, fps);
                             }
                         }
                         // Update chain state for the delivery watchdog (ADR-0020).

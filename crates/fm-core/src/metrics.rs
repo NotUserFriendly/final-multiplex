@@ -180,6 +180,7 @@ impl MetricsCollector {
             fps_in,
             fps_out: out.fps,
             dropped_frames: dropped,
+            bad_frames: 0,
             // Phase 2 will read actual drift from the net clock (ADR-0005).
             offset_vs_master_ms: 0,
             state: IngestState::Running,

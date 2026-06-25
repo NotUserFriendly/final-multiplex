@@ -19,8 +19,12 @@ pub struct SourceMetrics {
     pub fps_in: f64,
     /// Frames emitted by the compositor into the appsink per second.
     pub fps_out: f64,
-    /// Cumulative dropped frames since pipeline start.
+    /// Dropped frames over the last 60 s (live sources) or cumulative (finite sources).
+    /// Live: videorate drops when source fps exceeds the configured output fps.
     pub dropped_frames: u64,
+    /// Frames arriving from the decoder with the CORRUPTED flag set (RTP packet loss).
+    /// Windowed over the last 60 s for live sources; cumulative for finite sources.
+    pub bad_frames: u64,
     /// This source's pad offset relative to the master clock (ms).
     pub offset_vs_master_ms: i64,
     pub state: IngestState,
@@ -39,6 +43,7 @@ impl Default for SourceMetrics {
             fps_in: 0.0,
             fps_out: 0.0,
             dropped_frames: 0,
+            bad_frames: 0,
             offset_vs_master_ms: 0,
             state: IngestState::default(),
             reconnect_count: 0,

@@ -32,25 +32,23 @@ fn add_offset_canary(
     expected_offset_ns: i64,
     ceiling_ms: u64,
     pipeline_weak: gstreamer::glib::WeakRef<gstreamer::Pipeline>,
+    source_fps: f64,
 ) {
     let sid = source_id.to_string();
     let expected_ms = expected_offset_ns / 1_000_000;
     // Sampling window opens after the fill phase: ceiling_ms (worst-case) + 500 ms margin.
     let window_start_ns = ceiling_ms as i64 * 1_000_000 + 500_000_000i64;
-    // 150 ms tolerance, not the naive ±1-frame (~33 ms).
+    // Tolerance = frame_period + chain_latency (~100 ms empirical), floor 150 ms.
     // The probe fires when the compositor accepts the *next* buffer after
     // popping the current one; the measured running-pts is therefore
     // approximately (offset − frame_period − pipeline_latency).  Empirically
     // this reads ~80 ms below the configured offset at 30 fps with ~100 ms
-    // chain latency (e.g. 419 ms measured for 500 ms offset).  150 ms covers
-    // this structural bias while still catching a full TOML-revert regression
-    // (≥300 ms error).
-    // TODO(pre-Phase-3 metrics pass): 150 ms implicitly assumes ~30 fps — the
-    // bias is (frame_period + chain_latency), so at ~15 fps the frame period
-    // doubles and the bias approaches ~165 ms, which can tip a correct offset
-    // over this threshold and emit a false WARN.  Fix alongside fps_in once
-    // the real source framerate is available to the core.
-    const TOLERANCE_MS: i64 = 150;
+    // chain latency (e.g. 419 ms measured for 500 ms offset).
+    // At off-rates (e.g. 15 fps) the frame period doubles; without the real fps
+    // the bias can exceed the old hardcoded 150 ms and emit false WARNs.
+    let fps = if source_fps > 0.0 { source_fps } else { 30.0 };
+    let frame_period_ms = (1000.0 / fps) as i64;
+    let tolerance_ms: i64 = (frame_period_ms + 100).max(150);
     const SAMPLE_COUNT: u32 = 20;
 
     // u64::MAX = "not yet recorded"; running time is always > 0 in practice.
@@ -89,10 +87,10 @@ fn add_offset_canary(
 
         let diff_ms = (running_ns - pts.nseconds() as i64) / 1_000_000;
         let deviation = (diff_ms - expected_ms).abs();
-        if deviation > TOLERANCE_MS {
+        if deviation > tolerance_ms {
             eprintln!(
-                "[offset-canary] WARN '{}' expected {}ms got {}ms (deviation {}ms)",
-                sid, expected_ms, diff_ms, deviation
+                "[offset-canary] WARN '{}' expected {}ms got {}ms (deviation {}ms tolerance {}ms)",
+                sid, expected_ms, diff_ms, deviation, tolerance_ms
             );
         }
         samples_taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -792,7 +790,13 @@ impl Pipeline {
     /// present, live on a PLAYING pipeline.  This is the implementation risk
     /// called out in ADR-0013 — if it stalls the compositor, stop and treat it
     /// as a core problem to solve.
-    pub fn build_shmsrc_chain(&mut self, source_id: &str, has_video: bool, has_audio: bool) {
+    pub fn build_shmsrc_chain(
+        &mut self,
+        source_id: &str,
+        has_video: bool,
+        has_audio: bool,
+        source_fps: f64,
+    ) {
         let current_has_video = self
             .inner
             .by_name(&format!("vunixfdsrc_{source_id}"))
@@ -815,7 +819,7 @@ impl Pipeline {
                 // code path so the asymmetry cannot reappear.
                 self.remove_video_chain(source_id);
             }
-            if let Err(e) = self.add_video_chain(source_id) {
+            if let Err(e) = self.add_video_chain(source_id, source_fps) {
                 eprintln!("[pipeline] add_video_chain '{source_id}': {e}");
             }
         } else if current_has_video {
@@ -842,7 +846,7 @@ impl Pipeline {
 
     // ── Dynamic chain builders / tearers ─────────────────────────────────────
 
-    fn add_video_chain(&mut self, source_id: &str) -> Result<()> {
+    fn add_video_chain(&mut self, source_id: &str, source_fps: f64) -> Result<()> {
         let layout = self
             .source_layouts
             .get(source_id)
@@ -960,6 +964,7 @@ impl Pipeline {
             layout.offset_ns,
             self.ceiling_ms as u64,
             self.inner.downgrade(),
+            source_fps,
         );
 
         for elem in [

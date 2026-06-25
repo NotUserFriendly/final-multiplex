@@ -32,7 +32,7 @@ Desktop.ini
 /secrets/
 
 # --- Local-only task scratchpads ---
-TaskBlock.md
+TaskBlock*.md
 
 # --- Local media scratch ---
 # Don't commit test clips, stream dumps, or recordings.

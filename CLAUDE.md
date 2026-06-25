@@ -33,6 +33,14 @@ A task is not done until ALL of these are true:
 ## Working agreements
 - When a change is user-visible or alters behavior, add an entry under `## [Unreleased]` in `CHANGELOG.md`.
 - When you hit a decision that's hard to reverse or that a future reader would ask "why?" about (a dependency, a data model, an architectural boundary), STOP and flag it for the review chat to author the ADR — do not write or edit the ADR yourself. The test: would you answer "why is it built this way?" differently than the existing ADRs in `docs/decisions/`? If you can't tell, flag it anyway. You still write `CHANGELOG.md` entries and code comments, and you read and implement against existing ADRs.
+- If a step will run longer than ~5 minutes without visible output — long builds, soak/duration
+  tests, clock-convergence or reconnect waits, anything where you'll go quiet — say so up front:
+  that it'll take a while, a rough duration, and what's running. A silent 20-minute wait is
+  indistinguishable from a hang to the maintainer; "thinking…" with a stalled token count reads
+  as broken, not intentional. If a step you expected to be quick runs long, say so as soon as
+  that's apparent, and prefer emitting interim progress over going silent.
+- When you're blocked waiting on the maintainer (a physical action like an unplug/replug, or a
+  decision), state plainly that you're now waiting and on what — don't sit silent.
 - Don't restate PLAN.md or CHANGELOG.md content here. Link, don't duplicate.
 
 ## Conventions

@@ -106,39 +106,40 @@ fn main() {
         .map(String::as_str)
         .unwrap_or("127.0.0.1:5637");
     let (clock_host, clock_port) = split_addr(clock_addr);
-    let net_clock = gstreamer_net::NetClientClock::new(
-        None,
-        &clock_host,
-        clock_port,
-        gstreamer::ClockTime::ZERO,
-    );
-    // Gate production on clock sync (ADR-0005): without a synced
-    // GstNetClientClock the adapter's pipeline reports local time (~0)
-    // instead of the core's running time, so all frames carry PTS≈0.
-    // The compositor discards those as minutes-late, the socket backs up,
-    // fps_in drops to 0, and the 120 s frame watchdog fires — respawn loop.
-    // On cold-start both sides come up together and 5 s was enough; on
-    // respawn against a long-running provider the NTP-like calibration needs
-    // more rounds.  Measure actual convergence time here so the timeout can
-    // be set to a safe margin (Group 2A) or the calibration seeded (Group 2B).
+    // Seed the client clock with the current system time so it reads correctly
+    // immediately, independent of net calibration (ADR-0005 same-machine case).
+    //
+    // On this machine the GstNetTimeProvider wraps GstSystemClock, and every
+    // adapter process shares the same monotonic clock, so seeding with
+    // SystemClock::obtain().time() makes the NetClientClock read ≈correct by
+    // construction — no packet exchange required.
+    //
+    // Measurement confirmed that net calibration packets do not arrive on
+    // respawn (net_clock stayed at ZERO+elapsed after 60 s), so the seed is
+    // load-bearing, not a hint.  The cause is unknown but may be a GStreamer
+    // child-process global-state issue; recorded in troubleshooting.md.
+    //
+    // Cross-machine caveat: this seed only works when adapter and core share
+    // a monotonic clock.  A cross-machine deployment would need the NTP
+    // calibration actually working, or PTP (ADR-0005 upgrade path).
+    let initial_time = gstreamer::SystemClock::obtain().time();
+    let net_clock = gstreamer_net::NetClientClock::new(None, &clock_host, clock_port, initial_time);
     eprintln!("[rtsp-adapter] syncing to clock {clock_host}:{clock_port}");
     let sync_start = Instant::now();
-    match net_clock.wait_for_sync(gstreamer::ClockTime::from_seconds(60)) {
+    // Short wait for net refinement; proceed on timeout — the seeded clock is
+    // already ≈correct on same-machine, so a timeout is not a hard failure.
+    // This is the reverse of the pre-seed policy: previously timeout meant
+    // PTS≈0 (fatal); now it means "net calibration skipped, seed used" (safe).
+    match net_clock.wait_for_sync(gstreamer::ClockTime::from_seconds(5)) {
         Ok(()) => eprintln!(
             "[rtsp-adapter] clock synced in {}ms",
             sync_start.elapsed().as_millis()
         ),
-        Err(_) => {
-            // Group 1 measurement: did not converge in 60s.
-            // Distinguish genuine calibration failure from a stuck is-synced flag:
-            // compare the net clock's time to the local system clock.
-            let net_t = net_clock.time();
-            let sys_t = gstreamer::SystemClock::obtain().time();
-            eprintln!(
-                "[rtsp-adapter] clock sync: did not converge in 60s \
-                 (net_clock={net_t:?} sys_clock={sys_t:?})"
-            );
-        }
+        Err(_) => eprintln!(
+            "[rtsp-adapter] clock sync: net calibration incomplete ({}ms); \
+             seeded clock proceeds — same-machine only",
+            sync_start.elapsed().as_millis()
+        ),
     }
 
     // ── Config ────────────────────────────────────────────────────────────

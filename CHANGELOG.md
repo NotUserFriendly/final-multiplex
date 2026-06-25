@@ -23,6 +23,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface on the cheap deterministic path, not only against live cameras.
 
 ### Fixed
+- **cam-77 replug — adapter clock seeded with system time; respawn loop eliminated
+  (ADR-0005):** Respawned adapter processes consistently failed `GstNetClientClock`
+  calibration: `wait_for_sync` timed out every time while cold-start adapters synced in
+  <400 ms.  Measurement (Group 1) confirmed no NTP offset was ever applied on respawn —
+  `net_clock` stayed at `ZERO + elapsed` even after 60 s.  No UDP sockets for the
+  provider port were detectable on respawn, confirming the packets never arrive (not
+  "arrive but rejected").  Root cause unknown; may be a GStreamer child-process global
+  clock state issue.  Fix: seed `GstNetClientClock::new` with
+  `gstreamer::SystemClock::obtain().time()` instead of `ClockTime::ZERO`.  On the same
+  machine, adapter and core share the same monotonic clock, so the NetClientClock reads
+  ≈correct immediately — `first_pts ≈ pipeline_running_time` confirmed (119 ms gap vs
+  8+ minutes before the fix).  Net calibration is still attempted (5 s) for refinement;
+  timeout is non-fatal since the seed is load-bearing.  Implements ADR-0005 for the
+  same-machine case.  Cross-machine deployments cannot rely on this seed and would need
+  the NTP calibration actually working, or PTP (ADR-0005 upgrade path).
+- **cam-77 replug — compositor chain rebuilt on adapter restart; 20-second freeze
+  eliminated:** On cable replug, the supervisor-respawned adapter produced a new RTSP
+  stream starting at PTS≈0.  The compositor's cam-77 sink pad had an established PTS
+  timeline from the original session (e.g., 14 min of running time); the aggregator
+  stalled waiting for PTS to advance from 0 to the current time — producing 20-second
+  freeze / single-frame pulses.  Fix: supervisor always routes adapter-restart `Ready`
+  messages through `streams_changed`, causing `build_shmsrc_chain` to tear down and
+  rebuild the compositor sink pad.  The restart path now follows the same code as the
+  already-working hot-add path (fresh pad with no PTS history).  The `restarted` queue
+  and `restart_shmsrc` method are removed.
 - **Cold-start: offline source now populates tile on reconnect:** When a source reports
   `Ready(video=false audio=false)` at startup (camera offline), its tile layout (xpos,
   ypos, tile dimensions, offset) was not stored, so `add_video_chain`/`add_audio_chain`

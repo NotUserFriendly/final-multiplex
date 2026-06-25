@@ -6,6 +6,9 @@ A task is not done until ALL of these are true:
 - [ ] New architectural decision? Flagged for the review chat — not authored or edited here
 - [ ] Commit message states what changed and why
 
+## Claude Code UI/UX Behaviors
+- Before starting any multi-step task, create a todo checklist of all steps, then mark each in_progress → completed as you go.
+
 ## Process rules
 - **ADRs are immutable once `Status: Accepted`.** Never edit the body of an accepted ADR.
   To change, reverse, or extend a decision, write a NEW ADR that supersedes it and set the

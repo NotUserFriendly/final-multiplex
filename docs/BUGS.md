@@ -41,6 +41,17 @@ Areas: ui, pipeline, transport, metrics, audio, bridge, config, build
       parse error by the supervisor.  Adapters must route all diagnostic output to stderr.
       The correct architectural fix is a dedicated control file-descriptor (not stdout),
       deferred until it bites in practice.  Documented in ADR-0012 Consequences. (2026-06-23)
+- [ ] [transport] Dummy adapter reconnect: after Kill + Reboot, the rebooted `fm-dummy-adapter`
+      returns frozen with a pegged VU meter and the offset canary fires with a deviation equal to
+      the pipeline running time (~333 s deviation in a 5-minute session).
+      Root cause: `NetClientClock::wait_for_sync` times out on respawn (the system-clock seed from
+      the Phase-2.1 clock-on-respawn fix does not reach the dummy's `videotestsrc`); the
+      `videotestsrc` then timestamps from the timed-out net clock at PTS≈0 instead of the current
+      pipeline running time; `reconnect-pts` overcompensates by the full pipeline running time and
+      sets the pad offset to `pipeline_running + user_offset` instead of just `user_offset`.
+      Scope: framerate-independent; dummy-adapter only.  RTSP cameras are unaffected — they derive
+      PTS from the RTP stream, not the net clock.
+      Open thread: confirm *why* the seed doesn't reach `videotestsrc` on respawn.  (2026-06-26)
 - [ ] [pipeline] GStreamer criticals on adapter crash: original shmsrc poll-fd assertion flood
       may be resolved by the transport change (shmsrc → unixfdsrc, ADR-0019, 2026-06-25).
       Needs verification: crash an adapter and check whether `gst_poll_fd_has_error` criticals

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Manual ratchet reset button:** "↺ Reset Rate" button in the control bar resets
+  the output framerate high-water mark to the configured `fps` from the scene config.
+  Re-discovery runs through the settle window, so a reset immediately after a burst
+  source leaves won't re-lock on a residual burst.
+
+### Fixed
+- **Startup/reconnect burst false-high ratchet:** a source flushing a backlog at
+  startup or reconnect (jitter-buffer release, decode drain) could inflate the measured
+  `fps_in` briefly above its true rate; because the ratchet is monotonic this false
+  high would lock the output above the real maximum for the session.  Fixed by a
+  per-source 1000 ms settle window: measured-fallback rates do not count toward the
+  ratchet until the source has been delivering continuously for the window duration.
+  Caps-declared rates (from negotiated pad caps) remain immediate — they don't burst-lie.
+  The settle timer resets when a source's delivery stops (fps_in → 0), so reconnects
+  are protected automatically.
+
+### Added
 - **Phase 2.3 — Arbitrary and dynamic framerate (ADR-0023):** sources now compose
   at their native input rates rather than being forced to `fps` from the scene config.
   - **Native rate pass-through (Block 1):** `videorate` and the `framerate` constraint

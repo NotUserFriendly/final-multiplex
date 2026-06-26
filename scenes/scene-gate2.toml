@@ -1,0 +1,25 @@
+# Gate 2 validation scene — offset at 60 fps + reconnect (Phase 2.3 / ADR-0023).
+#
+# Single 60 fps dummy source. Apply +1500 ms offset via the UI offset slider,
+# confirm it holds steady (canary silent in session.log). Then Kill + Reboot
+# and confirm the offset survives the reconnect (canary still silent).
+#
+# This exercises the time-based voff_q sizing: the old frame-count buffer
+# (ceiling_ms * grid_fps / 1000 + 4) would have been undersized at 60 fps,
+# running dry at ~1280 ms. The time-only queue handles it correctly.
+
+[grid]
+columns                    = 1
+width                      = 1920
+height                     = 1080
+fps                        = 60
+adapter_ready_timeout_secs = 15
+live_offset_ceiling_ms     = 2000
+
+[[source]]
+id          = "fast"
+source_type = "external"
+adapter     = "fm-dummy-adapter"
+volume      = 0.5
+offset_ms   = 1500
+muted = true

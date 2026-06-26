@@ -92,6 +92,8 @@ pub enum Message {
     Kill {
         index: usize,
     },
+    /// Reset the output framerate ratchet to the configured grid fps (ADR-0023).
+    ResetRatchet,
     Resized {
         width: f32,
         height: f32,
@@ -353,6 +355,12 @@ impl App {
                 }
             }
 
+            Message::ResetRatchet => {
+                if let Some(t) = &mut self.transport {
+                    t.reset_ratchet();
+                }
+            }
+
             Message::Resized { width, height } => {
                 self.win_w = width;
                 self.win_h = height;
@@ -426,8 +434,14 @@ impl App {
         } else {
             "▶  Play"
         };
-        let chrome =
-            container(row![button(play_label).on_press(Message::TogglePlay)].spacing(8)).padding(8);
+        let chrome = container(
+            row![
+                button(play_label).on_press(Message::TogglePlay),
+                button("↺  Reset Rate").on_press(Message::ResetRatchet),
+            ]
+            .spacing(8),
+        )
+        .padding(8);
 
         column![video_area, chrome].into()
     }
@@ -816,6 +830,7 @@ fn try_init(
                 scene.grid.height,
                 scene.grid.fps,
                 s.uri.as_deref(),
+                s.extra_args.clone(),
             ) {
                 eprintln!("[app] failed to spawn adapter for '{}': {e}", s.id);
             } else {

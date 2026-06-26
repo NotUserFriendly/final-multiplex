@@ -1,0 +1,30 @@
+# Gate 1 validation scene — mid-session ratchet (Phase 2.3 / ADR-0023).
+#
+# Starts at 30 fps. The dummy source bumps its vcaps to 60 fps after 20 s
+# of PLAYING, exercising the ratchet on a compositor already running steady.
+# The FNAF2 clip (~24 fps) provides a second tile so the mix is visually live.
+#
+# Expected: output fps ratchets 30 → 60 in the session log at ~t+20s.
+# After the bump, 60 fps holds for the rest of the session (monotonic).
+
+[grid]
+columns                    = 2
+width                      = 1920
+height                     = 1080
+fps                        = 30
+adapter_ready_timeout_secs = 15
+
+[[source]]
+id          = "steady"
+source_type = "external"
+adapter     = "fm-dummy-adapter"
+extra_args  = ["--bump-fps-after", "20", "--bump-fps-to", "60"]
+volume      = 0.3
+muted = true
+
+[[source]]
+id        = "fnaf2"
+uri       = "file:///home/locad/Desktop/FNAF2-cropped.mkv"
+volume    = 0.3
+offset_ms = 0
+muted     = true

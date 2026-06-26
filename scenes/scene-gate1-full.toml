@@ -1,5 +1,6 @@
-# Mixed-source test scene: 2 RTSP cameras + 2 local files in a 2×2 grid.
-# Run with: final-multiplex scene-mixed.toml
+# Gate 1 full validation — mid-session ratchet with all source types.
+# dummy + fnaf2 (file) + cam-27 + cam-77 (RTSP), 2×2 grid.
+# Dummy bumps from 30 → 60 fps after 20 s of PLAYING.
 
 [grid]
 columns                    = 2
@@ -7,6 +8,21 @@ width                      = 1920
 height                     = 1080
 fps                        = 30
 adapter_ready_timeout_secs = 45
+
+[[source]]
+id          = "steady"
+source_type = "external"
+adapter     = "fm-dummy-adapter"
+extra_args  = ["--bump-fps-after", "20", "--bump-fps-to", "60"]
+volume      = 0.3
+muted       = true
+
+[[source]]
+id        = "fnaf2"
+uri       = "file:///home/locad/Desktop/FNAF2-cropped.mkv"
+volume    = 0.3
+offset_ms = 0
+muted     = true
 
 [[source]]
 id          = "cam-27"
@@ -23,16 +39,3 @@ adapter     = "fm-rtsp-adapter"
 uri         = "rtsp://monitor:QaUUk02YUO2zZ@10.0.0.77/Preview_01_main"
 volume      = 0.4
 offset_ms   = 0
-
-[[source]]
-id        = "fnaf2"
-uri       = "file:///home/locad/Desktop/FNAF2-cropped.mkv"
-volume    = 0.5
-offset_ms = 1000
-muted = true
-
-[[source]]
-id        = "apo"
-uri       = "file:///home/locad/Downloads/xx-x-apo-xx-x-pro.mp4"
-volume    = 0.5
-offset_ms = 0

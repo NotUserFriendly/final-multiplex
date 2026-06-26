@@ -147,6 +147,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let no_frames = args.contains_key("no-frames");
+    let bump_fps_after_secs: Option<u64> = args.get("bump-fps-after").and_then(|v| v.parse().ok());
+    let bump_fps_to: Option<i32> = args.get("bump-fps-to").and_then(|v| v.parse().ok());
 
     if no_frames {
         eprintln!("[dummy-adapter] --no-frames mode: sockets open but no frames produced");
@@ -237,6 +239,8 @@ fn main() {
     let mut ingest_state = IngestState::Idle;
     let mut prev_frames: u64 = 0;
     let mut events_injected = false;
+    let mut play_started_at: Option<Instant> = None;
+    let mut bump_fired = false;
 
     loop {
         // Process pending commands.
@@ -249,6 +253,7 @@ fn main() {
                     } else {
                         pipeline.set_state(gstreamer::State::Playing).unwrap();
                         ingest_state = IngestState::Running;
+                        play_started_at = Some(Instant::now());
                         eprintln!("[dummy-adapter] Play");
                     }
                 }
@@ -283,6 +288,26 @@ fn main() {
                     inject_decodebin3_events(&source_id, &vcaps, &acaps);
                 }
                 _ => {}
+            }
+        }
+
+        // Mid-session fps bump (--bump-fps-after / --bump-fps-to).
+        if !bump_fired {
+            if let (Some(after_secs), Some(to_fps), Some(started)) =
+                (bump_fps_after_secs, bump_fps_to, play_started_at)
+            {
+                if started.elapsed() >= Duration::from_secs(after_secs) {
+                    let new_caps = gstreamer::Caps::builder("video/x-raw")
+                        .field("format", "RGBA")
+                        .field("width", width)
+                        .field("height", height)
+                        .field("framerate", gstreamer::Fraction::new(to_fps, 1))
+                        .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
+                        .build();
+                    vcaps.set_property("caps", &new_caps);
+                    eprintln!("[dummy-adapter] rate bump: {fps} → {to_fps} fps");
+                    bump_fired = true;
+                }
             }
         }
 

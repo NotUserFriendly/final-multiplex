@@ -122,6 +122,11 @@ pub struct SourceConfig {
     /// mute state survives app restarts.
     #[serde(default)]
     pub muted: bool,
+    /// Extra command-line arguments appended verbatim to the adapter's argv.
+    /// Useful for test flags (e.g. `["--bump-fps-after", "20", "--bump-fps-to", "60"]`).
+    /// Ignored for file sources.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_volume() -> f64 {

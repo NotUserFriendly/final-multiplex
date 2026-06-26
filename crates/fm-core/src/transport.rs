@@ -3,7 +3,12 @@ use crate::pipeline::Pipeline;
 use fm_adapter_sdk::metrics::DB_FLOOR;
 use gstreamer::prelude::*;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Measured-fallback rates are not counted toward the ratchet until the source
+/// has been delivering continuously for this long.  Guards against startup /
+/// reconnect burst inflation (jitter-buffer drain, decode flush).
+const SETTLE_WINDOW: Duration = Duration::from_millis(1000);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -78,6 +83,13 @@ pub struct Transport {
     source_bounds: HashMap<String, SourceBounds>,
     /// Output framerate ratchet (ADR-0023).
     ratchet: FramerateRatchet,
+    /// Per-source settle timers for the measured-fallback ratchet path.
+    ///
+    /// Entry is inserted when a source's fps_in first becomes non-zero; removed
+    /// when fps_in drops back to zero (source disconnected / not yet delivering).
+    /// A source whose entry age is below SETTLE_WINDOW is excluded from the
+    /// measured-fallback ratchet contribution for that poll cycle.
+    settle_timers: HashMap<String, Instant>,
 }
 
 impl Transport {
@@ -87,6 +99,7 @@ impl Transport {
             pipeline,
             source_bounds: HashMap::new(),
             ratchet: FramerateRatchet::new(initial_fps),
+            settle_timers: HashMap::new(),
         }
     }
 
@@ -205,8 +218,21 @@ impl Transport {
                     // Measured fallback: use fps_in from the metrics snapshot.
                     let measured = metrics.snapshot(id).fps_in;
                     if measured > 0.0 {
+                        // Record when this source first started delivering in the
+                        // current run; clear the entry when delivery stops so the
+                        // window resets on reconnect.
+                        let started = self
+                            .settle_timers
+                            .entry(id.clone())
+                            .or_insert_with(Instant::now);
+                        if started.elapsed() < SETTLE_WINDOW {
+                            // Still in the startup/reconnect burst window; skip.
+                            continue;
+                        }
                         (measured.round() as i32, false)
                     } else {
+                        // Delivery stopped; reset settle timer for next run.
+                        self.settle_timers.remove(id);
                         continue;
                     }
                 }
@@ -224,9 +250,13 @@ impl Transport {
         }
     }
 
-    /// Reset the ratchet to the configured grid fps (call on scene reload).
+    /// Reset the ratchet to the configured grid fps (call on scene reload or manual reset).
+    ///
+    /// Clears settle timers so re-discovery runs through the settle window —
+    /// a reset immediately after a burst won't re-lock the false high.
     pub fn reset_ratchet(&mut self) {
         self.ratchet = FramerateRatchet::new(self.pipeline.grid_fps());
+        self.settle_timers.clear();
     }
 
     /// Reset shmsrc elements for a restarted external source so they

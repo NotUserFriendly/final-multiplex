@@ -124,6 +124,8 @@ struct LaunchSpec {
     /// Source URI delivered to the adapter via Configure on stdin (ADR-0014).
     /// Never passed as argv so credentials do not appear in process listings.
     uri: Option<String>,
+    /// Extra argv tokens appended after the standard args (from SourceConfig::extra_args).
+    extra_args: Vec<String>,
 }
 
 struct LiveHandle {
@@ -248,6 +250,7 @@ impl Supervisor {
         prod_h: u32,
         fps: u32,
         uri: Option<&str>,
+        extra_args: Vec<String>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let resolved = adapter_resolver::resolve(binary, self.adapter_dir.as_deref())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
@@ -265,6 +268,7 @@ impl Supervisor {
             framerate: fps,
             base_time_ns: net.base_time_ns,
             uri: uri.map(|s| s.to_string()),
+            extra_args,
         };
         self.specs.insert(source_id.to_string(), spec.clone());
         self.do_spawn(spec, 0)
@@ -634,6 +638,7 @@ impl Supervisor {
         ];
         let mut child = StdCommand::new(&spec.binary)
             .args(&argv)
+            .args(&spec.extra_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

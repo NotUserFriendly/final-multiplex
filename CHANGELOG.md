@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-26
+
 ### Added
 - **`bad_frames` shown in per-source stats:** the stats line now displays
   `drop N  bad N` alongside the fps readings.  For live (RTSP) sources both

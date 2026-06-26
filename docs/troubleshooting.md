@@ -25,6 +25,73 @@ Format. One section per bug. Under it: Attempt N — Hypothesis / Action / Resul
 
 ---
 
+## Phase 2.3 validation log (native framerate + output ratchet)
+
+### Gate 1 — Mid-session ratchet without freeze
+
+**Test mechanism:** Added `--bump-fps-after SECS --bump-fps-to FPS` to
+`fm-dummy-adapter` (live caps change on `vcaps` capsfilter mid-session) and
+`extra_args: Vec<String>` passthrough to `SourceConfig`/`LaunchSpec` so scene
+TOMLs can inject arbitrary adapter args. Two runs:
+
+**Run 1 — dummy + FNAF2 (2 sources, `scene-gate1.toml`):**
+- Mix started at 30 fps (scene configured). FNAF2 declared 50 fps caps at startup →
+  ratchet fired immediately to 50. Dummy bumped to 60 fps at t+20 s →
+  second ratchet fired: 50 → 60. Two-step escalation in a single session.
+- Maintainer confirmed: no freeze, no multi-second stall; fps_out showing ~60 for all
+  sources after the bump.
+
+**Run 2 — dummy + FNAF2 + cam-27 + cam-77 (4 sources, `scene-gate1-full.toml`):**
+- Same two-step ratchet sequence (30→50 at startup from FNAF2, 50→60 at t+20 s from
+  dummy bump) with all four source types live simultaneously.
+- Maintainer confirmed: fps ramped smoothly, no freeze across any tile during the
+  mid-session 50→60 transition.
+
+**Gate 1 result: PASS.** Live capsfilter renegotiation on a running compositor is
+stable. The monotonic high-water mark holds after the bump.
+
+---
+
+### Gate 2 — Offset at 60 fps + reconnect
+
+**Test scene:** `scene-gate2.toml` — single 60 fps dummy source, 1×1 grid,
+`live_offset_ceiling_ms = 2000`.
+
+**Pre-reconnect (buffer-sizing gate):**
+- Offset exercised: 0 → +1500 ms → 0 → +2000 ms → +1500 ms, held 10 s at +1500 ms.
+- Canary was **silent** throughout. No run-dry, no glitch, no drift.
+- This confirms the time-based `voff_q` (`max-size-buffers=0`, bounded by
+  `max-size-time = ceiling_ns`) is correctly sized at 60 fps for offsets up to the
+  2000 ms ceiling. The old frame-count formula (`ceiling_ms * grid_fps / 1000 + 4`)
+  would have sized for 30 fps and run dry at ~1280 ms.
+
+**Post-reconnect (Kill + Reboot):**
+- Canary fired immediately after the restarted adapter reached PLAYING:
+
+  ```
+  [dummy-adapter] WARNING: clock sync timed out
+  [reconnect-pts] 'fast' first_pts=Some(0:00:00.000000000) pipeline_running=Some(0:05:32.272849118)
+  [offset-canary] WARN 'fast' expected 1500ms got 334772ms (deviation 333272ms tolerance 150ms)
+  ```
+
+- Root cause: `NetClientClock::wait_for_sync(5 s)` timed out on the restarted adapter
+  instance. With a bad clock, the adapter's videotestsrc produced frames at PTS ≈ 0
+  instead of pipeline running time (~332 s). `reconnect-pts` added the full
+  `pipeline_running` as a PTS-zero compensation, resulting in a pad offset of
+  ~333772 ms instead of the intended 1500 ms.
+- This failure is **framerate-independent** — it would occur identically at 30 fps.
+  It is a pre-existing bug in the dummy adapter reconnect path, not a Phase 2.3
+  regression. Real RTSP cameras are unaffected (they use a source-internal clock, not
+  the shared net clock).
+- Source also showed frozen video and pegged VU meter after the bad reconnect, consistent
+  with frames arriving with PTS misaligned relative to the pipeline's running time.
+
+**Gate 2 result: PARTIAL.** Buffer-sizing half PASS; reconnect half FAIL (pre-existing
+dummy-adapter clock-sync bug, not a Phase 2.3 regression). See BUGS.md for the deferred
+entry.
+
+---
+
 ## Phase 2.2 session log (Blocks 2–5 implementation + bugs found during validation)
 
 ### Block 2 — RTSP metrics (fps_in, bad_frames, windowed rates)

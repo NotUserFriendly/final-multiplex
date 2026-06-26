@@ -28,6 +28,10 @@ struct SourceRow {
     signal_lost: bool,
     /// File source: set once the first frame has arrived; used to gate FILE TERMINATED.
     has_ever_had_frames: bool,
+    /// Reboot or Kill pressed and still in progress; disables both buttons.
+    transitioning: bool,
+    /// Kill-button cooldown: disabled until this instant to prevent spam.
+    kill_cooldown_until: Option<Instant>,
 }
 
 pub struct App {
@@ -82,6 +86,10 @@ pub enum Message {
     },
     /// Reboot button: graceful teardown → respawn for an external source.
     Reboot {
+        index: usize,
+    },
+    /// Kill button: graceful teardown → no respawn; tile stays dead until Reboot.
+    Kill {
         index: usize,
     },
     Resized {
@@ -160,14 +168,27 @@ impl App {
                         .map(|sup| sup.status_handle().lock().unwrap().clone());
                     for (i, src) in self.sources.iter_mut().enumerate() {
                         if src.is_external {
-                            src.signal_lost = status_snap
-                                .as_ref()
-                                .and_then(|s| s.get(&src.id))
+                            let adapter = status_snap.as_ref().and_then(|s| s.get(&src.id));
+                            src.signal_lost = adapter
                                 .map(|a| {
                                     a.state != fm_core::supervisor::AdapterState::Running
                                         || a.is_reconnecting
                                 })
                                 .unwrap_or(false);
+                            // Clear transitioning once adapter reaches a stable state.
+                            if src.transitioning {
+                                src.transitioning = adapter
+                                    .map(|a| {
+                                        a.state == fm_core::supervisor::AdapterState::Starting
+                                            || a.state
+                                                == fm_core::supervisor::AdapterState::Restarting
+                                    })
+                                    .unwrap_or(false);
+                            }
+                            // Expire kill cooldown.
+                            if matches!(src.kill_cooldown_until, Some(t) if Instant::now() >= t) {
+                                src.kill_cooldown_until = None;
+                            }
                         } else {
                             let fps_in =
                                 self.source_metrics.get(i).map(|m| m.fps_in).unwrap_or(0.0);
@@ -302,9 +323,20 @@ impl App {
             }
 
             Message::Reboot { index } => {
-                if let Some(src) = self.sources.get(index) {
+                if let Some(src) = self.sources.get_mut(index) {
+                    src.transitioning = true;
                     if let Some(sup) = &mut self.supervisor {
                         sup.request_reboot(&src.id.clone());
+                    }
+                }
+            }
+
+            Message::Kill { index } => {
+                if let Some(src) = self.sources.get_mut(index) {
+                    src.transitioning = true;
+                    src.kill_cooldown_until = Some(Instant::now() + Duration::from_secs(5));
+                    if let Some(sup) = &mut self.supervisor {
+                        sup.request_kill(&src.id.clone());
                     }
                 }
             }
@@ -518,11 +550,20 @@ impl App {
         .align_y(iced::alignment::Vertical::Center);
 
         let reboot_row: Option<Element<Message>> = if src.is_external {
-            Some(
-                button("⟳ Reboot")
-                    .on_press(Message::Reboot { index: i })
-                    .into(),
-            )
+            let reboot_btn = button("⟳ Reboot");
+            let kill_btn = button("✕ Kill");
+            let kill_locked = src.transitioning || src.kill_cooldown_until.is_some();
+            let (reboot_btn, kill_btn) = if src.transitioning {
+                (reboot_btn, kill_btn)
+            } else if kill_locked {
+                (reboot_btn.on_press(Message::Reboot { index: i }), kill_btn)
+            } else {
+                (
+                    reboot_btn.on_press(Message::Reboot { index: i }),
+                    kill_btn.on_press(Message::Kill { index: i }),
+                )
+            };
+            Some(row![reboot_btn, kill_btn].spacing(4).into())
         } else {
             None
         };
@@ -714,6 +755,8 @@ fn try_init(
             is_external: s.source_type == fm_core::config::SourceType::External,
             signal_lost: false,
             has_ever_had_frames: false,
+            transitioning: false,
+            kill_cooldown_until: None,
         })
         .collect();
 

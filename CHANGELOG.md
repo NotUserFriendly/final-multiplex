@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Kill button for external sources:** each external-source tile now has a
+  "✕ Kill" button alongside "⟳ Reboot".  Kill sends a graceful `Shutdown`
+  command (force-kills after `TEARDOWN_WINDOW_SECS` if the adapter doesn't
+  exit cleanly) and permanently suppresses respawn — the tile stays dead with
+  SIGNAL LOST until the operator clicks Reboot.  Both buttons are disabled
+  while a kill or reboot is in flight; Kill has an additional 5-second
+  cooldown after it re-enables to prevent rapid re-triggering.
 - **Mute state in scene config:** `SourceConfig` now has a `muted: bool` field
   (defaults to `false`).  The mute button reflects the scene's initial mute state
   on launch, and every toggle is persisted back to the scene TOML (same debounced

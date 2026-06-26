@@ -53,6 +53,8 @@ pub enum AdapterState {
     /// Waiting for the backoff delay to expire before the next spawn attempt.
     Restarting,
     Failed,
+    /// Manually killed via the Kill button; will not be respawned until Reboot.
+    Stopped,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,8 @@ pub struct Supervisor {
     /// Scene-level adapter dir override (ADR-0022 tier 1).  None = use the
     /// normal search path (FM_ADAPTER_DIR → XDG user dir → bundled).
     adapter_dir: Option<String>,
+    /// Source IDs that were manually killed; skips respawn on next reap.
+    killed: std::collections::HashSet<String>,
 }
 
 impl Supervisor {
@@ -183,6 +187,7 @@ impl Supervisor {
             playing: Arc::new(Mutex::new(false)),
             delivery_watchdog_ms: 30_000,
             adapter_dir: None,
+            killed: std::collections::HashSet::new(),
         }
     }
 
@@ -304,6 +309,17 @@ impl Supervisor {
         // ── Phase 2: process reaps → schedule restarts ────────────────────────
         for (id, ran_for, _was_teardown) in to_reap {
             self.live.remove(&id);
+
+            // Manual kill: mark Stopped and skip respawn entirely.
+            if self.killed.remove(&id) {
+                let mut s = self.status.lock().unwrap();
+                if let Some(a) = s.get_mut(&id) {
+                    a.state = AdapterState::Stopped;
+                    a.is_reconnecting = false;
+                }
+                eprintln!("[supervisor] '{id}' stopped (manual kill)");
+                continue;
+            }
 
             if ran_for >= Duration::from_secs(HEALTHY_RUN_SECS) {
                 eprintln!(
@@ -474,6 +490,49 @@ impl Supervisor {
     /// re-applied by `add_video/audio_chain` on the next `StreamsChanged` event.
     pub fn request_reboot(&mut self, source_id: &str) {
         eprintln!("[supervisor] '{source_id}': manual reboot requested");
+        self.killed.remove(source_id);
+        if self.live.contains_key(source_id) {
+            // Running: graceful teardown; the reap loop will schedule a respawn.
+            self.graceful_shutdown_live(source_id);
+        } else if !self.pending.contains_key(source_id) {
+            // Stopped or crashed with no pending restart: schedule immediate respawn.
+            if let Some(spec) = self.specs.get(source_id).cloned() {
+                let attempt = self
+                    .status
+                    .lock()
+                    .unwrap()
+                    .get(source_id)
+                    .map(|a| a.restart_count as usize)
+                    .unwrap_or(0);
+                {
+                    let mut s = self.status.lock().unwrap();
+                    if let Some(a) = s.get_mut(source_id) {
+                        a.state = AdapterState::Restarting;
+                        a.is_reconnecting = false;
+                    }
+                }
+                self.pending.insert(
+                    source_id.to_string(),
+                    PendingRestart {
+                        spec,
+                        retry_at: Instant::now(),
+                        attempt,
+                    },
+                );
+                eprintln!("[supervisor] '{source_id}': scheduling immediate respawn");
+            }
+        }
+        // If already pending (backoff window), it will respawn naturally.
+    }
+
+    /// Gracefully shut down an adapter and leave it stopped — no respawn.
+    /// The tile shows as dead (gray + border, no SIGNAL LOST overlay).
+    /// Use Reboot to bring a stopped source back.
+    pub fn request_kill(&mut self, source_id: &str) {
+        eprintln!("[supervisor] '{source_id}': manual kill requested");
+        self.killed.insert(source_id.to_string());
+        // Cancel any pending restart scheduled by a prior watchdog/reboot.
+        self.pending.remove(source_id);
         self.graceful_shutdown_live(source_id);
     }
 

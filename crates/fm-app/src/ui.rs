@@ -586,19 +586,7 @@ impl App {
             .align_x(iced::alignment::Horizontal::Left)
             .align_y(iced::alignment::Vertical::Bottom);
 
-        // Border always present — delineates tiles; visually absorbed by live
-        // video content, visible against the gray floor when a tile is dead.
-        let tile_border = |_: &iced::Theme| container::Style {
-            border: iced::Border {
-                color: Color::from_rgb(1.0, 1.0, 1.0),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        };
-
         container(stack([controls_layer.into(), state_layer]))
-            .style(tile_border)
             .width(Length::FillPortion(1))
             .height(Length::Fill)
             .into()

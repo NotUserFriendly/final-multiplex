@@ -60,7 +60,11 @@ fn main() -> iced::Result {
     // Pre-read config just to size the window; the full build happens in boot().
     let initial_size = fm_core::config::load(std::path::Path::new(&config_path))
         .map(|scene| {
-            let ar = scene.grid.width as f32 / scene.grid.height as f32;
+            let n = scene.source.len() as u32;
+            let cols = scene.grid.columns.max(1).min(n.max(1));
+            let rows = (n.max(1) + cols - 1) / cols;
+            let ar =
+                (cols as f32 * scene.grid.width as f32) / (rows as f32 * scene.grid.height as f32);
             let w = 1280.0f32;
             iced::Size::new(w, (w / ar).round() + ui::CHROME_H)
         })

@@ -363,10 +363,11 @@ impl Pipeline {
         let black_src: gstreamer::Element = gstreamer::ElementFactory::make("videotestsrc")
             .name("black_src")
             .build()?;
-        // ~25% gray (ARGB 0xFF404040) so empty tiles and letterbox bars are
-        // visually distinct from actual black content (ADR-0018 floor, appearance only).
+        // White floor (zorder=0) covers the full canvas.  Per-cell gray insets
+        // at zorder=1 sit inside it; the white shows as a border only on dead
+        // tiles (video at zorder=2 covers both when the source is live).
         black_src.set_property_from_str("pattern", "solid-color");
-        black_src.set_property("foreground-color", 0xFF404040u32);
+        black_src.set_property("foreground-color", 0xFFFFFFFFu32);
         black_src.set_property("is-live", true);
         let black_caps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
             .name("black_caps")
@@ -464,6 +465,46 @@ impl Pipeline {
                 },
             );
 
+            // zorder=1 gray inset — ~25% gray inset inside the white floor.
+            // Visible only when the source is dead (video at zorder=2 covers it).
+            // border_w controls the white frame thickness on a dead tile.
+            const BORDER_W: i32 = 4;
+            {
+                let gi = gstreamer::ElementFactory::make("videotestsrc")
+                    .name(format!("gray_{}", source.id))
+                    .build()?;
+                gi.set_property_from_str("pattern", "solid-color");
+                gi.set_property("foreground-color", 0xFF404040u32);
+                gi.set_property("is-live", true);
+                let gi_caps = gstreamer::ElementFactory::make("capsfilter")
+                    .name(format!("gray_caps_{}", source.id))
+                    .build()?;
+                gi_caps.set_property(
+                    "caps",
+                    &gstreamer::Caps::builder("video/x-raw")
+                        .field("format", "RGBA")
+                        .field("width", tile_w - 2 * BORDER_W)
+                        .field("height", tile_h - 2 * BORDER_W)
+                        .field("framerate", gstreamer::Fraction::new(grid_fps, 1))
+                        .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
+                        .build(),
+                );
+                pipeline.add_many([&gi, &gi_caps])?;
+                gstreamer::Element::link_many([&gi, &gi_caps])?;
+                let gi_sink = compositor
+                    .request_pad_simple("sink_%u")
+                    .ok_or("compositor: could not request gray inset sink pad")?;
+                gi_sink.set_property("zorder", 1u32);
+                gi_sink.set_property("xpos", xpos + BORDER_W);
+                gi_sink.set_property("ypos", ypos + BORDER_W);
+                gi_sink.set_property("width", tile_w - 2 * BORDER_W);
+                gi_sink.set_property("height", tile_h - 2 * BORDER_W);
+                gi_caps
+                    .static_pad("src")
+                    .ok_or("gray_caps: no src pad")?
+                    .link(&gi_sink)?;
+            }
+
             if !has_video && !has_audio {
                 eprintln!(
                     "[fm-core] skipping source '{}' — no usable streams (corrupt or empty)",
@@ -507,6 +548,7 @@ impl Pipeline {
                 let comp_sink = compositor
                     .request_pad_simple("sink_%u")
                     .ok_or("could not request compositor sink pad")?;
+                comp_sink.set_property("zorder", 2u32);
                 comp_sink.set_property("xpos", xpos);
                 comp_sink.set_property("ypos", ypos);
                 comp_sink.set_property("width", tile_w);
@@ -925,6 +967,7 @@ impl Pipeline {
         let comp_sink = compositor
             .request_pad_simple("sink_%u")
             .ok_or("compositor: no sink pad")?;
+        comp_sink.set_property("zorder", 2u32);
         comp_sink.set_property("xpos", layout.xpos);
         comp_sink.set_property("ypos", layout.ypos);
         comp_sink.set_property("width", layout.tile_w);

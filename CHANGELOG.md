@@ -12,10 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the existing supervisor path.  Offset and mute survive the reboot (stored
   in `source_layouts`, re-applied by `add_video/audio_chain` on reconnect).
 - **Tile chrome + state overlays (Block 4):**
-  - Floor background changed from black to ~25% gray (`solid-color` pattern,
-    ARGB `0xFF404040`) so empty tiles, letterbox bars, and black frames are
-    visually distinct.
-  - Each tile cell now has a 1-pixel white border drawn in the overlay layer.
+  - Each compositor cell now has three base layers: white fill at zorder 0
+    (full cell), ~25% gray inset at zorder 1 (4 px inside each edge), and
+    video at zorder 2 (full cell).  When a source is live the video covers
+    both layers entirely — no white or gray is visible.  When a source is
+    dead the gray tile with white border is exposed in the compositor output,
+    so it appears in captured/streamed frames, not only in the live UI.
   - **SIGNAL LOST** overlay (50% translucent black, white text, centered)
     appears when an external source's adapter is reconnecting, restarting, or
     in a failed state.
@@ -26,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scene.grid.width`/`height` are now per-tile dimensions; the compositor
   canvas is computed as `columns × width` × `rows × height`.  A 2×1 grid
   of 1920×1080 tiles now produces a 3840×1080 (32:9) canvas instead of
-  distorting each tile into 960×1080 (8:9).
+  distorting each tile into 960×1080 (8:9).  The initial window size is now
+  also derived from the canvas aspect ratio, so a 2×1 scene opens at 32:9
+  rather than 16:9.
 - **Overlay clamped to tile bounds:** the per-source control box now clips
   to its tile so it cannot paint outside the tile boundary at any grid size
   or aspect ratio.

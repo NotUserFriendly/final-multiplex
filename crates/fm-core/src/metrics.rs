@@ -91,58 +91,54 @@ pub struct MetricsCollector {
     per_source: Arc<Mutex<HashMap<String, SourceCounter>>>,
     output: Arc<Mutex<OutputCounter>>,
     audio_levels: AudioStore,
-    /// Stale threshold for fps_in: 1500 ms + compositor latency.  Ensures
-    /// FILE TERMINATED fires only after buffered frames have cleared the
-    /// compositor, not while the last frames are still in the latency window.
+    /// Slow stale threshold: compositor_latency_ms + 300 ms.  Used for
+    /// stream_drained — "source stopped AND downstream buffer cleared."
+    /// fps_in uses a separate fast window (500 ms constant) for display.
     fps_stale_ms: u64,
 }
 
 impl MetricsCollector {
+    /// Install BUFFER + QoS probes on a single source's video_src pad.
+    /// Called by `attach()` for initial sources and by `attach_source()` on reconnect.
+    fn install_video_probe(&self, source_id: &str, video_src: &gstreamer::Pad) {
+        let counters = self.per_source.clone();
+        let id_clone = source_id.to_string();
+        video_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, _info| {
+            counters
+                .lock()
+                .unwrap()
+                .entry(id_clone.clone())
+                .or_insert_with(SourceCounter::new)
+                .on_buffer();
+            gstreamer::PadProbeReturn::Ok
+        });
+
+        let counters_qos = self.per_source.clone();
+        let id_qos = source_id.to_string();
+        video_src.add_probe(
+            gstreamer::PadProbeType::EVENT_UPSTREAM,
+            move |_pad, info| {
+                if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
+                    if ev.type_() == gstreamer::EventType::Qos {
+                        counters_qos
+                            .lock()
+                            .unwrap()
+                            .entry(id_qos.clone())
+                            .or_insert_with(SourceCounter::new)
+                            .dropped += 1;
+                    }
+                }
+                gstreamer::PadProbeReturn::Ok
+            },
+        );
+    }
+
     /// Install pad probes and return a collector ready to be polled.
     /// Must be called before `Transport::new` consumes the `Pipeline`.
     pub fn attach(pipeline: &Pipeline) -> Self {
         let per_source: Arc<Mutex<HashMap<String, SourceCounter>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let output: Arc<Mutex<OutputCounter>> = Arc::new(Mutex::new(OutputCounter::new()));
-
-        // ── fps_in: capsfilter src pad BUFFER probes (post-scale, pre-compositor) ──
-        for (id, pads) in pipeline.source_pads() {
-            let counters = per_source.clone();
-            let id_clone = id.clone();
-
-            if let Some(ref video_src) = pads.video_src {
-                video_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, _info| {
-                    counters
-                        .lock()
-                        .unwrap()
-                        .entry(id_clone.clone())
-                        .or_insert_with(SourceCounter::new)
-                        .on_buffer();
-                    gstreamer::PadProbeReturn::Ok
-                });
-
-                // ── dropped_frames: QoS events travelling upstream ─────────────
-                let counters_qos = per_source.clone();
-                let id_qos = id.clone();
-
-                video_src.add_probe(
-                    gstreamer::PadProbeType::EVENT_UPSTREAM,
-                    move |_pad, info| {
-                        if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
-                            if ev.type_() == gstreamer::EventType::Qos {
-                                counters_qos
-                                    .lock()
-                                    .unwrap()
-                                    .entry(id_qos.clone())
-                                    .or_insert_with(SourceCounter::new)
-                                    .dropped += 1;
-                            }
-                        }
-                        gstreamer::PadProbeReturn::Ok
-                    },
-                );
-            } // end if let Some(video_src)
-        }
 
         // ── fps_out: appsink sink pad BUFFER probe ─────────────────────────
         if let Some(sink_pad) = pipeline.appsink().static_pad("sink") {
@@ -156,11 +152,33 @@ impl MetricsCollector {
         let audio_levels: AudioStore = Arc::new(Mutex::new(HashMap::new()));
         let fps_stale_ms = pipeline.compositor_latency_ms() as u64 + 300;
 
-        Self {
+        let collector = Self {
             per_source,
             output,
             audio_levels,
             fps_stale_ms,
+        };
+
+        // ── fps_in: capsfilter src pad probes (post-scale, pre-compositor) ──
+        // File sources are present at build time; external source pads are added
+        // dynamically on StreamsChanged — use attach_source() for those.
+        for (id, pads) in pipeline.source_pads() {
+            if let Some(ref video_src) = pads.video_src {
+                collector.install_video_probe(id, video_src);
+            }
+        }
+
+        collector
+    }
+
+    /// Install fps_in probes for one source after its chain is (re)built.
+    /// Call this from the StreamsChanged handler after apply_streams_changed()
+    /// so reconnected external sources report fps_in correctly.
+    pub fn attach_source(&self, source_id: &str, pipeline: &Pipeline) {
+        if let Some(pads) = pipeline.source_pads().get(source_id) {
+            if let Some(ref video_src) = pads.video_src {
+                self.install_video_probe(source_id, video_src);
+            }
         }
     }
 
@@ -175,22 +193,25 @@ impl MetricsCollector {
         let out = self.output.lock().unwrap();
         let audio = self.audio_levels.lock().unwrap();
 
-        // Report fps_in as 0 once no buffer has arrived for fps_stale_ms.
-        // fps_stale_ms = compositor_latency_ms + 1500 so the stale window
-        // covers the compositor's latency buffer; without this, FILE TERMINATED
-        // fires while the last frames are still being displayed from the buffer.
-        let stale_fps = std::time::Duration::from_millis(self.fps_stale_ms);
-        let (fps_in, dropped) = per
+        // Two staleness windows, two jobs:
+        //
+        // Fast (~500 ms): fps_in for the stats display.  Should react within a
+        // few frame intervals so the UI shows 0 quickly when a source stalls.
+        //
+        // Slow (compositor_latency_ms + 300 ms): stream_drained for FILE TERMINATED.
+        // Must cover the compositor's latency buffer so the overlay fires only after
+        // the last buffered frame has been displayed, not while it is still on screen.
+        let fast_stale = std::time::Duration::from_millis(500);
+        let slow_stale = std::time::Duration::from_millis(self.fps_stale_ms);
+        let (fps_in, dropped, stream_drained) = per
             .get(source_id)
             .map(|c| {
-                let fps = if c.last_frame_at.elapsed() > stale_fps {
-                    0.0
-                } else {
-                    c.fps
-                };
-                (fps, c.dropped)
+                let elapsed = c.last_frame_at.elapsed();
+                let fps = if elapsed > fast_stale { 0.0 } else { c.fps };
+                let drained = elapsed > slow_stale;
+                (fps, c.dropped, drained)
             })
-            .unwrap_or((0.0, 0));
+            .unwrap_or((0.0, 0, false));
 
         // Floor the meter if no level message has arrived in the last 300 ms
         // (3× the 100 ms default level interval).  This handles individual
@@ -214,6 +235,7 @@ impl MetricsCollector {
             reconnect_count: 0,
             audio_rms_db,
             audio_peak_db,
+            stream_drained,
         }
     }
 }

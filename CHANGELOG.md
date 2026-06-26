@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`bad_frames` shown in per-source stats:** the stats line now displays
+  `drop N  bad N` alongside the fps readings.  For live (RTSP) sources both
+  counts are the rolling 60-second window; for finite sources they are
+  cumulative totals (same windowing scheme as Block 2).
 - **Kill button for external sources:** each external-source tile now has a
   "✕ Kill" button alongside "⟳ Reboot".  Kill sends a graceful `Shutdown`
   command (force-kills after `TEARDOWN_WINDOW_SECS` if the adapter doesn't
@@ -76,7 +80,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run if absent.  `Makefile` targets (`make dev` / `make release`) build the workspace
   and populate `target/{debug,release}/adapters/` so the bundled path resolves in dev.
 
+### Fixed
+- **`fps_in` reads zero after adapter reboot:** `MetricsCollector` installed
+  BUFFER probes once at startup; after reconnect the new `vcaps:src` pad had no
+  probe so `fps_in` stayed 0.  A new `attach_source()` method reinstalls probes
+  on the new pad; called from the `StreamsChanged` handler after each chain rebuild.
+- **Kill after Reboot left source stuck in `Restarting`:** if the adapter exited
+  (normal reap after Reboot teardown) between the Reboot and Kill button presses,
+  `request_kill` found the adapter absent from `live`, so `graceful_shutdown_live`
+  was a no-op and nothing ever transitioned state to `Stopped`.  Buttons stayed
+  locked indefinitely.  `request_kill` now detects the already-dead case and sets
+  `Stopped` immediately.
+
 ### Changed
+- **`fps_in` display is now responsive (~500 ms stale window):** previously
+  `fps_in` used the same slow window as FILE TERMINATED (compositor latency +
+  300 ms, up to ~2.3 s), so the stats display lagged noticeably when a source
+  stalled.  A new fast 500 ms window is used for `fps_in` in the stats.  FILE
+  TERMINATED is now gated on a new `stream_drained` field in `SourceMetrics`
+  which retains the slow window (compositor_latency_ms + 300 ms), preserving
+  the buffer-aware timing that ensures the overlay fires only after the last
+  displayed frame clears.  The two windows are named and documented separately
+  in `metrics.rs`.
 - **Transport seam realized (ADR-0019):** The platform-specific element names
   (`unixfdsink`, `unixfdsrc`) are now behind a single `cfg(target_os = "linux")`
   guard each.  Adapter output: `fm_adapter_sdk::transport::make_output_sink()` in

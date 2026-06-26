@@ -34,6 +34,14 @@ pub struct SourceMetrics {
     pub audio_rms_db: f64,
     /// Current peak level in dBFS (loudest channel). DB_FLOOR when silent or no audio.
     pub audio_peak_db: f64,
+    /// True once `last_frame_at` has been silent for compositor_latency_ms + 300 ms.
+    /// "The source stopped *and* the downstream buffer has drained."
+    /// Used by the UI to gate FILE TERMINATED so the overlay fires only after the
+    /// last buffered frame is actually displayed.  Always false for external sources
+    /// (adapters report their own stream state via `IngestState`).
+    /// Default false so older adapter builds that predate this field still parse.
+    #[serde(default)]
+    pub stream_drained: bool,
 }
 
 impl Default for SourceMetrics {
@@ -49,6 +57,7 @@ impl Default for SourceMetrics {
             reconnect_count: 0,
             audio_rms_db: DB_FLOOR,
             audio_peak_db: DB_FLOOR,
+            stream_drained: false,
         }
     }
 }

@@ -306,6 +306,7 @@ fn main() {
                 reconnect_count: 0,
                 audio_rms_db: DB_FLOOR,
                 audio_peak_db: DB_FLOOR,
+                stream_drained: false,
             }));
         }
 

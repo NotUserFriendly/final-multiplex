@@ -28,6 +28,11 @@ Secondary: a corp camera wall on integrated hardware. Linux first, Windows next.
 
 Each phase has a deliverable and an exit criterion. Don't start N+1 until N exits.
 
+> *Provenance: items tagged **[build-out]** were added after this plan's earliest snapshot
+> (mid-Phase-2), as the work surfaced them — not in the original outline. Tracking before that
+> snapshot is imperfect: Phase 1's "Also shipped" extras and Phase 4's fit-mode design notes may
+> also be later additions, but history can't confirm it.*
+
 ### Phase 0 — Scaffold  *(complete)*
 - **Deliverable:** repo, CLAUDE.md, settings.local.json, .gitignore, licenses, ADRs.
 - **Exit:** project builds empty; stack/license/architecture recorded (ADR-0002..0006).
@@ -60,7 +65,7 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 - **Exit:** kill the RTSP process mid-play — the core survives, the tile holds, the
   source auto-recovers, and A/V sync is intact after recovery.
 
-### Phase 2.1 — Recovery hardening  *(complete)*
+### Phase 2.1 — Recovery hardening  *(complete)*  **[build-out]**
 - **Deliverable:** the reconnect/recovery path made solid on real hardware, well beyond
   Phase 2's exit bar. Transport moved from GDP-framed shm to **unixfd** (ADR-0019), carrying
   PTS/caps/events natively, behind a per-platform **transport seam** (SDK output builder +
@@ -78,7 +83,7 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
   tile recovers, offset and mute persist, no respawn loop; the watchdog backstops a stuck
   divergence and stays silent against a genuinely-absent source. Hardware-validated.
 
-### Phase 2.2 — Pre-Phase-3 cleanup
+### Phase 2.2 — Pre-Phase-3 cleanup  **[build-out]**
 - **Deliverable:** close instrumentation and hygiene gaps before a second adapter type.
   - **RTSP metrics:** fix `fps_in` (pinned at 30 — report the *actual* rate); add a
     bad/incomplete-frame counter for RTSP; window dropped + bad over a rolling interval
@@ -98,6 +103,20 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
     RTSP feed (reuses the supervisor respawn the watchdog already drives).
 - **Exit:** metrics read true for live RTSP; adapter launch is deterministic; the UI gaps are
   closed; a flaky feed can be manually rebooted.
+
+### Phase 2.3 — Arbitrary and dynamic framerate  **[build-out]**
+- **Deliverable:** sources compose at their **native** input rates (RTSP 10–35, YouTube/Twitch
+  60, phone/pro cameras 120+) instead of a forced 30. The framerate-dependent code that assumes
+  30 — offset-buffer sizing (`frames = ms × fps`), the offset canary's tolerance (frame period),
+  the fps metrics — is made rate-correct per source.
+- **Output framerate policy (ADR-0023):** a monotonic **ratchet-up high-water mark**. The output
+  fixes to the max input rate seen across active sources and never falls back within a session:
+  15 in → 15 out; a burst to 35 → 35 out; a fall to 24 leaves output at 35. Renegotiates only on
+  a new high, then settles; resets to fresh discovery on scene reload.
+- **Exit:** a mixed-rate scene (10 / 30 / 60 / 120) composes correctly; the output ratchets up to
+  the active max and holds; canary and offset-buffer math use real per-source rates.
+- **Position:** before Phase 3 — YouTube is a 60 fps source, so landing this first means the
+  prototype handles native rates instead of downsampling YouTube to 30 and redoing it later.
 
 ### Phase 3 — YouTube adapter
 - **Deliverable:** yt-dlp resolver subprocess + stream ingest + periodic re-resolve on
@@ -130,10 +149,14 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
   - **Distinct from the Phase-1 UI aspect-lock.** That locks the *whole composited
     output's* display region to the output aspect ratio in the UI (so overlays align).
     This is per-*source* fit *inside the compositor*. Different layer — don't conflate.
+  - **Focus is triggered by double-clicking a source.** **[build-out]** Double-click promotes a
+    source into the focus layout's large tile; double-click again (or an explicit control)
+    returns to equal split. The runtime sink-pad geometry control above is what lets this switch
+    happen without restarting sources. (The broader layout-editing surface is a later phase.)
 
 ### Phase 5 — Manual audio sync (prerecorded)
 - **Deliverable:** visible per-source waveform; drag to align a source against the others;
-  "play all" honors it. There are **two distinct alignment tools here, not one** — keep
+  "play all" honors it. There are **two distinct alignment tools here, not one** **[build-out]** — keep
   them separate:
   - **Sync offset (the Phase-1 pad offset):** shifts *when* a source presents on the
     shared timeline, in small amounts, for A/V alignment. Source-agnostic (a pad offset
@@ -156,7 +179,15 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 ### Later
 Twitch (streamlink), web pages (CEF), ONVIF discovery, text/program-view sources.
 
-**Cross-machine / distributed deployment.** Net-clock calibration fails on supervisor-respawned
+**Interactive layout editing & preset library.** **[build-out]** Direct-manipulation layout:
+click-and-drag a source to reorder it within the grid; an "add column" / "add row" menu to grow
+the grid at runtime. Named layouts saved and restored through the existing scene system
+(ADR-0010) — extend scene persistence from a single layout to a library. Ship a set of **default
+layouts and their focused variants** (equal split, focus-with-thumbnails, etc.) as presets.
+Double-click-to-focus (Phase 4) is the per-source trigger; this is the editing and preset surface
+around it. Fancy UI, post-prototype.
+
+**Cross-machine / distributed deployment.** **[build-out]** Net-clock calibration fails on supervisor-respawned
 adapters (the respawn clock-calibration gap): the system-clock seed (ADR-0005, single-machine) is load-bearing on
 every reconnect and masks it. Single-machine is unaffected — the system clock is the genuine
 shared timebase. Cross-machine deployments cannot rely on the seed. **Trigger:** when core and
@@ -175,7 +206,7 @@ suspected GStreamer child-process clock state).
   this path has not been reproduced or verified since the fix. The Phase-2 process
   boundary makes it moot for out-of-process sources (a dead adapter can't stall the core),
   so revisit only if it surfaces for an in-core source.
-- **Scrub control timing:** the scrub (per-source file seek, symmetric jumps) is slated
+- **Scrub control timing:** **[build-out]** the scrub (per-source file seek, symmetric jumps) is slated
   for Phase 5 alongside the waveform, but the desire for it surfaced in Phase 1 — the
   sync offset's asymmetric feedback (no visible jump when nudging back toward live) reads
   as "nothing happened" to a user expecting an immediate undo. The sync offset is working
@@ -193,16 +224,16 @@ suspected GStreamer child-process clock state).
   the control channel. ADR-0008 says per-source telemetry originates in the adapter, but
   level is a cheap post-decode measurement that's simplest taken at one core-side spot —
   resolve when the Phase-2 contract is concrete.
-- **File offset bound:** files cost nothing to offset (seekable, not real-time), so they do
+- **File offset bound:** **[build-out]** files cost nothing to offset (seekable, not real-time), so they do
   not need the live buffering ceiling (ADR-0016) — but an *unbounded* value invites fat-finger
   errors and offsetting past a clip's own length is meaningless (the source just never overlaps
   the composition window). Recommendation: bound file offset to the **media's duration** where
   known, rather than the live ceiling or infinity. Small ADR-0016 follow-up if adopted; the live
   bound is unchanged.
-- **Per-source volume tag (resolved):** the scene already carries a per-source `volume`
+- **Per-source volume tag (resolved):** **[build-out]** the scene already carries a per-source `volume`
   (default 1.0); `0.0` already produces silence on the audiomixer sink pad, so "0 = mute" holds
   today. Live volume *sliders* remain the separate open question below.
-- **shm bandwidth:** the core scales full-resolution frames per source (ADR-0012
+- **shm bandwidth:** **[build-out — evolved from the original "shm payload" question]** the core scales full-resolution frames per source (ADR-0012
   core-owned resize — adapter produces at full grid resolution, core scales to tile).
   At 1920×1080 @ 30 fps that is ~240 MB/s per source over shared memory.  Acceptable on
   the discrete-GPU target; if it bites on integrated-hardware camera walls, add an

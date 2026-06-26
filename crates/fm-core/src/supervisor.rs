@@ -533,7 +533,22 @@ impl Supervisor {
         self.killed.insert(source_id.to_string());
         // Cancel any pending restart scheduled by a prior watchdog/reboot.
         self.pending.remove(source_id);
-        self.graceful_shutdown_live(source_id);
+
+        if self.live.contains_key(source_id) {
+            // Adapter is running: graceful shutdown, reap loop will see `killed`
+            // and transition state to Stopped.
+            self.graceful_shutdown_live(source_id);
+        } else {
+            // Adapter already dead (exited between Reboot and Kill, or never ran).
+            // Nothing to kill; set Stopped immediately so the UI unlocks.
+            self.killed.remove(source_id);
+            let mut s = self.status.lock().unwrap();
+            if let Some(a) = s.get_mut(source_id) {
+                a.state = AdapterState::Stopped;
+                a.is_reconnecting = false;
+            }
+            eprintln!("[supervisor] '{source_id}' stopped immediately (was already dead)");
+        }
     }
 
     /// Send Play to all live adapters and flip the internal play flag so

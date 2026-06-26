@@ -231,6 +231,11 @@ impl App {
                                     .map(|m| m.fps_in)
                                     .unwrap_or(0.0);
                                 t.apply_streams_changed(&id, has_video, has_audio, fps);
+                                // Reinstall fps_in probe on the new pad so metrics
+                                // survive adapter reconnect / reboot.
+                                if let Some(m) = &self.metrics {
+                                    m.attach_source(&id, t.pipeline());
+                                }
                             }
                         }
                         // Update chain state for the delivery watchdog (ADR-0020).
@@ -471,8 +476,8 @@ impl App {
             .map(|m| {
                 (
                     format!(
-                        "in {:.1} fps  out {:.1} fps  dropped {}",
-                        m.fps_in, m.fps_out, m.dropped_frames
+                        "in {:.1} fps  out {:.1} fps  drop {}  bad {}",
+                        m.fps_in, m.fps_out, m.dropped_frames, m.bad_frames
                     ),
                     m.audio_peak_db,
                 )
@@ -587,9 +592,13 @@ impl App {
             ..Default::default()
         };
         // Determine per-tile display state.
-        let fps_in = self.source_metrics.get(i).map(|m| m.fps_in).unwrap_or(0.0);
+        let stream_drained = self
+            .source_metrics
+            .get(i)
+            .map(|m| m.stream_drained)
+            .unwrap_or(false);
         let file_terminated =
-            !src.is_external && src.has_ever_had_frames && fps_in == 0.0 && self.playing;
+            !src.is_external && src.has_ever_had_frames && stream_drained && self.playing;
         let state_label: Option<&str> = if src.is_external && src.signal_lost {
             Some("SIGNAL LOST")
         } else if file_terminated {

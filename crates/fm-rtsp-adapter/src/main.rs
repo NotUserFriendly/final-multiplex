@@ -648,6 +648,7 @@ fn main() {
                 reconnect_count: rc,
                 audio_rms_db: DB_FLOOR,
                 audio_peak_db: DB_FLOOR,
+                stream_drained: false,
             }));
         }
 

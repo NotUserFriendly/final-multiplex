@@ -467,6 +467,16 @@ impl Supervisor {
         }
     }
 
+    /// Gracefully tear down a single adapter and let the existing respawn path
+    /// bring it back up.  Wired to the per-tile Reboot button (Block 5).
+    ///
+    /// Offset and mute survive because they are stored in `source_layouts` and
+    /// re-applied by `add_video/audio_chain` on the next `StreamsChanged` event.
+    pub fn request_reboot(&mut self, source_id: &str) {
+        eprintln!("[supervisor] '{source_id}': manual reboot requested");
+        self.graceful_shutdown_live(source_id);
+    }
+
     /// Send Play to all live adapters and flip the internal play flag so
     /// newly-restarted adapters auto-receive Play on their Ready message.
     pub fn send_play_all(&mut self) {

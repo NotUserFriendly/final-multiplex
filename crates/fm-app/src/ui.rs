@@ -22,6 +22,12 @@ struct SourceRow {
     /// File sources: ±60 000 ms; live sources: [0, min(declared_max, ceiling)].
     min_offset_ms: i32,
     max_offset_ms: i32,
+    /// True for out-of-process (RTSP) sources; false for in-process file sources.
+    is_external: bool,
+    /// External source: adapter not delivering (Restarting/Failed or is_reconnecting).
+    signal_lost: bool,
+    /// File source: set once the first frame has arrived; used to gate FILE TERMINATED.
+    has_ever_had_frames: bool,
 }
 
 pub struct App {
@@ -67,6 +73,10 @@ pub enum Message {
         delta: i32,
     },
     ToggleMute {
+        index: usize,
+    },
+    /// Reboot button: graceful teardown → respawn for an external source.
+    Reboot {
         index: usize,
     },
     Resized {
@@ -136,6 +146,31 @@ impl App {
                         .iter()
                         .map(|s| metrics.snapshot(&s.id))
                         .collect();
+                }
+                // Update per-source display state for tile overlays.
+                {
+                    let status_snap = self
+                        .supervisor
+                        .as_ref()
+                        .map(|sup| sup.status_handle().lock().unwrap().clone());
+                    for (i, src) in self.sources.iter_mut().enumerate() {
+                        if src.is_external {
+                            src.signal_lost = status_snap
+                                .as_ref()
+                                .and_then(|s| s.get(&src.id))
+                                .map(|a| {
+                                    a.state != fm_core::supervisor::AdapterState::Running
+                                        || a.is_reconnecting
+                                })
+                                .unwrap_or(false);
+                        } else {
+                            let fps_out =
+                                self.source_metrics.get(i).map(|m| m.fps_out).unwrap_or(0.0);
+                            if fps_out > 0.0 {
+                                src.has_ever_had_frames = true;
+                            }
+                        }
+                    }
                 }
                 // Debounced persist: flush 500 ms after the last committed offset change.
                 if self
@@ -248,6 +283,14 @@ impl App {
                     src.muted = !src.muted;
                     if let Some(t) = &mut self.transport {
                         let _ = t.set_source_mute(&src.id, src.muted);
+                    }
+                }
+            }
+
+            Message::Reboot { index } => {
+                if let Some(src) = self.sources.get(index) {
+                    if let Some(sup) = &mut self.supervisor {
+                        sup.request_reboot(&src.id.clone());
                     }
                 }
             }
@@ -459,7 +502,17 @@ impl App {
         .spacing(4)
         .align_y(iced::alignment::Vertical::Center);
 
-        let control_box = column![
+        let reboot_row: Option<Element<Message>> = if src.is_external {
+            Some(
+                button("⟳ Reboot")
+                    .on_press(Message::Reboot { index: i })
+                    .into(),
+            )
+        } else {
+            None
+        };
+
+        let mut ctrl_col = column![
             text(&src.id).size(13),
             text(&src.display_name).size(10),
             offset_row,
@@ -468,20 +521,71 @@ impl App {
             text(metrics_line).size(10),
         ]
         .spacing(3);
+        if let Some(rb) = reboot_row {
+            ctrl_col = ctrl_col.push(rb);
+        }
+        let control_box = ctrl_col;
 
         let dark_bg = |_: &iced::Theme| container::Style {
             background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.7))),
             ..Default::default()
         };
+        let tile_border = |_: &iced::Theme| container::Style {
+            border: iced::Border {
+                color: Color::from_rgb(1.0, 1.0, 1.0),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        };
 
-        // Transparent outer cell; dark control box anchored to bottom-left.
-        // clip(true) ensures the box never renders outside its tile.
-        container(container(control_box).style(dark_bg).padding(6))
-            .width(Length::FillPortion(1))
+        // Determine per-tile display state.
+        let fps_out = self.source_metrics.get(i).map(|m| m.fps_out).unwrap_or(0.0);
+        let file_terminated =
+            !src.is_external && src.has_ever_had_frames && fps_out == 0.0 && self.playing;
+        let state_label: Option<&str> = if src.is_external && src.signal_lost {
+            Some("SIGNAL LOST")
+        } else if file_terminated {
+            Some("FILE TERMINATED")
+        } else {
+            None
+        };
+
+        // State overlay: translucent 50% black, white text, centered.
+        let state_layer: Element<Message> = if let Some(label) = state_label {
+            let overlay_bg = |_: &iced::Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
+                ..Default::default()
+            };
+            container(
+                container(text(label).size(20).color(Color::WHITE))
+                    .style(overlay_bg)
+                    .padding(12),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+        } else {
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        // Control box anchored bottom-left inside a white-bordered tile cell.
+        let controls_layer = container(container(control_box).style(dark_bg).padding(6))
+            .width(Length::Fill)
             .height(Length::Fill)
             .clip(true)
             .align_x(iced::alignment::Horizontal::Left)
-            .align_y(iced::alignment::Vertical::Bottom)
+            .align_y(iced::alignment::Vertical::Bottom);
+
+        container(stack([controls_layer.into(), state_layer]))
+            .style(tile_border)
+            .width(Length::FillPortion(1))
+            .height(Length::Fill)
             .into()
     }
 }
@@ -601,6 +705,9 @@ fn try_init(
             display_name: uri_display_name(s.uri.as_deref().unwrap_or("")),
             min_offset_ms: file_min,
             max_offset_ms: file_max,
+            is_external: s.source_type == fm_core::config::SourceType::External,
+            signal_lost: false,
+            has_ever_had_frames: false,
         })
         .collect();
 

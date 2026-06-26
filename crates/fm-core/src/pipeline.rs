@@ -363,7 +363,10 @@ impl Pipeline {
         let black_src: gstreamer::Element = gstreamer::ElementFactory::make("videotestsrc")
             .name("black_src")
             .build()?;
-        black_src.set_property_from_str("pattern", "black");
+        // ~25% gray (ARGB 0xFF404040) so empty tiles and letterbox bars are
+        // visually distinct from actual black content (ADR-0018 floor, appearance only).
+        black_src.set_property_from_str("pattern", "solid-color");
+        black_src.set_property("foreground-color", 0xFF404040u32);
         black_src.set_property("is-live", true);
         let black_caps: gstreamer::Element = gstreamer::ElementFactory::make("capsfilter")
             .name("black_caps")

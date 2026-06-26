@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Adapter reboot control (Block 5):** each external-source tile now has a
+  "⟳ Reboot" button that triggers graceful adapter teardown and respawn via
+  the existing supervisor path.  Offset and mute survive the reboot (stored
+  in `source_layouts`, re-applied by `add_video/audio_chain` on reconnect).
+- **Tile chrome + state overlays (Block 4):**
+  - Floor background changed from black to ~25% gray (`solid-color` pattern,
+    ARGB `0xFF404040`) so empty tiles, letterbox bars, and black frames are
+    visually distinct.
+  - Each tile cell now has a 1-pixel white border drawn in the overlay layer.
+  - **SIGNAL LOST** overlay (50% translucent black, white text, centered)
+    appears when an external source's adapter is reconnecting, restarting, or
+    in a failed state.
+  - **FILE TERMINATED** overlay appears for a finite file source when
+    `fps_out` drops to 0 while the pipeline is playing and the source has
+    previously delivered frames (distinguishes EOS from pre-start).
 - **Output aspect ratio derived from grid geometry (2×1 bug fix):**
   `scene.grid.width`/`height` are now per-tile dimensions; the compositor
   canvas is computed as `columns × width` × `rows × height`.  A 2×1 grid

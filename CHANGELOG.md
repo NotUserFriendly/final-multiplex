@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Ratchet jitter-fired on measurement noise:** the 1-second fps_in measurement
+  window can round a nominally-30 fps source up to 31–34 fps under normal frame
+  timing jitter; two consecutive identical readings would commit the ratchet to that
+  inflated rate, causing compositor judder on non-integer-multiple sources (e.g.
+  24 fps FNAF2 content stuttered in a 33 fps compositor).  Fixed by requiring a
+  candidate to be at least 5 fps above the current high-water mark before the
+  2-poll hysteresis begins.
 - **Ratchet locked to RTSP SDP-declared fps, not actual delivery rate:** RTSP cameras
   commonly advertise their maximum capability in the SDP (e.g. 50 fps) while delivering
   far less (e.g. 12 fps).  The ratchet trusted caps-declared rates immediately and locked

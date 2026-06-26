@@ -11,6 +11,13 @@ use std::time::{Duration, Instant};
 /// flush) subside before they can lock in a false high.
 const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 
+/// Minimum fps above the current high-water mark required to accept a ratchet
+/// candidate.  The 1-second measurement window can round up a nominally-30 fps
+/// source to 31–34 fps under normal jitter; a genuine upgrade (48/50/60 fps) is
+/// always ≥18 fps above a 30 fps baseline.  5 fps blocks noise without masking
+/// real rate changes.
+const RATCHET_MIN_DELTA: i32 = 5;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Session-scoped output framerate high-water mark (ADR-0023).
@@ -39,10 +46,14 @@ impl FramerateRatchet {
 
     /// Check `candidate_fps` against the high-water mark.
     ///
-    /// Commits when the same candidate appears in two consecutive polls.
+    /// Commits when the same candidate appears in two consecutive polls AND is
+    /// at least `RATCHET_MIN_DELTA` above the current mark (guards against
+    /// measurement jitter on sources near the current rate).
     /// Returns `Some(new_fps)` if the mark should be ratcheted up.
     fn check(&mut self, candidate_fps: i32) -> Option<i32> {
-        if candidate_fps <= self.high_water_fps {
+        if candidate_fps <= self.high_water_fps
+            || candidate_fps < self.high_water_fps + RATCHET_MIN_DELTA
+        {
             self.pending_candidate = None;
             return None;
         }

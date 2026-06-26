@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-26
+
 ### Added
 - **Manual ratchet reset button:** "↺ Reset Rate" button in the control bar resets
   the output framerate high-water mark to the configured `fps` from the scene config.

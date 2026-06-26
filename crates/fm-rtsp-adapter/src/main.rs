@@ -199,10 +199,8 @@ fn main() {
         .get("video-height")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1080);
-    let fps: i32 = args
-        .get("framerate")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+    // --framerate is accepted but ignored: the camera's native rate flows through
+    // unmodified after videorate was removed (ADR-0023 Phase 2.3).
     let base_time_ns: u64 = args
         .get("base-time")
         .and_then(|v| v.parse().ok())
@@ -315,7 +313,6 @@ fn main() {
                         &video_shm_c,
                         prod_w,
                         prod_h,
-                        fps,
                         Arc::clone(&source_frames_c),
                         Arc::clone(&output_frames_c),
                         Arc::clone(&bad_frames_c),
@@ -685,7 +682,6 @@ fn build_video_chain(
     shm_path: &str,
     prod_w: i32,
     prod_h: i32,
-    fps: i32,
     source_counter: Arc<AtomicU64>,
     output_counter: Arc<AtomicU64>,
     bad_counter: Arc<AtomicU64>,
@@ -693,29 +689,28 @@ fn build_video_chain(
     let vconv = make("videoconvert", "vconv");
     let vdeint = make("deinterlace", "vdeint");
     let vscale = make("videoscale", "vscale");
-    // videorate converts the camera's native framerate to the configured fps
-    // so that vcaps below can specify a fully-fixed framerate.  Without a fixed
-    // framerate in the caps, the core's capsfilter downstream sees a range and
-    // errors with "output caps are unfixed".
-    let vrate = make("videorate", "vrate");
+    // No videorate — the camera's native framerate flows through unmodified.
+    // The core's compositor accepts mixed-rate inputs; the output rate is
+    // determined by the output capsfilter (ratcheted up per ADR-0023).
     let vcaps = make("capsfilter", "vcaps");
     let vunixfdsink = fm_adapter_sdk::transport::make_output_sink("vunixfdsink", shm_path);
 
+    // Only pin format, resolution, and pixel-aspect-ratio.  No framerate field
+    // so the camera's negotiated rate passes through unmodified.
     vcaps.set_property(
         "caps",
         &gstreamer::Caps::builder("video/x-raw")
             .field("format", "RGBA")
             .field("width", prod_w)
             .field("height", prod_h)
-            .field("framerate", gstreamer::Fraction::new(fps, 1))
             .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );
 
-    pipeline.add_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink])?;
-    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink])?;
+    pipeline.add_many([&vconv, &vdeint, &vscale, &vcaps, &vunixfdsink])?;
+    gstreamer::Element::link_many([&vconv, &vdeint, &vscale, &vcaps, &vunixfdsink])?;
 
-    for elem in [&vconv, &vdeint, &vscale, &vrate, &vcaps, &vunixfdsink] {
+    for elem in [&vconv, &vdeint, &vscale, &vcaps, &vunixfdsink] {
         let _ = elem.sync_state_with_parent();
     }
 
@@ -744,7 +739,7 @@ fn build_video_chain(
     eprintln!("[rtsp-adapter] video chain ready → {shm_path}");
     Ok(Chain {
         sink: sink_pad,
-        elements: vec![vconv, vdeint, vscale, vrate, vcaps, vunixfdsink],
+        elements: vec![vconv, vdeint, vscale, vcaps, vunixfdsink],
     })
 }
 

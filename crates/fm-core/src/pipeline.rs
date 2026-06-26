@@ -586,11 +586,12 @@ impl Pipeline {
                 if source.source_type == SourceType::External {
                     let ceiling_ms = scene.grid.live_offset_ceiling_ms as u64;
                     let ceiling_ns = ceiling_ms * 1_000_000;
-                    let ceiling_buffers = (ceiling_ms * scene.grid.fps as u64 / 1000 + 4) as u32;
                     let voff_q: gstreamer::Element = gstreamer::ElementFactory::make("queue")
                         .name(format!("voff_q_{}", source.id))
                         .build()?;
-                    voff_q.set_property("max-size-buffers", ceiling_buffers);
+                    // Disable the buffer-count limit — rate-independent sizing.
+                    // max-size-time alone bounds the queue to ceiling_ms regardless of fps.
+                    voff_q.set_property("max-size-buffers", 0u32);
                     voff_q.set_property("max-size-bytes", 0u32);
                     voff_q.set_property("max-size-time", ceiling_ns);
                     voff_q.set_property_from_str("leaky", "upstream");
@@ -720,7 +721,6 @@ impl Pipeline {
                                 .field("format", "RGBA")
                                 .field("width", grid_w)
                                 .field("height", grid_h)
-                                .field("framerate", gstreamer::Fraction::new(grid_fps, 1))
                                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                                 .build(),
                         );
@@ -805,12 +805,82 @@ impl Pipeline {
         self.compositor_latency_ms
     }
 
+    /// Initial configured output framerate (fps). Used as the starting point
+    /// for the session high-water ratchet (ADR-0023).
+    pub fn grid_fps(&self) -> i32 {
+        self.grid_fps
+    }
+
+    /// Update the output capsfilter to a new framerate, triggering live
+    /// renegotiation of the compositor → appsink path (ADR-0023 ratchet).
+    ///
+    /// Reads the current canvas width/height from the existing capsfilter so
+    /// the caller does not need to track those dimensions.
+    /// No-op if the element is absent or the new fps matches the current one.
+    pub fn set_output_fps(&self, new_fps: i32) {
+        let Some(elem) = self.inner.by_name("comp_capsfilter") else {
+            return;
+        };
+        let current = elem.property::<gstreamer::Caps>("caps");
+        let Some(s) = current.structure(0) else {
+            return;
+        };
+        let Ok(width) = s.get::<i32>("width") else {
+            return;
+        };
+        let Ok(height) = s.get::<i32>("height") else {
+            return;
+        };
+        if let Ok(cur_frac) = s.get::<gstreamer::Fraction>("framerate") {
+            if cur_frac.numer() == new_fps && cur_frac.denom() == 1 {
+                return; // already at target fps
+            }
+        }
+        let new_caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("width", width)
+            .field("height", height)
+            .field("framerate", gstreamer::Fraction::new(new_fps, 1))
+            .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
+            .build();
+        elem.set_property("caps", &new_caps);
+        eprintln!("[pipeline] output fps ratcheted → {new_fps}");
+    }
+
     pub fn appsink(&self) -> &gstreamer_app::AppSink {
         &self.appsink
     }
 
     pub fn source_pads(&self) -> &HashMap<String, SourcePads> {
         &self.source_pads
+    }
+
+    /// Return the caps-declared input framerate for `source_id`, or `None` if
+    /// the pad caps are not yet negotiated or the source declares a variable rate.
+    ///
+    /// For external sources, reads from `vshmcaps_{id}:src` (which carries the
+    /// adapter's native framerate after the framerate pin was removed in Phase 2.3).
+    /// For file sources, falls back to `vcaps_{id}:src` (the tile-scale capsfilter).
+    /// Callers should fall back to measured `fps_in` when this returns `None`.
+    pub fn source_input_fps(&self, source_id: &str) -> Option<f64> {
+        for prefix in &["vshmcaps_", "vcaps_"] {
+            let name = format!("{prefix}{source_id}");
+            if let Some(elem) = self.inner.by_name(&name) {
+                if let Some(pad) = elem.static_pad("src") {
+                    if let Some(caps) = pad.current_caps() {
+                        if let Some(s) = caps.structure(0) {
+                            if let Ok(frac) = s.get::<gstreamer::Fraction>("framerate") {
+                                let fps = frac.numer() as f64 / frac.denom().max(1) as f64;
+                                if fps > 0.0 {
+                                    return Some(fps);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// True if the core pipeline has an active video chain for `source_id`.
@@ -935,7 +1005,6 @@ impl Pipeline {
                 .field("format", "RGBA")
                 .field("width", self.grid_w)
                 .field("height", self.grid_h)
-                .field("framerate", gstreamer::Fraction::new(self.grid_fps, 1))
                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                 .build(),
         );
@@ -995,9 +1064,10 @@ impl Pipeline {
 
         let ceiling_ms = self.ceiling_ms as u64;
         let ceiling_ns = ceiling_ms * 1_000_000;
-        let ceiling_buffers = (ceiling_ms * self.grid_fps as u64 / 1000 + 4) as u32;
         let voff_q = make("queue", &format!("voff_q_{source_id}"))?;
-        voff_q.set_property("max-size-buffers", ceiling_buffers);
+        // Disable the buffer-count limit — rate-independent sizing.
+        // max-size-time alone bounds the queue to ceiling_ms regardless of fps.
+        voff_q.set_property("max-size-buffers", 0u32);
         voff_q.set_property("max-size-bytes", 0u32);
         voff_q.set_property("max-size-time", ceiling_ns);
         // leaky=upstream: drop incoming frames when full to preserve the oldest

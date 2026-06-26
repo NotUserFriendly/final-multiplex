@@ -247,6 +247,13 @@ impl App {
                             sup.update_chain_state(id, has_chain);
                         }
                     }
+                    // Output framerate ratchet (ADR-0023): poll every ~500 ms.
+                    // Ratchets up to the max observed input rate across all sources.
+                    // Excludes synthetic floors (not in self.sources).
+                    if let (Some(t), Some(m)) = (&mut self.transport, &self.metrics) {
+                        let ids: Vec<String> = self.sources.iter().map(|s| s.id.clone()).collect();
+                        t.check_and_ratchet(&ids, m);
+                    }
                 }
             }
 

@@ -1,4 +1,4 @@
-use crate::metrics::{AudioLevel, AudioStore};
+use crate::metrics::{AudioLevel, AudioStore, MetricsCollector};
 use crate::pipeline::Pipeline;
 use fm_adapter_sdk::metrics::DB_FLOOR;
 use gstreamer::prelude::*;
@@ -6,6 +6,60 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Session-scoped output framerate high-water mark (ADR-0023).
+///
+/// Ratchets up to the maximum input rate observed across active real sources;
+/// never falls back within a session.  Resets to the configured grid fps on
+/// scene reload.
+///
+/// Hysteresis: caps-declared rates (stable, negotiated once) are trusted
+/// immediately.  Measured-fallback rates (fps_in from buffer counting) must
+/// appear in two consecutive polls before triggering a ratchet to guard
+/// against single-sample bursts.
+struct FramerateRatchet {
+    /// Current session high-water mark.  Initialized to grid_fps at startup.
+    high_water_fps: i32,
+    /// Candidate new high from the previous poll (measured-fallback only).
+    /// Cleared on commit; stays None for caps-declared highs (committed immediately).
+    pending_candidate: Option<i32>,
+}
+
+impl FramerateRatchet {
+    fn new(initial_fps: i32) -> Self {
+        Self {
+            high_water_fps: initial_fps,
+            pending_candidate: None,
+        }
+    }
+
+    /// Check `candidate_fps` against the high-water mark.
+    ///
+    /// `is_declared`: true when the rate comes from negotiated caps (trust immediately);
+    /// false when it comes from buffer counting (require two consecutive polls).
+    ///
+    /// Returns `Some(new_fps)` if the mark should be ratcheted up to `new_fps`.
+    fn check(&mut self, candidate_fps: i32, is_declared: bool) -> Option<i32> {
+        if candidate_fps <= self.high_water_fps {
+            self.pending_candidate = None;
+            return None;
+        }
+        if is_declared {
+            self.pending_candidate = None;
+            self.high_water_fps = candidate_fps;
+            return Some(candidate_fps);
+        }
+        // Measured fallback: require the same value in two consecutive polls.
+        if self.pending_candidate == Some(candidate_fps) {
+            self.pending_candidate = None;
+            self.high_water_fps = candidate_fps;
+            Some(candidate_fps)
+        } else {
+            self.pending_candidate = Some(candidate_fps);
+            None
+        }
+    }
+}
 
 /// Per-source effective offset bounds (in milliseconds, inclusive) derived from
 /// the adapter's declared capability and the core's ceiling (ADR-0016/0017).
@@ -22,13 +76,17 @@ pub struct Transport {
     /// Effective per-source offset bounds, populated at startup from supervisor
     /// Ready data.  Sources not in this map use file-source defaults (±60 s).
     source_bounds: HashMap<String, SourceBounds>,
+    /// Output framerate ratchet (ADR-0023).
+    ratchet: FramerateRatchet,
 }
 
 impl Transport {
     pub fn new(pipeline: Pipeline) -> Self {
+        let initial_fps = pipeline.grid_fps();
         Self {
             pipeline,
             source_bounds: HashMap::new(),
+            ratchet: FramerateRatchet::new(initial_fps),
         }
     }
 
@@ -129,6 +187,46 @@ impl Transport {
 
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
+    }
+
+    /// Poll each source's input fps and ratchet the output rate up to the
+    /// observed maximum (ADR-0023).  Call ~once per second from the Tick loop.
+    ///
+    /// `source_ids`: all real source IDs (excludes synthetic floors, which are
+    /// not in the pipeline's source_pads and not tracked by MetricsCollector).
+    pub fn check_and_ratchet(&mut self, source_ids: &[String], metrics: &MetricsCollector) {
+        let mut max_fps: i32 = 0;
+        let mut max_is_declared = false;
+
+        for id in source_ids {
+            let (candidate, declared) = match self.pipeline.source_input_fps(id) {
+                Some(fps) if fps > 0.0 => (fps.round() as i32, true),
+                _ => {
+                    // Measured fallback: use fps_in from the metrics snapshot.
+                    let measured = metrics.snapshot(id).fps_in;
+                    if measured > 0.0 {
+                        (measured.round() as i32, false)
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            if candidate > max_fps {
+                max_fps = candidate;
+                max_is_declared = declared;
+            }
+        }
+
+        if max_fps > 0 {
+            if let Some(new_fps) = self.ratchet.check(max_fps, max_is_declared) {
+                self.pipeline.set_output_fps(new_fps);
+            }
+        }
+    }
+
+    /// Reset the ratchet to the configured grid fps (call on scene reload).
+    pub fn reset_ratchet(&mut self) {
+        self.ratchet = FramerateRatchet::new(self.pipeline.grid_fps());
     }
 
     /// Reset shmsrc elements for a restarted external source so they

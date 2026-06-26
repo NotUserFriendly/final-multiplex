@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Phase 2.3 — Arbitrary and dynamic framerate (ADR-0023):** sources now compose
+  at their native input rates rather than being forced to `fps` from the scene config.
+  - **Native rate pass-through (Block 1):** `videorate` and the `framerate` constraint
+    removed from the RTSP adapter's video chain.  The `vshmcaps` receive-side
+    capsfilter in the core no longer pins framerate.  Each source's negotiated
+    framerate flows through the adapter → unixfd transport → core chain unmodified.
+    `Pipeline::source_input_fps(id)` reads the caps-declared rate from the negotiated
+    pad caps; used by the ratchet controller.
+  - **Rate-independent offset buffer (Block 2):** `voff_q` (`max-size-buffers`)
+    changed from a frame-count derived from `grid_fps` to `0` (disabled).  The queue
+    is now bounded purely by `max-size-time = ceiling_ms`, which is framerate-
+    independent.  A 120 fps source buffers the same *time* window as a 15 fps one.
+  - **Output framerate ratchet (Block 3):** the output framerate is now a monotonic
+    session high-water mark.  `Transport::check_and_ratchet` (called every ~500 ms
+    from the Tick loop) computes the max input fps across all real sources, preferring
+    caps-declared rates (trusted immediately) over measured fallback rates (require two
+    consecutive polls for hysteresis).  On a new high, `Pipeline::set_output_fps`
+    updates `comp_capsfilter` live — the compositor renegotiates its output pad without
+    a pipeline restart.  The mark never falls back within a session; `reset_ratchet()`
+    resets it on scene reload.
+
 ## [0.2.0] - 2026-06-26
 
 ### Added

@@ -25,6 +25,63 @@ Format. One section per bug. Under it: Attempt N — Hypothesis / Action / Resul
 
 ---
 
+## Compositor stutter — software CPU ceiling (2026-06-26)
+
+**Symptom:** Visible stutter on all source tiles at 30 fps output. Persists in both
+debug and release builds. All sources affected simultaneously, not per-tile.
+
+**Scene layout:** `scene-mixed-dummy.toml` — dummy (30 fps) + cam-27 (RTSP) + cam-77
+(RTSP, ~12 fps actual) + FNAF2 (file, 23.976 fps). Grid: 2×2, 1920×1080 per tile →
+**3840×2160 canvas** (4K software composite).
+
+### Attempt 1 — Clamp ratchet to 30 fps
+
+Hypothesis: ratchet had fired spuriously to 33 fps; irregular frame period at 33/24
+fps caused judder on FNAF2, which looked like stutter on all tiles.
+
+Action: hard-clamped `check_and_ratchet` to return immediately (no ratchet fires).
+
+Result: **stutter persisted unchanged.** Framerate is not the cause.
+
+### Attempt 2 — Release build
+
+Hypothesis: debug binary's unoptimized Rust pixel-processing paths are the bottleneck.
+
+Action: `make release` + relaunch from `target/release/`.
+
+Result: **stutter unchanged.** CPU numbers barely moved:
+
+| Process | Debug CPU | Release CPU |
+|---------|-----------|-------------|
+| fm-core | 668% | 527% |
+| cam-27 adapter | ~101% | ~99% |
+| cam-77 adapter | ~57% | ~53% |
+| dummy adapter | ~24% | ~17% |
+
+The Rust overhead dropped (core: 668→527%), but the cam-27 adapter stayed at ~1 full
+core in both builds. The bottleneck is in GStreamer's C libraries (H.264 software
+decode + pixel format conversion), which are already compiled optimized — the release
+profile only helps our Rust code.
+
+**Root cause assessment:** Software compositing a 3840×2160 canvas at 30 fps requires
+~2 GB/s of pixel throughput. cam-27's adapter saturating a full CPU core (software
+H.264 decode at 1920×1080) creates frame delivery jitter. On a machine near 7/8
+cores total, OS scheduling jitter tips the compositor into dropping frames, which
+shows as all-tile stutter.
+
+### Next steps (not yet attempted)
+
+**Option A — Hardware decode in the RTSP adapter:** replace `decodebin3` with a
+hardware-accelerated path (`vaapidecodebin` / `nvh264dec`). Drops cam-27's adapter
+from ~1 core to near zero. Likely the correct long-term fix; touches RTSP adapter
+pipeline construction and has hardware/driver assumptions — flagged for review chat.
+
+**Option B — Reduce tile resolution:** change `width`/`height` per tile in the scene
+(e.g., 960×540 → 1920×1080 canvas). Cuts pixel throughput 4×; would confirm
+CPU-ceiling diagnosis. Scene config change only, no code.
+
+---
+
 ## Output ratchet false-high bugs (post-Phase 2.3, 2026-06-26)
 
 Three bugs found during real-scene validation with `scene-mixed-dummy.toml`

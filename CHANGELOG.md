@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Ratchet locked to RTSP SDP-declared fps, not actual delivery rate:** RTSP cameras
+  commonly advertise their maximum capability in the SDP (e.g. 50 fps) while delivering
+  far less (e.g. 12 fps).  The ratchet trusted caps-declared rates immediately and locked
+  the output to the SDP value; the Reset Rate button could not lower it because the same
+  declared rate re-fired within the same poll tick after the suppress window cleared.
+  Fix: the caps-declared fast path is removed.  The ratchet now uses measured `fps_in`
+  exclusively, protected by the 3 s settle window and 2-poll hysteresis.
+
 ## [0.2.3] - 2026-06-26
 
 _Versions 0.2.1 and 0.2.2 were not cut; those patches were folded into 0.2.0.

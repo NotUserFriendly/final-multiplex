@@ -5,10 +5,11 @@ use gstreamer::prelude::*;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Measured-fallback rates are not counted toward the ratchet until the source
-/// has been delivering continuously for this long.  Guards against startup /
-/// reconnect burst inflation (jitter-buffer drain, decode flush).
-const SETTLE_WINDOW: Duration = Duration::from_millis(1000);
+/// How long after startup or a manual reset before any source may contribute to
+/// the ratchet.  Holds at grid_fps during the window; sources re-discover when it
+/// clears.  Also long enough to let burst readings (jitter-buffer drain, decode
+/// flush) subside before they can lock in a false high.
+const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -18,15 +19,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 /// never falls back within a session.  Resets to the configured grid fps on
 /// scene reload.
 ///
-/// Hysteresis: caps-declared rates (stable, negotiated once) are trusted
-/// immediately.  Measured-fallback rates (fps_in from buffer counting) must
-/// appear in two consecutive polls before triggering a ratchet to guard
-/// against single-sample bursts.
+/// Hysteresis: a candidate must appear in two consecutive polls before the
+/// ratchet commits, guarding against single-sample bursts from decode/jitter.
 struct FramerateRatchet {
     /// Current session high-water mark.  Initialized to grid_fps at startup.
     high_water_fps: i32,
-    /// Candidate new high from the previous poll (measured-fallback only).
-    /// Cleared on commit; stays None for caps-declared highs (committed immediately).
+    /// Candidate new high from the previous poll; committed on the second
+    /// consecutive appearance of the same value.
     pending_candidate: Option<i32>,
 }
 
@@ -40,21 +39,13 @@ impl FramerateRatchet {
 
     /// Check `candidate_fps` against the high-water mark.
     ///
-    /// `is_declared`: true when the rate comes from negotiated caps (trust immediately);
-    /// false when it comes from buffer counting (require two consecutive polls).
-    ///
-    /// Returns `Some(new_fps)` if the mark should be ratcheted up to `new_fps`.
-    fn check(&mut self, candidate_fps: i32, is_declared: bool) -> Option<i32> {
+    /// Commits when the same candidate appears in two consecutive polls.
+    /// Returns `Some(new_fps)` if the mark should be ratcheted up.
+    fn check(&mut self, candidate_fps: i32) -> Option<i32> {
         if candidate_fps <= self.high_water_fps {
             self.pending_candidate = None;
             return None;
         }
-        if is_declared {
-            self.pending_candidate = None;
-            self.high_water_fps = candidate_fps;
-            return Some(candidate_fps);
-        }
-        // Measured fallback: require the same value in two consecutive polls.
         if self.pending_candidate == Some(candidate_fps) {
             self.pending_candidate = None;
             self.high_water_fps = candidate_fps;
@@ -90,6 +81,12 @@ pub struct Transport {
     /// A source whose entry age is below SETTLE_WINDOW is excluded from the
     /// measured-fallback ratchet contribution for that poll cycle.
     settle_timers: HashMap<String, Instant>,
+    /// Global ratchet suppression until this instant.  While active, no source
+    /// (caps-declared or measured) may contribute to the ratchet — the output
+    /// holds at grid_fps.  Set at construction (startup) and by reset_ratchet()
+    /// (manual reset) so the button produces a visible rate drop before
+    /// re-discovery.
+    suppress_until: Instant,
 }
 
 impl Transport {
@@ -100,6 +97,7 @@ impl Transport {
             source_bounds: HashMap::new(),
             ratchet: FramerateRatchet::new(initial_fps),
             settle_timers: HashMap::new(),
+            suppress_until: Instant::now() + SETTLE_WINDOW,
         }
     }
 
@@ -208,43 +206,39 @@ impl Transport {
     /// `source_ids`: all real source IDs (excludes synthetic floors, which are
     /// not in the pipeline's source_pads and not tracked by MetricsCollector).
     pub fn check_and_ratchet(&mut self, source_ids: &[String], metrics: &MetricsCollector) {
+        // Global suppression window: hold at grid_fps until it clears.
+        if Instant::now() < self.suppress_until {
+            return;
+        }
+
+        // Use measured fps_in exclusively.  RTSP SDP-declared rates are
+        // unreliable — cameras routinely declare their maximum capability (e.g.
+        // 50 fps) while delivering a fraction of that (e.g. 12 fps).  Measured
+        // rates require the SETTLE_WINDOW + 2-poll hysteresis to commit, which is
+        // sufficient protection against startup bursts.
         let mut max_fps: i32 = 0;
-        let mut max_is_declared = false;
 
         for id in source_ids {
-            let (candidate, declared) = match self.pipeline.source_input_fps(id) {
-                Some(fps) if fps > 0.0 => (fps.round() as i32, true),
-                _ => {
-                    // Measured fallback: use fps_in from the metrics snapshot.
-                    let measured = metrics.snapshot(id).fps_in;
-                    if measured > 0.0 {
-                        // Record when this source first started delivering in the
-                        // current run; clear the entry when delivery stops so the
-                        // window resets on reconnect.
-                        let started = self
-                            .settle_timers
-                            .entry(id.clone())
-                            .or_insert_with(Instant::now);
-                        if started.elapsed() < SETTLE_WINDOW {
-                            // Still in the startup/reconnect burst window; skip.
-                            continue;
-                        }
-                        (measured.round() as i32, false)
-                    } else {
-                        // Delivery stopped; reset settle timer for next run.
-                        self.settle_timers.remove(id);
-                        continue;
-                    }
+            let measured = metrics.snapshot(id).fps_in;
+            if measured > 0.0 {
+                let started = self
+                    .settle_timers
+                    .entry(id.clone())
+                    .or_insert_with(Instant::now);
+                if started.elapsed() < SETTLE_WINDOW {
+                    continue;
                 }
-            };
-            if candidate > max_fps {
-                max_fps = candidate;
-                max_is_declared = declared;
+                let candidate = measured.round() as i32;
+                if candidate > max_fps {
+                    max_fps = candidate;
+                }
+            } else {
+                self.settle_timers.remove(id);
             }
         }
 
         if max_fps > 0 {
-            if let Some(new_fps) = self.ratchet.check(max_fps, max_is_declared) {
+            if let Some(new_fps) = self.ratchet.check(max_fps) {
                 self.pipeline.set_output_fps(new_fps);
             }
         }
@@ -257,6 +251,7 @@ impl Transport {
     pub fn reset_ratchet(&mut self) {
         self.ratchet = FramerateRatchet::new(self.pipeline.grid_fps());
         self.settle_timers.clear();
+        self.suppress_until = Instant::now() + SETTLE_WINDOW;
     }
 
     /// Reset shmsrc elements for a restarted external source so they

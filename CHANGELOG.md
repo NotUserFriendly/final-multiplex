@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Output aspect ratio derived from grid geometry (2×1 bug fix):**
+  `scene.grid.width`/`height` are now per-tile dimensions; the compositor
+  canvas is computed as `columns × width` × `rows × height`.  A 2×1 grid
+  of 1920×1080 tiles now produces a 3840×1080 (32:9) canvas instead of
+  distorting each tile into 960×1080 (8:9).
+- **Overlay clamped to tile bounds:** the per-source control box now clips
+  to its tile so it cannot paint outside the tile boundary at any grid size
+  or aspect ratio.
+- **Offset stepper bounds visible + enforced in UI:** the allowed range
+  (e.g. `0..2000 ms` for a live source, `−60000..60000 ms` for a file
+  source) is displayed below the stepper row; stepper buttons are disabled
+  when already at the limit.
 - **RTSP metrics: real `fps_in`, bad-frame counter, windowed rates:**
   - `fps_in` now reflects the actual camera frame rate (probe on `vconv:sink`,
     pre-`videorate`) instead of the configured/resampled output rate. A camera

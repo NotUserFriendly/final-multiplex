@@ -390,30 +390,65 @@ impl App {
             })
             .unwrap_or_default();
 
-        // Offset controls: [−1s] [−10ms] [ text box ] [+10ms] [+1s]
+        // Offset controls: steppers disabled when at the source's effective limit.
+        let at_min = src.offset_ms <= src.min_offset_ms;
+        let at_max = src.offset_ms >= src.max_offset_ms;
+        let btn_neg1s = {
+            let b = button("−1s");
+            if at_min {
+                b
+            } else {
+                b.on_press(Message::OffsetStep {
+                    index: i,
+                    delta: -1000,
+                })
+            }
+        };
+        let btn_neg10 = {
+            let b = button("−10");
+            if at_min {
+                b
+            } else {
+                b.on_press(Message::OffsetStep {
+                    index: i,
+                    delta: -10,
+                })
+            }
+        };
+        let btn_pos10 = {
+            let b = button("+10");
+            if at_max {
+                b
+            } else {
+                b.on_press(Message::OffsetStep {
+                    index: i,
+                    delta: 10,
+                })
+            }
+        };
+        let btn_pos1s = {
+            let b = button("+1s");
+            if at_max {
+                b
+            } else {
+                b.on_press(Message::OffsetStep {
+                    index: i,
+                    delta: 1000,
+                })
+            }
+        };
         let offset_row = row![
-            button("−1s").on_press(Message::OffsetStep {
-                index: i,
-                delta: -1000
-            }),
-            button("−10").on_press(Message::OffsetStep {
-                index: i,
-                delta: -10
-            }),
+            btn_neg1s,
+            btn_neg10,
             text_input("0", &src.offset_buf)
                 .on_input(move |s| Message::OffsetEdit { index: i, text: s })
                 .width(Length::Fixed(60.0)),
-            button("+10").on_press(Message::OffsetStep {
-                index: i,
-                delta: 10
-            }),
-            button("+1s").on_press(Message::OffsetStep {
-                index: i,
-                delta: 1000
-            }),
+            btn_pos10,
+            btn_pos1s,
         ]
         .spacing(3)
         .align_y(iced::alignment::Vertical::Center);
+        let range_label = text(format!("{}..{} ms", src.min_offset_ms, src.max_offset_ms)).size(9);
 
         // Level meter + mute toggle
         let mute_label = if src.muted { "[M]" } else { "M" };
@@ -428,6 +463,7 @@ impl App {
             text(&src.id).size(13),
             text(&src.display_name).size(10),
             offset_row,
+            range_label,
             meter_row,
             text(metrics_line).size(10),
         ]
@@ -439,9 +475,11 @@ impl App {
         };
 
         // Transparent outer cell; dark control box anchored to bottom-left.
+        // clip(true) ensures the box never renders outside its tile.
         container(container(control_box).style(dark_bg).padding(6))
             .width(Length::FillPortion(1))
             .height(Length::Fill)
+            .clip(true)
             .align_x(iced::alignment::Horizontal::Left)
             .align_y(iced::alignment::Vertical::Bottom)
             .into()
@@ -544,7 +582,9 @@ fn try_init(
     let n = scene.source.len() as u32;
     let cols = scene.grid.columns.max(1).min(n.max(1));
     let rows = (n.max(1) + cols - 1) / cols;
-    let grid_ar = scene.grid.width as f32 / scene.grid.height as f32;
+    // scene.grid.width/height are per-tile; canvas is cols×tile × rows×tile.
+    let grid_ar =
+        (cols as f32 * scene.grid.width as f32) / (rows as f32 * scene.grid.height as f32);
 
     // Per-source bounds are finalised after the Ready wait loop; start with
     // file-source defaults and overwrite for external sources below.

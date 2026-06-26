@@ -256,6 +256,19 @@ impl Pipeline {
                 .collect()
         };
 
+        // Compute grid geometry up front — needed for both the compositor output
+        // caps (canvas = cols×tile_w × rows×tile_h) and per-source layout below.
+        // scene.grid.width/height are per-TILE dimensions; the canvas expands to
+        // fit cols×rows tiles, so a 2×1 grid of 1920×1080 tiles gives a 3840×1080
+        // canvas (32:9), not a squashed 1920×1080 (the "2×1 AR bug").
+        let n_sources = scene.source.len() as u32;
+        let cols = scene.grid.columns.max(1).min(n_sources.max(1));
+        let rows = (n_sources.max(1) + cols - 1) / cols;
+        let tile_w = scene.grid.width as i32;
+        let tile_h = scene.grid.height as i32;
+        let canvas_w = cols as i32 * tile_w;
+        let canvas_h = rows as i32 * tile_h;
+
         let pipeline = gstreamer::Pipeline::new();
 
         // ── Output video path ──────────────────────────────────────────────
@@ -280,8 +293,8 @@ impl Pipeline {
 
         let output_caps = gstreamer::Caps::builder("video/x-raw")
             .field("format", "RGBA")
-            .field("width", scene.grid.width as i32)
-            .field("height", scene.grid.height as i32)
+            .field("width", canvas_w)
+            .field("height", canvas_h)
             .field(
                 "framerate",
                 gstreamer::Fraction::new(scene.grid.fps as i32, 1),
@@ -359,8 +372,8 @@ impl Pipeline {
             "caps",
             gstreamer::Caps::builder("video/x-raw")
                 .field("format", "RGBA")
-                .field("width", scene.grid.width as i32)
-                .field("height", scene.grid.height as i32)
+                .field("width", canvas_w)
+                .field("height", canvas_h)
                 .field(
                     "framerate",
                     gstreamer::Fraction::new(scene.grid.fps as i32, 1),
@@ -402,24 +415,22 @@ impl Pipeline {
             .request_pad_simple("sink_%u")
             .ok_or("compositor: could not request floor sink pad")?;
         comp_floor_pad.set_property("zorder", 0u32);
-        comp_floor_pad.set_property("width", scene.grid.width as i32);
-        comp_floor_pad.set_property("height", scene.grid.height as i32);
+        comp_floor_pad.set_property("width", canvas_w);
+        comp_floor_pad.set_property("height", canvas_h);
         black_caps
             .static_pad("src")
             .ok_or("black_caps: no src pad")?
             .link(&comp_floor_pad)?;
 
         // ── Per-source elements ────────────────────────────────────────────
-        let n = scene.source.len() as u32;
-        if n == 0 {
+        if n_sources == 0 {
             return Err("scene.toml has no [[source]] entries".into());
         }
-        let cols = scene.grid.columns.max(1).min(n);
-        let rows = (n + cols - 1) / cols;
-        let tile_w = (scene.grid.width / cols) as i32;
-        let tile_h = (scene.grid.height / rows) as i32;
-        let grid_w = scene.grid.width as i32;
-        let grid_h = scene.grid.height as i32;
+        // tile_w/tile_h = adapter production size (per-tile, not canvas).
+        // grid_w/grid_h stored in Pipeline struct so add_video_chain can set
+        // vshmcaps to the adapter production resolution on reconnect.
+        let grid_w = tile_w;
+        let grid_h = tile_h;
         let grid_fps = scene.grid.fps as i32;
 
         let mut source_pads: HashMap<String, SourcePads> = HashMap::new();

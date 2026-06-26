@@ -39,9 +39,11 @@ pub struct SceneConfig {
 pub struct GridConfig {
     /// Number of columns in the equal-split tile grid.
     pub columns: u32,
-    /// Composited output width in pixels.
+    /// Per-tile width in pixels.  The composited canvas is `columns × width`
+    /// wide, so a 2-column grid of 1920-wide tiles produces a 3840-pixel canvas.
     pub width: u32,
-    /// Composited output height in pixels.
+    /// Per-tile height in pixels.  The composited canvas is `rows × height`
+    /// tall (rows derived from source count and columns).
     pub height: u32,
     /// Composited output frame rate.
     pub fps: u32,

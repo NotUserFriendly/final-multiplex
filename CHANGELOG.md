@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.3] - 2026-06-26
 
+_Versions 0.2.1 and 0.2.2 were not cut; those patches were folded into 0.2.0.
+This release tracks Phase 2.3 (arbitrary and dynamic framerate, ADR-0023)._
+
 ### Added
 - **Manual ratchet reset button:** "↺ Reset Rate" button in the control bar resets
   the output framerate high-water mark to the configured `fps` from the scene config.

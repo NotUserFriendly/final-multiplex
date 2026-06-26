@@ -67,6 +67,11 @@ pub enum Message {
         index: usize,
         text: String,
     },
+    /// Enter pressed in an offset box: sync the display buffer back to the
+    /// clamped offset_ms so an out-of-range entry shows its actual value.
+    OffsetNormalise {
+        index: usize,
+    },
     /// Stepper button: saturating add delta (ms), clamp to ±MAX_OFFSET_MS.
     OffsetStep {
         index: usize,
@@ -254,6 +259,12 @@ impl App {
                         p.set_source_offset(&id, ms);
                     }
                     self.last_offset_change = Some(Instant::now());
+                }
+            }
+
+            Message::OffsetNormalise { index } => {
+                if let Some(src) = self.sources.get_mut(index) {
+                    src.offset_buf = src.offset_ms.to_string();
                 }
             }
 
@@ -485,6 +496,7 @@ impl App {
             btn_neg10,
             text_input("0", &src.offset_buf)
                 .on_input(move |s| Message::OffsetEdit { index: i, text: s })
+                .on_submit(Message::OffsetNormalise { index: i })
                 .width(Length::Fixed(60.0)),
             btn_pos10,
             btn_pos1s,
@@ -530,19 +542,11 @@ impl App {
             background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.7))),
             ..Default::default()
         };
-        let tile_border = |_: &iced::Theme| container::Style {
-            border: iced::Border {
-                color: Color::from_rgb(1.0, 1.0, 1.0),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        };
-
         // Determine per-tile display state.
         let fps_out = self.source_metrics.get(i).map(|m| m.fps_out).unwrap_or(0.0);
         let file_terminated =
             !src.is_external && src.has_ever_had_frames && fps_out == 0.0 && self.playing;
+        let is_dead = (src.is_external && src.signal_lost) || file_terminated;
         let state_label: Option<&str> = if src.is_external && src.signal_lost {
             Some("SIGNAL LOST")
         } else if file_terminated {
@@ -552,6 +556,7 @@ impl App {
         };
 
         // State overlay: translucent 50% black, white text, centered.
+        // White border only shown when the source is dead (signal lost / terminated).
         let state_layer: Element<Message> = if let Some(label) = state_label {
             let overlay_bg = |_: &iced::Theme| container::Style {
                 background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
@@ -574,7 +579,7 @@ impl App {
                 .into()
         };
 
-        // Control box anchored bottom-left inside a white-bordered tile cell.
+        // Control box anchored bottom-left; white border appears only when dead.
         let controls_layer = container(container(control_box).style(dark_bg).padding(6))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -582,8 +587,23 @@ impl App {
             .align_x(iced::alignment::Horizontal::Left)
             .align_y(iced::alignment::Vertical::Bottom);
 
+        let tile_style = move |_: &iced::Theme| {
+            if is_dead {
+                container::Style {
+                    border: iced::Border {
+                        color: Color::from_rgb(1.0, 1.0, 1.0),
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
+                }
+            } else {
+                container::Style::default()
+            }
+        };
+
         container(stack([controls_layer.into(), state_layer]))
-            .style(tile_border)
+            .style(tile_style)
             .width(Length::FillPortion(1))
             .height(Length::Fill)
             .into()

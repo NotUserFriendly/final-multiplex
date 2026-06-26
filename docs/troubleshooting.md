@@ -25,6 +25,72 @@ Format. One section per bug. Under it: Attempt N — Hypothesis / Action / Resul
 
 ---
 
+## Output ratchet false-high bugs (post-Phase 2.3, 2026-06-26)
+
+Three bugs found during real-scene validation with `scene-mixed-dummy.toml`
+(dummy + cam-27 + cam-77 + FNAF2). All three are now fixed.
+
+---
+
+### Bug 1 — RTSP SDP-declared fps locked the ratchet at 50 fps
+
+**Symptom:** With the Phase 2.3 caps-declared fast path, cam-77's RTSP SDP advertised
+50 fps. The ratchet trusted this immediately and set compositor output to 50 fps.
+cam-77 actually delivers ~12 fps. The Reset Rate button had no visible effect because
+the same caps-declared 50 fps re-fired within the same poll tick once the suppress
+window cleared.
+
+**Diagnosis:** Added a temporary `eprintln!` in `check_and_ratchet` logging
+`declared_fps` and `measured_fps` for each source per poll:
+
+```
+[ratchet-diag] dummy: declared=Some(30.0) measured=0.0
+[ratchet-diag] cam-27: declared=None measured=29.6
+[ratchet-diag] cam-77: declared=Some(50.0) measured=12.1
+[ratchet-diag] fnaf2: declared=Some(23.976) measured=29.6
+[pipeline] output fps ratcheted → 50
+```
+
+cam-77's SDP caps propagated through `vshmcaps_cam-77:src` as 50 fps regardless
+of actual delivery. The user's observation that the ratchet was "double FNAF2" was
+a coincidence — FNAF2 measured ~24 fps and 24×2=48≈50.
+
+**Fix:** Dropped the caps-declared fast path entirely. Ratchet now uses measured
+`fps_in` exclusively. RTSP SDP rates are unreliable; the 3 s settle window +
+2-poll hysteresis is sufficient burst protection. Diagnostic logging removed.
+
+---
+
+### Bug 2 — Compositor jitter-fired to 33 fps, causing stutter
+
+**Symptom:** After removing the caps path, the ratchet fired to 33 fps on fresh
+launch. All sources showed visible stutter; FNAF2 visually appeared ~15 fps despite
+reporting ~24 fps fps_in.
+
+**Root cause:** The 1-second fps_in measurement window accumulated 32–33 frames from
+the dummy adapter (nominally 30 fps) when frame arrivals bunched slightly — normal
+jitter. Two consecutive identical readings at 33 fps committed the ratchet. The
+compositor then ran at 33 fps; 24 fps FNAF2 content in a 33 fps compositor produces
+irregular judder (33/24 = 11/8, no clean telecine pattern), explaining the visible
+stutter on all tiles.
+
+**Fix:** Added `RATCHET_MIN_DELTA = 5` constant. `FramerateRatchet::check` now
+requires `candidate >= high_water + 5` before starting the 2-poll window. Jitter on a
+30 fps source peaks at ~34 fps (+4 fps); a genuine upgrade (48/50/60 fps) is always
+≥18 fps above a 30 fps baseline. After fix: no ratchet event on fresh launch with
+the mixed scene; compositor held at grid_fps=30 as expected.
+
+---
+
+### Net state after both fixes
+
+- fps_out: stable at 30 fps (grid_fps), no spurious ratchet events
+- Reset Rate button: functional — suppresses for 3 s, re-discovers at measured rates
+- cam-77: measured ~12 fps (below grid_fps, no ratchet contribution), displayed correctly
+- FNAF2: measured ~24 fps (below 30 fps, no ratchet contribution), smooth playback
+
+---
+
 ## Phase 2.3 validation log (native framerate + output ratchet)
 
 ### Gate 1 — Mid-session ratchet without freeze

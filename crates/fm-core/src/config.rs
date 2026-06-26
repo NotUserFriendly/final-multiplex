@@ -118,6 +118,10 @@ pub struct SourceConfig {
     /// Static: read once at pipeline build; not adjustable at runtime.
     #[serde(default = "default_volume")]
     pub volume: f64,
+    /// Source starts muted. Persisted back to the TOML on every toggle so
+    /// mute state survives app restarts.
+    #[serde(default)]
+    pub muted: bool,
 }
 
 fn default_volume() -> f64 {

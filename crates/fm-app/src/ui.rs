@@ -295,6 +295,9 @@ impl App {
                     if let Some(t) = &mut self.transport {
                         let _ = t.set_source_mute(&src.id, src.muted);
                     }
+                    if let Some(p) = &mut self.config_persist {
+                        p.set_source_muted(&src.id, src.muted);
+                    }
                 }
             }
 
@@ -704,7 +707,7 @@ fn try_init(
             id: s.id.clone(),
             offset_ms: s.offset_ms.clamp(file_min as i64, file_max as i64) as i32,
             offset_buf: s.offset_ms.to_string(),
-            muted: false,
+            muted: s.muted,
             display_name: uri_display_name(s.uri.as_deref().unwrap_or("")),
             min_offset_ms: file_min,
             max_offset_ms: file_max,

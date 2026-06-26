@@ -471,7 +471,7 @@ impl Pipeline {
                     tile_h,
                     offset_ns,
                     volume: source.volume,
-                    muted: false,
+                    muted: source.muted,
                 },
             );
 
@@ -646,6 +646,7 @@ impl Pipeline {
                 as_.set_offset(offset_ns);
                 as_.link(&mix_sink)?;
                 mix_sink.set_property("volume", source.volume);
+                mix_sink.set_property("mute", source.muted);
                 mixer_sink_pads.insert(source.id.clone(), mix_sink);
 
                 aconv_sink_for_cb = Some(aconv.static_pad("sink").ok_or("aconv: no sink pad")?);

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Mute state in scene config:** `SourceConfig` now has a `muted: bool` field
+  (defaults to `false`).  The mute button reflects the scene's initial mute state
+  on launch, and every toggle is persisted back to the scene TOML (same debounced
+  flush path as `offset_ms`), so mute state survives app restarts.  The old
+  workaround of setting `volume = 0.0` to silence a source is superseded — use
+  `muted = true` instead.
 - **Adapter reboot control (Block 5):** each external-source tile now has a
   "⟳ Reboot" button that triggers graceful adapter teardown and respawn via
   the existing supervisor path.  Offset and mute survive the reboot (stored

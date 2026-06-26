@@ -34,6 +34,11 @@ impl ConfigPersist {
         self.set_source_field(source_id, "offset_ms", toml_edit::value(offset_ms));
     }
 
+    /// Persist the muted flag for the source with the given id.
+    pub fn set_source_muted(&mut self, source_id: &str, muted: bool) {
+        self.set_source_field(source_id, "muted", toml_edit::value(muted));
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

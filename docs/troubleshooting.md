@@ -112,6 +112,34 @@ Attempt 3 — per-cell compositor layers, no gutters (TaskBlock-block3-chrome.md
   in the transport layer — neither is re-read from scene on respawn.
 - Reboot button rendered for external sources only.
 
+**Validation:** SIGNAL LOST appeared during the down phase; source recovered cleanly;
+offset and mute were intact after reconnect.
+
+---
+
+### Mute button not reflecting scene mute status
+
+**Symptom:** The mute button (`M` / `[M]`) always started unmuted regardless of whether
+the scene intended sources to be muted. Toggling mute in the UI worked for the session
+but state was lost on relaunch.
+
+**Root cause — no `muted` field in `SourceConfig`:** `SourceRow.muted` was hardcoded to
+`false` at startup. The only way to silence a source at launch was `volume = 0.0`, which
+silenced audio via gain but left the mute button showing the wrong state. Mute state was
+also not written back to the scene TOML, so it didn't survive app restarts.
+
+**Fix:**
+- Added `muted: bool` (`#[serde(default)]`) to `SourceConfig`.
+- `SourceLayout.muted` now initialised from `source.muted` instead of hardcoded `false`;
+  applied to the audiomixer sink pad for file sources at build time (`mix_sink.set_property("mute", source.muted)`).
+- `SourceRow.muted` in ui.rs initialised from `s.muted` instead of `false`.
+- `ConfigPersist::set_source_muted()` added; called from `ToggleMute` handler so every
+  toggle writes back to the scene TOML (same debounced flush path as offset_ms).
+
+**Validation:** launched 4-tile scene with `muted = true` on all sources — all four
+buttons showed `[M]`. Relaunched with cam-77 `muted = false` — only cam-77 showed `M`
+and was audible; others showed `[M]` and were silent.
+
 ---
 
 ### Validation notes — kill-and-recover test mechanics

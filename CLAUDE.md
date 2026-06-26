@@ -6,6 +6,11 @@ A task is not done until ALL of these are true:
 - [ ] New architectural decision? Flagged for the review chat — not authored or edited here
 - [ ] Commit message states what changed and why
 
+- **Cutting a release:** run `scripts/release.sh X.Y.Z` from a green tree (DoD passed). It bumps
+  the workspace version, rolls `[Unreleased]` into a dated `[X.Y.Z]` section, refreshes
+  `Cargo.lock`, commits, and creates an annotated `vX.Y.Z` tag — it does **not** push (review,
+  then push manually). `--dry-run` previews. Per ADR-0021.
+
 ## Claude Code UI/UX Behaviors
 - Before starting any multi-step task, create a todo checklist of all steps, then mark each in_progress → completed as you go.
 

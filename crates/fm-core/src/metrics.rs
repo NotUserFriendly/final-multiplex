@@ -21,19 +21,28 @@ struct SourceCounter {
     fps: f64,
     dropped: u64,
     last_reset: Instant,
+    /// Updated on every incoming buffer; used to detect EOS / stalled source.
+    last_frame_at: Instant,
 }
 
 impl SourceCounter {
     fn new() -> Self {
+        // Initialise last_frame_at far in the past so a source that never
+        // delivers any frames reads as stale immediately.
+        let long_ago = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
         Self {
             frames_since_reset: 0,
             fps: 0.0,
             dropped: 0,
             last_reset: Instant::now(),
+            last_frame_at: long_ago,
         }
     }
 
     fn on_buffer(&mut self) {
+        self.last_frame_at = Instant::now();
         self.frames_since_reset += 1;
         let elapsed = self.last_reset.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
@@ -82,6 +91,10 @@ pub struct MetricsCollector {
     per_source: Arc<Mutex<HashMap<String, SourceCounter>>>,
     output: Arc<Mutex<OutputCounter>>,
     audio_levels: AudioStore,
+    /// Stale threshold for fps_in: 1500 ms + compositor latency.  Ensures
+    /// FILE TERMINATED fires only after buffered frames have cleared the
+    /// compositor, not while the last frames are still in the latency window.
+    fps_stale_ms: u64,
 }
 
 impl MetricsCollector {
@@ -141,11 +154,13 @@ impl MetricsCollector {
         }
 
         let audio_levels: AudioStore = Arc::new(Mutex::new(HashMap::new()));
+        let fps_stale_ms = pipeline.compositor_latency_ms() as u64 + 300;
 
         Self {
             per_source,
             output,
             audio_levels,
+            fps_stale_ms,
         }
     }
 
@@ -160,9 +175,21 @@ impl MetricsCollector {
         let out = self.output.lock().unwrap();
         let audio = self.audio_levels.lock().unwrap();
 
+        // Report fps_in as 0 once no buffer has arrived for fps_stale_ms.
+        // fps_stale_ms = compositor_latency_ms + 1500 so the stale window
+        // covers the compositor's latency buffer; without this, FILE TERMINATED
+        // fires while the last frames are still being displayed from the buffer.
+        let stale_fps = std::time::Duration::from_millis(self.fps_stale_ms);
         let (fps_in, dropped) = per
             .get(source_id)
-            .map(|c| (c.fps, c.dropped))
+            .map(|c| {
+                let fps = if c.last_frame_at.elapsed() > stale_fps {
+                    0.0
+                } else {
+                    c.fps
+                };
+                (fps, c.dropped)
+            })
             .unwrap_or((0.0, 0));
 
         // Floor the meter if no level message has arrived in the last 300 ms

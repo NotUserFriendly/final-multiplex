@@ -169,9 +169,9 @@ impl App {
                                 })
                                 .unwrap_or(false);
                         } else {
-                            let fps_out =
-                                self.source_metrics.get(i).map(|m| m.fps_out).unwrap_or(0.0);
-                            if fps_out > 0.0 {
+                            let fps_in =
+                                self.source_metrics.get(i).map(|m| m.fps_in).unwrap_or(0.0);
+                            if fps_in > 0.0 {
                                 src.has_ever_had_frames = true;
                             }
                         }
@@ -543,9 +543,9 @@ impl App {
             ..Default::default()
         };
         // Determine per-tile display state.
-        let fps_out = self.source_metrics.get(i).map(|m| m.fps_out).unwrap_or(0.0);
+        let fps_in = self.source_metrics.get(i).map(|m| m.fps_in).unwrap_or(0.0);
         let file_terminated =
-            !src.is_external && src.has_ever_had_frames && fps_out == 0.0 && self.playing;
+            !src.is_external && src.has_ever_had_frames && fps_in == 0.0 && self.playing;
         let state_label: Option<&str> = if src.is_external && src.signal_lost {
             Some("SIGNAL LOST")
         } else if file_terminated {

@@ -21,9 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **SIGNAL LOST** overlay (50% translucent black, white text, centered)
     appears when an external source's adapter is reconnecting, restarting, or
     in a failed state.
-  - **FILE TERMINATED** overlay appears for a finite file source when
-    `fps_out` drops to 0 while the pipeline is playing and the source has
-    previously delivered frames (distinguishes EOS from pre-start).
+  - **FILE TERMINATED** overlay appears for a finite file source once
+    `fps_in` (per-source, probed at `vcaps:src`) has been silent for
+    `compositor_latency_ms + 300 ms`, so the overlay fires after the last
+    buffered frame has cleared the compositor rather than while it is still
+    being displayed.  `fps_in` now correctly reports 0 after EOS by tracking
+    `last_frame_at` per source; it previously held its last measured value
+    indefinitely since `on_buffer()` is never called after EOS.
 - **Output aspect ratio derived from grid geometry (2×1 bug fix):**
   `scene.grid.width`/`height` are now per-tile dimensions; the compositor
   canvas is computed as `columns × width` × `rows × height`.  A 2×1 grid

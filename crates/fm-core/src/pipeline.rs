@@ -214,6 +214,11 @@ pub struct Pipeline {
     /// Configured live-source offset ceiling in milliseconds (ADR-0016).
     /// Used to size the per-source offset buffer queues.
     ceiling_ms: u32,
+    /// Compositor latency in milliseconds — equals ceiling_ms when external
+    /// sources are present, 0 otherwise.  Used by MetricsCollector to adjust
+    /// the fps stale threshold so FILE TERMINATED fires after buffered frames
+    /// have actually been displayed, not while they are still in the compositor.
+    compositor_latency_ms: u32,
 }
 
 impl Pipeline {
@@ -286,6 +291,11 @@ impl Pipeline {
             .source
             .iter()
             .any(|s| s.source_type == SourceType::External);
+        let compositor_latency_ms = if has_external {
+            scene.grid.live_offset_ceiling_ms
+        } else {
+            0
+        };
         if has_external {
             let ceiling_ns: u64 = scene.grid.live_offset_ceiling_ms as u64 * 1_000_000;
             compositor.set_property("latency", ceiling_ns);
@@ -782,11 +792,16 @@ impl Pipeline {
             grid_fps,
             source_layouts,
             ceiling_ms: scene.grid.live_offset_ceiling_ms,
+            compositor_latency_ms,
         })
     }
 
     pub fn inner(&self) -> &gstreamer::Pipeline {
         &self.inner
+    }
+
+    pub fn compositor_latency_ms(&self) -> u32 {
+        self.compositor_latency_ms
     }
 
     pub fn appsink(&self) -> &gstreamer_app::AppSink {

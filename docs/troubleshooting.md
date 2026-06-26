@@ -123,3 +123,39 @@ then exit the loop and let the next respawn run to completion.
 Earlier one-liner attempt failed (exit 144): the loop's own cmdline contained the
 search pattern `fm-rtsp-adapter.*cam-27`, causing `pgrep -f` to match and kill the
 bash process itself. Fixed by writing the loop to `/tmp/hold_dead.sh`.
+
+---
+
+### FILE TERMINATED timing bug (Block 4)
+
+**Symptom:** FILE TERMINATED overlay appeared a few frames before the file stopped
+playing — visible on top of still-moving video at the end of the clip.
+
+**Root cause — wrong metric:** `file_terminated` was keyed on `fps_out`, which is
+the global compositor output rate (probe on the appsink sink pad). The compositor
+keeps running regardless of whether a file source has ended, so `fps_out` never
+drops to 0. Fixed to use `fps_in` (per-source, probed on `vcaps:src`).
+
+**Root cause — stale fps never zeros:** `SourceCounter.fps` is only updated inside
+`on_buffer()`. After EOS, `on_buffer()` is never called again, so `fps` holds its
+last non-zero value indefinitely. Fixed by adding `last_frame_at: Instant` to
+`SourceCounter` (updated on every buffer) and checking staleness at snapshot time:
+if `last_frame_at.elapsed() > fps_stale_ms`, report `fps_in = 0`.
+
+**Root cause — compositor latency:** `fps_stale_ms` was initially set to a flat
+1500 ms. When external sources are present the compositor has a `latency` property
+set to `ceiling_ms` (default 2000 ms), which buffers all sources — including file
+sources — by up to 2000 ms. With `fps_stale_ms = 1500`, FILE TERMINATED fired
+500 ms before the last frame was actually displayed. Fixed: `fps_stale_ms =
+compositor_latency_ms + 300` (300 ms margin for downstream pipeline + iced latency).
+
+**Stale fps side-effects audit:**
+- `fps_in` shown in per-source stats display (ui.rs:440): correctly reads 0 after
+  a file ends — desired.
+- `has_ever_had_frames` latch (ui.rs:172): uses `fps_in > 0` to set; once latched
+  true, stale→0 has no effect.
+- `StreamsChanged` handler (ui.rs:210): reads from `sup.status_handle()` —
+  adapter-reported telemetry, not MetricsCollector. Unaffected.
+- Supervisor delivery watchdog (supervisor.rs:415, 779): also reads adapter
+  telemetry, not MetricsCollector. Unaffected.
+No unintended side-effects from the stale zeroing.

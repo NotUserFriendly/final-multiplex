@@ -61,6 +61,40 @@ comparison is moot.
 
 ---
 
+## Tile-res revert validation (ADR-0025, 2026-06-29)
+
+**Scene:** 4-source 2×2 (1 dummy + 2 RTSP + 1 file), same as Block 3 baseline.
+**Binary:** tile-res revert commit (GPU probe back on `vcaps_{id}:src`).
+
+**A/B comparison result (maintainer-verified 2026-06-29):**
+Maintainer recorded both runs externally and compared side-by-side.  Stutter is
+**identical** between tile-res and native-res capture.  Conclusion: the stutter is not
+caused by capture resolution or copy cost — it is a present-timing beat (16 ms wall-clock
+timer at ~62.5 Hz beating against ~60 Hz vsync), independent of capture resolution.
+**No tile-res revert.** Capture stays at native-res (ADR-0025 updated).
+
+**Step 3 — 4K fullscreen calibration:**
+Deferred — fullscreen 4K measurement should be taken after the vsync/timer-beat fix so it
+reflects capture copy cost alone, not the timing beat.  See ADR-0025.
+
+**Measured perf (tile-res revert, windowed, 3-sample average, CC-measured 2026-06-29):**
+
+| Process | CPU % | RSS | Notes |
+|---|---|---|---|
+| `final-multiplex` (main app) | **~486%** | 9.2 GB | down from ~544% (native-res), ~380% (Block 3 tile-res) |
+| `fm-rtsp-adapter` cam-27 | ~81% | 1.2 GB | decode + convert + scale to tile |
+| `fm-rtsp-adapter` cam-77 | ~37% | 661 MB | lighter load |
+| `fm-dummy-adapter` | ~15% | 534 MB | synthetic RGBA |
+| **GPU** | **62–66% util, 2% mem-BW** | 2193–2233 MiB | wgpu render, 24564 MiB total |
+
+Note: main-app CPU slightly higher than the Block 3 tile-res baseline (~380%) — the ring
+buffer now holds tile-res frames (960×540 RGBA = ~2 MB each) but is sized to
+`ceiling_ms + 500 ms`, and the capture thread is running at the same rate.  The delta
+from 380% likely reflects the additional GPU side panel render overhead introduced in
+later blocks (shared pipeline + 4-source draw per refresh at 60 Hz).
+
+---
+
 ## Block 4 validation — decouple + offset (2026-06-29)
 
 **Decouple test (the rephase headline payoff):**

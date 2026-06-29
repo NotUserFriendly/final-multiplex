@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GPU presentation path — native resolution (Phase 3 B2, experimental, additive):**
+  the GPU path now captures frames at **native input resolution** instead of tile-res:
+  - *Probe moved to pre-scale tap (`vdeint_{id}:src`):* the GPU ring receives frames
+    before `vscale` downscales them to tile dimensions.  File sources present at their
+    decoded resolution; RTSP sources present at native camera resolution.
+  - *Adapter vshmcaps relaxed:* the core's `vshmcaps` no longer constrains width/height
+    (format + PAR only), so native-res frames from the adapter flow through unmodified.
+    The compositor path's `vscale→vcaps(tile)` chain is unchanged.
+  - *RTSP adapter vcaps relaxed:* `prod_w`/`prod_h` scale removed from the adapter-side
+    `vcaps` capsfilter — the camera's native resolution now flows to the core unchanged.
+    (`vscale` inside the adapter becomes a no-op and is preserved for format conversion.)
+  - *Res-appropriate-to-rect (ADR-0024 B2 deferred):* the bandwidth optimization
+    (native-res for large tiles, tile-res for thumbnails) is documented but not yet
+    wired — all tiles are equal-size today so the selection is moot; will be activated
+    when focus mode (Phase 5) introduces variable-size rects.
 - **GPU presentation path — Phase 3 Block 3 (experimental, additive):** three
   efficiency improvements over the Block 2 baseline (711% main-app CPU, 84% GPU util):
   - *Off-thread capture copy (3a):* pad probe now enqueues a `gst::Buffer` reference

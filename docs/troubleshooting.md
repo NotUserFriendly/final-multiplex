@@ -51,9 +51,27 @@ startup (not drifting).  For a cleaner alignment test use a scene with only file
 sources (no live-source startup stall), or compare after setting a known offset
 on the GPU path to compensate.
 
-**Status:** Expected behaviour at this stage.  Not a defect.  ADR-0024 demotes
-the compositor to record tier; in the final architecture the GPU path IS the
-display reference and this comparison is moot.
+**Status:** Maintainer-verified (2026-06-29).  Observed the GPU-ahead-of-compositor
+gap with live RTSP sources present; accepted the compositor-startup-latency explanation
+as sufficient — the gap is session-startup-dependent and not a scheduler defect.
+File-source-only isolation was not run; the live-source startup-delay mechanism is
+understood and the file case is not a concern.  ADR-0024 demotes the compositor to
+record tier; in the final architecture the GPU path IS the display reference and this
+comparison is moot.
+
+---
+
+## Block 4 validation — decouple + offset (2026-06-29)
+
+**Decouple test (the rephase headline payoff):**
+Maintainer manually killed a source mid-session.  Observed: the killed tile froze in
+its own rect; all other tiles continued advancing normally.  Recovery confirmed on
+source reboot.  Maintainer-verified 2026-06-29.
+
+**User-settable offsets on GPU path:**
+Maintainer confirmed offsets are settable and present correctly on the GPU-path tiles
+(GPU-side frame selection visibly lags behind by the configured amount at positive
+offsets).  Maintainer-verified 2026-06-29.
 
 ---
 
@@ -136,6 +154,32 @@ the GPU path moves to native-res textures in Block 3.
 
 **Status:** Resolved.  Architecture win will be fully banked at native-res + dmabuf (next
 block), which eliminates the CPU-side capture copy entirely.
+
+---
+
+## B1 dmabuf zero-copy: wgpu-hal 27 has no Linux dmabuf import path (2026-06-29)
+
+**Status: Decision needed (flagged for review chat).**
+
+**Finding:** wgpu-hal 27.0.4 enables `VK_EXT_external_memory_dma_buf` on adapters that
+support it, but the only wired external-memory import path is Win32 (`D3D11_TEXTURE`
+handle type, for cross-GPU sharing).  There is no `create_texture_from_dma_buf` or
+equivalent high-level API for importing a Linux dmabuf fd as a wgpu texture.  Implementing
+it would require:
+1. Adding `wgpu-hal` as a direct explicit dependency with its `vulkan` feature.
+2. Using `device.create_texture_from_hal::<wgpu::hal::vulkan::Api>` with a manually
+   constructed `vk::Image` and `vk::DeviceMemory` backed by the dmabuf fd
+   (`vkImportMemoryFdKHR`, handle type `DMA_BUF_BIT_EXT`).
+3. Unsafe Vulkan-only code with no fallback mechanism at the wgpu level.
+
+This constitutes a real architectural sub-decision (not just implementation): which
+import path, what the fallback looks like if ash/Vulkan is absent, and whether to wait
+for wgpu to expose a cleaner API.  **Flagged for the review chat to decide scope and
+capture as an ADR note under 0024.**
+
+**Unblocked path (B2):** native-res CPU-copy path is now implemented (probe moved to
+`vdeint:src`).  The ~380% capture cost will reduce proportionally with dmabuf once
+the import path is resolved — the architecture is in place.
 
 ---
 

@@ -695,14 +695,16 @@ fn build_video_chain(
     let vcaps = make("capsfilter", "vcaps");
     let vunixfdsink = fm_adapter_sdk::transport::make_output_sink("vunixfdsink", shm_path);
 
-    // Only pin format, resolution, and pixel-aspect-ratio.  No framerate field
-    // so the camera's negotiated rate passes through unmodified.
+    // Pin format and PAR only — no width/height constraint so the camera's
+    // native resolution flows through to the core unscaled.  The core's
+    // vscale→vcaps(tile) handles the downscale for the compositor path; the
+    // GPU path taps before vscale to get native-res frames (ADR-0024 B2).
+    // prod_w / prod_h args are accepted but no longer used for scaling.
+    let _ = (prod_w, prod_h);
     vcaps.set_property(
         "caps",
         &gstreamer::Caps::builder("video/x-raw")
             .field("format", "RGBA")
-            .field("width", prod_w)
-            .field("height", prod_h)
             .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build(),
     );

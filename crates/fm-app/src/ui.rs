@@ -267,19 +267,19 @@ impl App {
                                 if let Some(m) = &self.metrics {
                                     m.attach_source(&id, t.pipeline());
                                 }
-                                // apply_streams_changed replaces the entire vcaps
-                                // chain (remove_video_chain + add_video_chain), so
+                                // apply_streams_changed replaces the entire chain
+                                // (remove_video_chain + add_video_chain), so
                                 // the probe installed at try_init is now on a dead
-                                // element.  Reinstall on the new vcaps pad.
+                                // element.  Reinstall on the new pre-scale pad.
                                 if let Some(store) = self.gpu_stores.get(&id) {
                                     if let Some(pad) = t
                                         .pipeline()
                                         .source_pads()
                                         .get(&id)
-                                        .and_then(|p| p.video_src.as_ref())
+                                        .and_then(|p| p.pre_scale_video_src.as_ref())
                                     {
                                         gpu_path::install_probe(pad, store.clone());
-                                        eprintln!("[gpu-path] probe reinstalled on vcaps_{id}");
+                                        eprintln!("[gpu-path] native-res probe reinstalled on vdeint_{id}");
                                     }
                                 }
                             }
@@ -1033,20 +1033,21 @@ fn try_init(
 
     bridge::install(pipeline.appsink(), frame_store.clone());
 
-    // GPU presentation path (ADR-0024, Block 2): probe every source with a
-    // video pad.  Ring sized by the scene's offset ceiling (time-based, not
-    // frame-count) — same lesson as the Phase-2.3 voff_q fix.
+    // GPU presentation path (ADR-0024, Block 2/B2): probe every source with a
+    // video pad at the pre-scale tap (vdeint:src) so the GPU path receives
+    // frames at native input resolution rather than tile-res (ADR-0024 B2).
+    // Ring sized by the scene's offset ceiling (time-based, not frame-count).
     let gpu_stores: HashMap<String, GpuFrameStore> = sources
         .iter()
         .filter_map(|s| {
             pipeline
                 .source_pads()
                 .get(&s.id)
-                .and_then(|p| p.video_src.as_ref())
+                .and_then(|p| p.pre_scale_video_src.as_ref())
                 .map(|pad| {
                     let store = gpu_path::new_store(scene.grid.live_offset_ceiling_ms as u64);
                     gpu_path::install_probe(pad, store.clone());
-                    eprintln!("[gpu-path] probe installed on vcaps_{}", s.id);
+                    eprintln!("[gpu-path] native-res probe installed on vdeint_{}", s.id);
                     (s.id.clone(), store)
                 })
         })

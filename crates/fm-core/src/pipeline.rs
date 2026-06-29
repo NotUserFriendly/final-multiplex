@@ -152,9 +152,15 @@ fn make_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Elemen
 /// the `capsfilter:src` pads that feed the compositor and audiomixer rather
 /// than the mixer sink pads themselves (ADR-0004).
 pub struct SourcePads {
-    /// `vcaps_{id}:src` — the source pad feeding `compositor:sink_N`.
+    /// `vcaps_{id}:src` — the tile-res source pad feeding `compositor:sink_N`.
     /// None when the source has no video stream.
     pub video_src: Option<gstreamer::Pad>,
+    /// `vdeint_{id}:src` — the **pre-scale** source pad at native input resolution
+    /// (before `vscale` downscales to tile dimensions for the compositor path).
+    /// Used by the GPU presentation path (ADR-0024) to capture frames at native
+    /// quality without the tile-res crop imposed by ADR-0012.
+    /// None when the source has no video stream.
+    pub pre_scale_video_src: Option<gstreamer::Pad>,
     /// `acaps_{id}:src` — the source pad feeding `audiomixer:sink_N`.
     /// None when the source has no audio stream.
     pub audio_src: Option<gstreamer::Pad>,
@@ -205,9 +211,7 @@ pub struct Pipeline {
     mixer_sink_pads: HashMap<String, gstreamer::Pad>,
     /// `compositor` sink pad per source — stored so we can release it on teardown.
     comp_sink_pads: HashMap<String, gstreamer::Pad>,
-    /// Grid output resolution and framerate — needed when building chains dynamically.
-    grid_w: i32,
-    grid_h: i32,
+    /// Grid output framerate — needed when building chains dynamically.
     grid_fps: i32,
     /// Tile layout per external source — needed when building chains dynamically.
     source_layouts: HashMap<String, SourceLayout>,
@@ -440,11 +444,6 @@ impl Pipeline {
         if n_sources == 0 {
             return Err("scene.toml has no [[source]] entries".into());
         }
-        // tile_w/tile_h = adapter production size (per-tile, not canvas).
-        // grid_w/grid_h stored in Pipeline struct so add_video_chain can set
-        // vshmcaps to the adapter production resolution on reconnect.
-        let grid_w = tile_w;
-        let grid_h = tile_h;
         let grid_fps = scene.grid.fps as i32;
 
         let mut source_pads: HashMap<String, SourcePads> = HashMap::new();
@@ -525,6 +524,8 @@ impl Pipeline {
 
             // ── Video chain (only when probe confirmed video) ──────────────
             let mut vcaps_src: Option<gstreamer::Pad> = None;
+            // Pre-scale pad for the GPU native-res path (ADR-0024 B2).
+            let mut pre_scale_vcaps_src: Option<gstreamer::Pad> = None;
             let mut vconv_sink_for_cb: Option<gstreamer::Pad> = None;
 
             if has_video {
@@ -570,6 +571,10 @@ impl Pipeline {
                 let vs = vcaps.static_pad("src").ok_or("vcaps: no src pad")?;
                 vs.set_offset(offset_ns);
 
+                // GPU pre-scale tap: vdeint:src is before vscale, giving the
+                // GPU path frames at native input resolution (ADR-0024 B2).
+                pre_scale_vcaps_src = Some(vdeint.static_pad("src").ok_or("vdeint: no src pad")?);
+
                 // For external (live) sources, insert the offset buffer queue
                 // between vcaps and the compositor (ADR-0016).  The queue holds
                 // up to ceiling_ms of tile-resolution frames so a positive pad
@@ -608,6 +613,7 @@ impl Pipeline {
                 comp_sink_pads.insert(source.id.clone(), comp_sink);
                 vconv_sink_for_cb = Some(vconv.static_pad("sink").ok_or("vconv: no sink pad")?);
                 vcaps_src = Some(vs);
+                // pre_scale_vcaps_src already set above before the voff_q branch.
             }
 
             // ── Audio chain (only when probe confirmed audio) ──────────────
@@ -658,6 +664,7 @@ impl Pipeline {
                 source.id.clone(),
                 SourcePads {
                     video_src: vcaps_src,
+                    pre_scale_video_src: pre_scale_vcaps_src,
                     audio_src: acaps_src,
                 },
             );
@@ -715,12 +722,15 @@ impl Pipeline {
                             gstreamer::ElementFactory::make("capsfilter")
                                 .name(format!("vshmcaps_{}", source.id))
                                 .build()?;
+                        // GPU native-res path (ADR-0024 B2): do NOT constrain
+                        // width/height here — the adapter now sends at its native
+                        // camera resolution.  vscale→vcaps(tile) in the core
+                        // handles the downscale for the compositor path; the GPU
+                        // path probes vdeint:src to capture at native resolution.
                         vshmcaps.set_property(
                             "caps",
                             gstreamer::Caps::builder("video/x-raw")
                                 .field("format", "RGBA")
-                                .field("width", grid_w)
-                                .field("height", grid_h)
                                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                                 .build(),
                         );
@@ -788,8 +798,6 @@ impl Pipeline {
             source_pads,
             mixer_sink_pads,
             comp_sink_pads,
-            grid_w,
-            grid_h,
             grid_fps,
             source_layouts,
             ceiling_ms: scene.grid.live_offset_ceiling_ms,
@@ -1007,12 +1015,13 @@ impl Pipeline {
         let vunixfdsrc = make_transport_src(&format!("vunixfdsrc_{source_id}"), &video_sock)?;
 
         let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
+        // Native-res GPU path (ADR-0024 B2): no width/height constraint here —
+        // the adapter sends at native camera resolution.  vscale→vcaps(tile)
+        // handles the downscale for the compositor path.
         vshmcaps.set_property(
             "caps",
             gstreamer::Caps::builder("video/x-raw")
                 .field("format", "RGBA")
-                .field("width", self.grid_w)
-                .field("height", self.grid_h)
                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                 .build(),
         );
@@ -1132,14 +1141,18 @@ impl Pipeline {
         }
 
         eprintln!("[pipeline] added video chain for '{source_id}'");
+        let pre_scale_src = vdeint.static_pad("src").ok_or("vdeint: no src")?;
         self.comp_sink_pads.insert(source_id.to_string(), comp_sink);
-        self.source_pads
+        let entry = self
+            .source_pads
             .entry(source_id.to_string())
             .or_insert(SourcePads {
                 video_src: None,
+                pre_scale_video_src: None,
                 audio_src: None,
-            })
-            .video_src = Some(vcaps_src);
+            });
+        entry.video_src = Some(vcaps_src);
+        entry.pre_scale_video_src = Some(pre_scale_src);
         Ok(())
     }
 
@@ -1163,6 +1176,7 @@ impl Pipeline {
         }
         if let Some(sp) = self.source_pads.get_mut(source_id) {
             sp.video_src = None;
+            sp.pre_scale_video_src = None;
         }
 
         for name in [
@@ -1271,6 +1285,7 @@ impl Pipeline {
             .entry(source_id.to_string())
             .or_insert(SourcePads {
                 video_src: None,
+                pre_scale_video_src: None,
                 audio_src: None,
             })
             .audio_src = Some(acaps_src);

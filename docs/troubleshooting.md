@@ -135,6 +135,45 @@ is incorrect and requires revision.  Three paths forward (decision for review ch
    Architectural change; the taskblock named this as the fallback if iced friction
    materialised.  It has.
 
+**Render-rate split measurement (CC-measured 2026-06-29):**
+Ran the renderrate-measure taskblock: downscaled textures to 426×240 before
+`write_texture` (upload ~400 KB vs 33 MB native-res), kept all other path unchanged,
+measured `Message::Frame` rate in batches of 30 with per-batch fps and per-frame
+upload time logged to session log.
+
+Key numbers over a ~30-minute session:
+
+| Phase | Frames | Batch fps range | Avg upload / frame |
+|---|---|---|---|
+| Startup (cold) | 1–300 | **44–60 fps** (avg ~54) | ~50–59 μs |
+| Mid session | 300–990 | **35–56 fps** (avg ~48) | ~49–52 μs |
+| Late (sustained) | 990+ | **24–30 fps** (avg ~28) | ~53–65 μs |
+
+Upload time: consistently **~50–65 μs** regardless of phase.  At native-res (80× more
+data) upload would be ~4 ms — present but not the floor.
+
+**Split conclusion — iced event-loop overhead is the dominant and growing bottleneck:**
+- The upload (even at native-res ~4 ms) cannot explain a 53 ms cycle.  Eliminating 32 MB
+  of upload data (tiny textures) only recovers ~4 ms; the cycle is still 17–40 ms.
+- The render rate DEGRADES from ~54 fps at startup to ~28 fps after 10–15 min of
+  sustained operation — with tiny textures.  Upload cost is constant; the degradation is
+  from event-loop pressure accumulating under sustained load (ring-buffer eviction,
+  probable thermal throttle, or both).
+- Early 44–60 fps is a cold-machine artifact (empty ring, cool silicon), not a steady-state
+  we can count on.
+
+**Taskblock classification: Path 3.**
+The taskblock's decision tree:
+- ≥ 50 fps with tiny tex → upload was the wall → Path 1
+- ≤ 30 fps with tiny tex → loop can't reach 60 → Path 3 (dedicated GPU surface)
+- 30–50 fps → both → Path 1 now, Path 3 eventually
+
+Sustained late-session fps is ≤ 30.  Even the cold-start phase sits in the 30–50 range,
+not ≥ 50.  **Path 3 is required: the GPU compositor needs its own wgpu present loop
+outside iced's event dispatch.**  Path 1 (smaller uploads) is a palliative that buys a
+few minutes of better fps on a cold machine; it does not fix the steady-state problem.
+This is an architectural decision → flag for review chat to author ADR.
+
 **Measured perf (tile-res revert, windowed, 3-sample average, CC-measured 2026-06-29):**
 
 | Process | CPU % | RSS | Notes |

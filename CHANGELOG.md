@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-29
+
 ### Fixed
 - **GPU present-timing beat eliminated (vsync-driven scheduler):** the GPU path
   previously selected and presented frames on a `time::every(16 ms)` wall-clock timer

@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "fm-adapter-sdk"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "gstreamer",
  "serde",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "fm-app"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "fm-adapter-sdk",
  "fm-core",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "fm-core"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "fm-adapter-sdk",
  "gstreamer",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "fm-dummy-adapter"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "fm-adapter-sdk",
  "gstreamer",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "fm-rtsp-adapter"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "fm-adapter-sdk",
  "gstreamer",

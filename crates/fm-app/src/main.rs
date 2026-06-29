@@ -66,10 +66,16 @@ fn main() -> iced::Result {
             let rows = (n.max(1) + cols - 1) / cols;
             let ar =
                 (cols as f32 * scene.grid.width as f32) / (rows as f32 * scene.grid.height as f32);
-            let w = 1280.0f32;
-            iced::Size::new(w, (w / ar).round() + ui::CHROME_H)
+            // Compositor portion sized at 1280 wide; GPU side panel adds
+            // GPU_PANEL_W to the right for the Block 1 proof display.
+            let compositor_w = 1280.0f32;
+            let h = (compositor_w / ar).round() + ui::CHROME_H;
+            iced::Size::new(compositor_w + ui::GPU_PANEL_W, h)
         })
-        .unwrap_or(iced::Size::new(1280.0, 720.0 + ui::CHROME_H));
+        .unwrap_or(iced::Size::new(
+            1280.0 + ui::GPU_PANEL_W,
+            720.0 + ui::CHROME_H,
+        ));
 
     iced::application(boot, ui::App::update, ui::App::view)
         .title("Final Multiplex")

@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const MIN_OFFSET_MS: i32 = -60_000;
 const MAX_OFFSET_MS: i32 = 60_000;
 pub(crate) const CHROME_H: f32 = 50.0;
+/// Width of the GPU-path side panel (Block 1 proof display).
+pub(crate) const GPU_PANEL_W: f32 = 480.0;
 
 struct SourceRow {
     id: String,
@@ -407,17 +409,19 @@ impl App {
         }
 
         // ── Compute video display dimensions locked to output aspect ratio ──
-        // The container is black (letterbox/pillarbox bars); the video Stack
-        // inside is sized exactly to the grid AR so tile overlays align.
+        // The GPU side panel takes GPU_PANEL_W from the right; the compositor
+        // output is sized from the remaining width.
         let avail_h = (self.win_h - CHROME_H).max(1.0);
-        let video_w = (avail_h * self.grid_ar).min(self.win_w);
+        let avail_w = (self.win_w - GPU_PANEL_W).max(1.0);
+        let video_w = (avail_h * self.grid_ar).min(avail_w);
         let video_h = video_w / self.grid_ar;
 
-        // ── Layer 0: video shader ──────────────────────────────────────────
         let black_bg = |_: &iced::Theme| container::Style {
             background: Some(Background::Color(Color::BLACK)),
             ..Default::default()
         };
+
+        // ── Layer 0: compositor output ─────────────────────────────────────
         let video_layer: Element<Message> = if self.current_frame.is_some() {
             container(
                 shader(VideoProg {
@@ -440,32 +444,11 @@ impl App {
                 .into()
         };
 
-        // ── Layer 1: GPU-path PiP (ADR-0024 Block 1 proof) ────────────────
-        // Draws the GPU-path source in the bottom-right quarter of the video
-        // area using the arbitrary-rect wgpu shader.  The compositor path
-        // (layer 0) continues to run beneath it — both paths are live.
-        // rect = [x0=-1+1=0, y0=-1, x1=1, y1=0] → bottom-right quarter in NDC.
-        let gpu_rect_layer: Element<Message> = if self.current_gpu_frame.is_some() {
-            shader(GpuRectProg {
-                frame: self.current_gpu_frame.clone(),
-                rect: [-0.5, -0.5, 0.5, 0.5],
-            })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-        } else {
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        };
-
-        // ── Layer 2: per-tile overlay grid ─────────────────────────────────
+        // ── Layer 1: per-tile overlay grid ─────────────────────────────────
         let overlay_layer = self.tile_overlay_grid();
 
-        // Stack + centre in black surround
-        let video_area = container(
-            stack([video_layer, gpu_rect_layer, overlay_layer])
+        let compositor_area = container(
+            stack([video_layer, overlay_layer])
                 .width(Length::Fixed(video_w))
                 .height(Length::Fixed(video_h)),
         )
@@ -474,6 +457,46 @@ impl App {
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill);
+
+        // ── GPU side panel (ADR-0024 Block 1) ─────────────────────────────
+        // Sits to the right of the compositor — both paths visible side by side.
+        // Sized to maintain the tile AR so the source isn't distorted.
+        let gpu_vid_h = GPU_PANEL_W / self.grid_ar;
+        let dark_panel_bg = |_: &iced::Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.05, 0.05, 0.05))),
+            ..Default::default()
+        };
+        let gpu_video: Element<Message> = if self.current_gpu_frame.is_some() {
+            shader(GpuRectProg {
+                frame: self.current_gpu_frame.clone(),
+                rect: [-1.0, -1.0, 1.0, 1.0],
+            })
+            .width(Length::Fixed(GPU_PANEL_W))
+            .height(Length::Fixed(gpu_vid_h))
+            .into()
+        } else {
+            container(text("waiting…").color(Color::WHITE))
+                .width(Length::Fixed(GPU_PANEL_W))
+                .height(Length::Fixed(gpu_vid_h))
+                .center_x(Length::Fixed(GPU_PANEL_W))
+                .center_y(Length::Fixed(gpu_vid_h))
+                .into()
+        };
+        let gpu_label = text(format!(
+            "GPU PATH — {}",
+            self.gpu_source_id.as_deref().unwrap_or("none")
+        ))
+        .size(11)
+        .color(Color::WHITE);
+        let gpu_side_panel = container(column![gpu_label, gpu_video].spacing(4))
+            .style(dark_panel_bg)
+            .width(Length::Fixed(GPU_PANEL_W))
+            .height(Length::Fill)
+            .padding(8);
+
+        let video_area = row![compositor_area, gpu_side_panel]
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         // ── Chrome: master Play/Pause only ─────────────────────────────────
         let play_label = if self.playing {

@@ -315,18 +315,18 @@ struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 
 // ── GPU presentation path: arbitrary-rect shader widget (ADR-0024) ───────────
 //
-// Draws one source's texture at an arbitrary NDC rect [x0, y0, x1, y1].
+// Draws N sources, each at its own NDC rect [x0, y0, x1, y1].
 // NDC convention: X ∈ [-1, 1] left→right; Y ∈ [-1, 1] bottom→top.
-// Example — bottom-right quarter: [-1.0, -1.0, 1.0, 0.0] … err, [0.0, -1.0, 1.0, 0.0].
 //
-// The rect is the "general interface" ADR-0024 requires from day one:
-// focus mode, per-source fit, and layout editing all change only the rect
-// values, not the renderer.
+// Design note: iced shares shader::Pipeline across all widgets of the same
+// Primitive type, so stacking N separate shader(GpuRectProg) widgets would
+// have them overwrite each other's texture in the shared pipeline state.
+// Instead, one GpuRectProg widget carries all N (frame, rect) pairs and
+// makes N draw calls in a single pass, each with its own per-slot GpuRectInner.
 
 pub struct GpuRectProg {
-    pub frame: Option<Arc<TimedFrame>>,
-    /// [x0, y0, x1, y1] in NDC clip space.  Y=-1 is bottom, Y=+1 is top.
-    pub rect: [f32; 4],
+    /// One entry per source: (frame, [x0, y0, x1, y1]).
+    pub sources: Vec<(Option<Arc<TimedFrame>>, [f32; 4])>,
 }
 
 impl<Msg> shader::Program<Msg> for GpuRectProg
@@ -338,16 +338,14 @@ where
 
     fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> GpuRectPrim {
         GpuRectPrim {
-            frame: self.frame.clone(),
-            rect: self.rect,
+            sources: self.sources.clone(),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GpuRectPrim {
-    frame: Option<Arc<TimedFrame>>,
-    rect: [f32; 4],
+    sources: Vec<(Option<Arc<TimedFrame>>, [f32; 4])>,
 }
 
 impl shader::Primitive for GpuRectPrim {
@@ -361,76 +359,79 @@ impl shader::Primitive for GpuRectPrim {
         _bounds: &Rectangle,
         _viewport: &Viewport,
     ) {
-        let frame = match &self.frame {
-            Some(f) => f,
-            None => return,
-        };
-        let (w, h) = (frame.width, frame.height);
-
-        let rebuild = pipeline
-            .inner
-            .as_ref()
-            .map(|i| i.tex_w != w || i.tex_h != h)
-            .unwrap_or(true);
-        if rebuild {
-            pipeline.inner = Some(GpuRectInner::new(device, pipeline.format, w, h));
+        // Grow the per-slot vec to match source count.
+        if pipeline.slots.len() < self.sources.len() {
+            pipeline.slots.resize_with(self.sources.len(), || None);
         }
 
-        let inner = pipeline.inner.as_mut().unwrap();
+        for (slot, (frame, rect)) in self.sources.iter().enumerate() {
+            let Some(frame) = frame else { continue };
+            let (w, h) = (frame.width, frame.height);
 
-        // Upload rect uniform [x0, y0, x1, y1] as 16 bytes (vec4<f32>).
-        let mut rect_bytes = [0u8; 16];
-        for (i, v) in self.rect.iter().enumerate() {
-            rect_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
-        }
-        queue.write_buffer(&inner.rect_buf, 0, &rect_bytes);
+            let rebuild = pipeline.slots[slot]
+                .as_ref()
+                .map(|i: &GpuRectInner| i.tex_w != w || i.tex_h != h)
+                .unwrap_or(true);
+            if rebuild {
+                pipeline.slots[slot] = Some(GpuRectInner::new(device, pipeline.format, w, h));
+            }
 
-        // Upload texture only when the frame changes.
-        if frame.pts_ns != inner.last_pts {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &inner.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &frame.rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            inner.last_pts = frame.pts_ns;
+            let inner = pipeline.slots[slot].as_mut().unwrap();
+
+            // Upload rect uniform [x0, y0, x1, y1].
+            let mut rect_bytes = [0u8; 16];
+            for (i, v) in rect.iter().enumerate() {
+                rect_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            queue.write_buffer(&inner.rect_buf, 0, &rect_bytes);
+
+            if frame.pts_ns != inner.last_pts {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &inner.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &frame.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: None,
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                inner.last_pts = frame.pts_ns;
+            }
         }
     }
 
     fn draw(&self, pipeline: &GpuRectState, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        let Some(inner) = &pipeline.inner else {
-            return false;
-        };
-        render_pass.set_pipeline(&inner.pipeline);
-        render_pass.set_bind_group(0, &inner.bind_group, &[]);
-        render_pass.draw(0..4, 0..1);
-        true
+        let mut drew_any = false;
+        for inner in pipeline.slots.iter().flatten() {
+            render_pass.set_pipeline(&inner.pipeline);
+            render_pass.set_bind_group(0, &inner.bind_group, &[]);
+            render_pass.draw(0..4, 0..1);
+            drew_any = true;
+        }
+        drew_any
     }
 }
 
 pub struct GpuRectState {
     format: wgpu::TextureFormat,
-    inner: Option<GpuRectInner>,
+    slots: Vec<Option<GpuRectInner>>,
 }
 
 impl shader::Pipeline for GpuRectState {
     fn new(_device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         Self {
             format,
-            inner: None,
+            slots: Vec::new(),
         }
     }
 }

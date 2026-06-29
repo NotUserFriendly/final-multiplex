@@ -267,6 +267,21 @@ impl App {
                                 if let Some(m) = &self.metrics {
                                     m.attach_source(&id, t.pipeline());
                                 }
+                                // apply_streams_changed replaces the entire vcaps
+                                // chain (remove_video_chain + add_video_chain), so
+                                // the probe installed at try_init is now on a dead
+                                // element.  Reinstall on the new vcaps pad.
+                                if let Some(store) = self.gpu_stores.get(&id) {
+                                    if let Some(pad) = t
+                                        .pipeline()
+                                        .source_pads()
+                                        .get(&id)
+                                        .and_then(|p| p.video_src.as_ref())
+                                    {
+                                        gpu_path::install_probe(pad, store.clone());
+                                        eprintln!("[gpu-path] probe reinstalled on vcaps_{id}");
+                                    }
+                                }
                             }
                         }
                         // Update chain state for the delivery watchdog (ADR-0020).
@@ -467,11 +482,16 @@ impl App {
             background: Some(Background::Color(Color::from_rgb(0.05, 0.05, 0.05))),
             ..Default::default()
         };
+        // Build (frame, rect) pairs for all GPU-pathed sources.  A single
+        // GpuRectProg widget carries all N pairs; the pipeline makes N draw
+        // calls with per-slot wgpu resources so they don't overwrite each other.
         let cols_f = self.grid_cols as f32;
         let rows_f = self.grid_rows as f32;
-        let mut gpu_layers: Vec<Element<Message>> = Vec::new();
-        for (idx, src) in self.sources.iter().enumerate() {
-            if let Some(frame) = self.current_gpu_frames.get(&src.id) {
+        let gpu_sources: Vec<(Option<Arc<TimedFrame>>, [f32; 4])> = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(idx, src)| {
                 let col = (idx as u32 % self.grid_cols) as f32;
                 let row = (idx as u32 / self.grid_cols) as f32;
                 let rect = [
@@ -480,31 +500,24 @@ impl App {
                     -1.0 + 2.0 * (col + 1.0) / cols_f,
                     1.0 - 2.0 * row / rows_f,
                 ];
-                gpu_layers.push(
-                    shader(GpuRectProg {
-                        frame: Some(frame.clone()),
-                        rect,
-                    })
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
-                );
-            }
-        }
-        let gpu_grid: Element<Message> = if gpu_layers.is_empty() {
+                (self.current_gpu_frames.get(&src.id).cloned(), rect)
+            })
+            .collect();
+        let any_frame = gpu_sources.iter().any(|(f, _)| f.is_some());
+        let gpu_grid: Element<Message> = if any_frame {
+            shader(GpuRectProg {
+                sources: gpu_sources,
+            })
+            .width(Length::Fixed(GPU_PANEL_W))
+            .height(Length::Fixed(gpu_grid_h))
+            .into()
+        } else {
             container(text("waiting…").color(Color::WHITE))
                 .width(Length::Fixed(GPU_PANEL_W))
                 .height(Length::Fixed(gpu_grid_h))
                 .center_x(Length::Fixed(GPU_PANEL_W))
                 .center_y(Length::Fixed(gpu_grid_h))
                 .into()
-        } else {
-            container(
-                stack(gpu_layers)
-                    .width(Length::Fixed(GPU_PANEL_W))
-                    .height(Length::Fixed(gpu_grid_h)),
-            )
-            .into()
         };
         let n_probed = self.gpu_stores.len();
         let gpu_label = text(format!("GPU PATH — {n_probed} sources"))

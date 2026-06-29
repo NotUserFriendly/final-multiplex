@@ -18,6 +18,13 @@ const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 /// real rate changes.
 const RATCHET_MIN_DELTA: i32 = 5;
 
+/// Maximum plausible native source fps accepted by the ratchet.  HTTP streaming
+/// sources (YouTube/Twitch) decode their initial buffer faster than real-time
+/// (measured at the vcaps:src probe), producing burst readings far above any real
+/// video framerate.  Readings above this cap are noise — skip them.  240 fps
+/// covers any real camera or broadcast source with comfortable headroom.
+const MAX_RATCHET_SOURCE_FPS: i32 = 240;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Session-scoped output framerate high-water mark (ADR-0023).
@@ -246,6 +253,10 @@ impl Transport {
                     continue;
                 }
                 let candidate = measured.round() as i32;
+                if candidate > MAX_RATCHET_SOURCE_FPS {
+                    eprintln!("[ratchet] '{id}' fps_in={candidate} exceeds cap ({MAX_RATCHET_SOURCE_FPS}) — skipped (HTTP burst?)");
+                    continue;
+                }
                 if candidate > max_fps {
                     max_fps = candidate;
                 }

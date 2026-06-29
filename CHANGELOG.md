@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Ratchet runaway on HTTP streaming sources (YouTube):** `uridecodebin3` decodes
+  YouTube content faster than real-time, flooding the `vcaps:src` probe with burst fps
+  readings (300–420 fps) that exhausted the 3-second settle window and locked the
+  compositor to an impossibly high rate.  Added `MAX_RATCHET_SOURCE_FPS = 240` cap in
+  `check_and_ratchet()` (`fm-core/src/transport.rs`): readings above 240 fps are logged
+  and skipped, capping the ratchet contribution to any plausible native source rate.
+
 ### Added
 - **`fm-youtube-adapter` Block 2 — URL-expiry re-resolution:** on GStreamer Error or EOS the
   adapter re-runs `yt-dlp` for a fresh signed URL, sets it on `uridecodebin3`, and restarts

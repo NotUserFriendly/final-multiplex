@@ -119,7 +119,61 @@ for an expired signed URL (typical expiry: several hours into a long session).
 
 **Status:** Block 2 compiles clean; `cargo check --workspace` and `cargo fmt --check` pass.
 Commit `0ab396d`.  SIGUSR1 re-resolve sequence confirmed in logs 2026-06-29.
-Visual validation pending maintainer.
+Visual validation: maintainer confirmed other three tiles kept playing during re-resolve, but
+the YouTube tile "recovered strangely" (2026-06-29).  Root cause identified — see bug below.
+
+---
+
+## Bug: YouTube reconnect resumes from burst-offset PTS, causing tile to go black (2026-06-29)
+
+**Symptom:** After SIGUSR1 re-resolve (and presumably after a real URL expiry), the YouTube
+tile initially appears to recover (pads re-link, `StreamsChanged(true)` emitted, chain
+rebuilt), but the tile goes black and stays black instead of showing video.
+
+**Root cause — two compounding issues:**
+
+1. **HTTP CDN burst:** `uridecodebin3` decodes YouTube progressive MP4 (format 18/22) 10–13×
+   faster than real-time.  After 8 minutes of session time, the CDN had delivered ~94 minutes
+   of video content (measured: `first_pts=1:34:35.574658689` after reconnect in a session
+   running for `pipeline_running=0:08:09`).
+
+2. **GStreamer state-reset does not rewind the demuxer:** When `uridecodebin3.set_state(Null)`
+   is called and the element is then restarted with a fresh URL, the internal `qtdemux` or
+   `souphttpsrc` HTTP range state resumes from the burst offset (byte ~300 MB into the MP4),
+   not from byte 0.  The first frame after reconnect carries `PTS ≈ 1:34:35`.
+
+**Why the tile goes black:** The core compositor's pipeline running time at reconnect was
+≈ 8 min = 480 s.  The incoming frames had `PTS ≈ 5,675 s` (1:34:35).  `PTS > running_time`,
+so all frames are in the FUTURE from the compositor's perspective.  The `voff_q` (max
+2000 ms, `leaky=upstream`) holds these future frames, but the compositor finds no frame
+matching its current running time (480 s) and renders the tile black.
+
+**Contrast with initial play:** On first play, YouTube frames start at `PTS = 0`.  The
+compositor's running time is also small (seconds), so frames are slightly in the past.
+The compositor uses the latest available past frame → tile plays normally at 30 fps.  After
+reconnect the burst means PTS >> running_time and no frame matches.
+
+**Fix approach — seek to position 0 after reconnect:**
+In `spawn_reconnect_thread` (or in the main loop at the `post_reconnect_check_at` gate),
+after `uridecodebin3` is stable in PLAYING state, issue:
+```rust
+let _ = uridecodebin.seek_simple(
+    gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+    gstreamer::ClockTime::ZERO,
+);
+```
+This resets the demuxer to byte 0, flushing the burst offset.  After the seek, new frames
+start at `PTS = 0` and the compositor can display them (same as initial play).  The seek
+should be issued BEFORE emitting `StreamsChanged(true)`, so the core rebuilds its chain onto
+a source that's already at position 0.
+
+**Attempted (no effect):** `deep-element-added` signal on `uridecodebin3` to cap the internal
+`queue2` buffer — this signal does not fire for `uridecodebin3`'s internal elements (it is not
+a standard GstBin in this respect).  `uridecodebin3` exposes only `source-setup` as a signal.
+
+**Not yet attempted:** seek to position 0 after reconnect (above).
+
+**Status:** Bug confirmed by maintainer visual 2026-06-29.  Fix designed, not yet implemented.
 
 ---
 

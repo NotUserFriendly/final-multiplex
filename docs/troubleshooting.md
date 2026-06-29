@@ -504,3 +504,49 @@ degradation, alignment preserved, compositor tier unaffected.  Rate ceiling (not
 160 Hz) flagged for ADR decision on next architecture step.
 
 ---
+
+## Phase 3 loose-ends verification (2026-06-29)
+
+### 1 — Render-thread clock freshness
+
+**Question:** Does the render thread read `running_time` at a coarse enough cadence that
+frame selection steps visibly on a moving source?
+
+**Measurement (CC-run, 15 min, release build):**
+
+| Sample | Message::Frame fps | Notes |
+|---|---|---|
+| Warmup (t=0–30 s) | 135–136 fps | Cold start; iced's loop slightly slower initially |
+| Steady state (t>30 s) | 147–151 fps | Stable; iced now lightweight with GPU sched skipped |
+
+`running_time` is updated at ~148 fps; the render thread presents at ~148 fps; video sources
+deliver at 30 fps (33 ms/frame).  Maximum staleness between atomic reads ≈ 7 ms — well within
+a single video frame period.  Selection error is negligible and invisible on motion.
+
+**No fix needed.** Direct pipeline-clock read on the render thread was considered and
+ruled out — the AtomicU64 path is sufficient at this update rate.
+
+**Bonus finding:** `Message::Frame` running at 147–151 fps (vs the 19 fps pre-fix baseline)
+also means the Mutter subsurface ceiling rises to ~148 fps — confirming the coupling is to
+iced's commit rate, not a fixed compositor cap.
+
+### 2 — RSS flat-line check
+
+**Question:** Is there a real memory leak independent of the (now-removed) render-rate
+degradation path?
+
+**Measurement (same 15-min run):**
+
+| Sample | RSS |
+|---|---|
+| t ≈ 0 | 8 368 MB |
+| t ≈ 5 min | 8 391–8 447 MB (oscillating) |
+| t ≈ 10 min | 8 376–8 463 MB (oscillating) |
+| t ≈ 15 min | 8 416–8 463 MB |
+
+RSS is flat and non-monotone (oscillates ±95 MB around ~8 410 MB).  No climb.
+
+**Leak question closed.** The fps degradation observed in the Step 0 tile-res run (54→28 fps
+over 15 min) was event-loop pressure and thermal, not a memory-backed leak.
+
+---

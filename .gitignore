@@ -34,6 +34,7 @@ exampleInputs.md
 
 # --- Local scene files (may contain real credentials) ---
 scenes/scene-mixed-dummy.toml
+scenes/scene-youtube-test.toml
 
 # --- Local-only task scratchpads ---
 TaskBlock*.md

@@ -4,6 +4,7 @@ use crate::video::{GpuRectProg, VideoProg};
 use fm_adapter_sdk::metrics::SourceMetrics;
 use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,13 +62,11 @@ pub struct App {
     tick_count: u64,
     /// IDs of external sources — used to query chain state for delivery watchdog.
     external_source_ids: Vec<String>,
-    /// GPU presentation path (ADR-0024, Phase 3 Block 1).
-    /// Populated for the first source that has a video pad.
-    gpu_frame_store: Option<GpuFrameStore>,
-    /// The source ID whose vcaps:src pad is being GPU-pathed.
-    gpu_source_id: Option<String>,
-    /// Most recently scheduler-selected frame for the GPU-path source.
-    current_gpu_frame: Option<Arc<TimedFrame>>,
+    /// GPU presentation path (ADR-0024, Phase 3 Block 2).
+    /// One FrameStore per source that has a video pad.
+    gpu_stores: HashMap<String, GpuFrameStore>,
+    /// Most recently scheduler-selected frame per GPU-pathed source.
+    current_gpu_frames: HashMap<String, Arc<TimedFrame>>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,9 +136,8 @@ impl App {
                     last_offset_change: None,
                     tick_count: 0,
                     external_source_ids: Vec::new(),
-                    gpu_frame_store: None,
-                    gpu_source_id: None,
-                    current_gpu_frame: None,
+                    gpu_stores: HashMap::new(),
+                    current_gpu_frames: HashMap::new(),
                 }
             }
         }
@@ -168,20 +166,22 @@ impl App {
                 if let Some(frame) = bridge::latest_frame(&self.frame_store, &mut self.frame_gen) {
                     self.current_frame = Some(frame);
                 }
-                // GPU-path scheduler (ADR-0024): select the frame whose PTS
-                // is closest to (pipeline_running_time − source_offset_ns).
-                if let (Some(store), Some(src_id), Some(t)) =
-                    (&self.gpu_frame_store, &self.gpu_source_id, &self.transport)
-                {
+                // GPU-path scheduler (ADR-0024): for each probed source select
+                // the frame whose PTS is closest to (running_time − offset_ns).
+                if let Some(t) = &self.transport {
                     if let Some(running_ns) = t.pipeline_running_time_ns() {
-                        let offset_ns = self
-                            .sources
-                            .iter()
-                            .find(|s| &s.id == src_id)
-                            .map(|s| s.offset_ms as i64 * 1_000_000)
-                            .unwrap_or(0);
-                        let target_ns = (running_ns as i64 - offset_ns).max(0) as u64;
-                        self.current_gpu_frame = store.lock().unwrap().select(target_ns);
+                        for (src_id, store) in &self.gpu_stores {
+                            let offset_ns = self
+                                .sources
+                                .iter()
+                                .find(|s| &s.id == src_id)
+                                .map(|s| s.offset_ms as i64 * 1_000_000)
+                                .unwrap_or(0);
+                            let target_ns = (running_ns as i64 - offset_ns).max(0) as u64;
+                            if let Some(frame) = store.lock().unwrap().select(target_ns) {
+                                self.current_gpu_frames.insert(src_id.clone(), frame);
+                            }
+                        }
                     }
                 }
                 if let Some(metrics) = &self.metrics {
@@ -458,37 +458,59 @@ impl App {
         .center_x(Length::Fill)
         .center_y(Length::Fill);
 
-        // ── GPU side panel (ADR-0024 Block 1) ─────────────────────────────
-        // Sits to the right of the compositor — both paths visible side by side.
-        // Sized to maintain the tile AR so the source isn't distorted.
-        let gpu_vid_h = GPU_PANEL_W / self.grid_ar;
+        // ── GPU side panel (ADR-0024 Block 2) ─────────────────────────────
+        // All N GPU-path sources rendered as a mini-grid, mirroring the
+        // compositor layout.  Each source gets its computed NDC rect so the
+        // positions match the compositor tiles for the alignment check.
+        let gpu_grid_h = GPU_PANEL_W / self.grid_ar;
         let dark_panel_bg = |_: &iced::Theme| container::Style {
             background: Some(Background::Color(Color::from_rgb(0.05, 0.05, 0.05))),
             ..Default::default()
         };
-        let gpu_video: Element<Message> = if self.current_gpu_frame.is_some() {
-            shader(GpuRectProg {
-                frame: self.current_gpu_frame.clone(),
-                rect: [-1.0, -1.0, 1.0, 1.0],
-            })
-            .width(Length::Fixed(GPU_PANEL_W))
-            .height(Length::Fixed(gpu_vid_h))
-            .into()
-        } else {
+        let cols_f = self.grid_cols as f32;
+        let rows_f = self.grid_rows as f32;
+        let mut gpu_layers: Vec<Element<Message>> = Vec::new();
+        for (idx, src) in self.sources.iter().enumerate() {
+            if let Some(frame) = self.current_gpu_frames.get(&src.id) {
+                let col = (idx as u32 % self.grid_cols) as f32;
+                let row = (idx as u32 / self.grid_cols) as f32;
+                let rect = [
+                    -1.0 + 2.0 * col / cols_f,
+                    1.0 - 2.0 * (row + 1.0) / rows_f,
+                    -1.0 + 2.0 * (col + 1.0) / cols_f,
+                    1.0 - 2.0 * row / rows_f,
+                ];
+                gpu_layers.push(
+                    shader(GpuRectProg {
+                        frame: Some(frame.clone()),
+                        rect,
+                    })
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                );
+            }
+        }
+        let gpu_grid: Element<Message> = if gpu_layers.is_empty() {
             container(text("waiting…").color(Color::WHITE))
                 .width(Length::Fixed(GPU_PANEL_W))
-                .height(Length::Fixed(gpu_vid_h))
+                .height(Length::Fixed(gpu_grid_h))
                 .center_x(Length::Fixed(GPU_PANEL_W))
-                .center_y(Length::Fixed(gpu_vid_h))
+                .center_y(Length::Fixed(gpu_grid_h))
                 .into()
+        } else {
+            container(
+                stack(gpu_layers)
+                    .width(Length::Fixed(GPU_PANEL_W))
+                    .height(Length::Fixed(gpu_grid_h)),
+            )
+            .into()
         };
-        let gpu_label = text(format!(
-            "GPU PATH — {}",
-            self.gpu_source_id.as_deref().unwrap_or("none")
-        ))
-        .size(11)
-        .color(Color::WHITE);
-        let gpu_side_panel = container(column![gpu_label, gpu_video].spacing(4))
+        let n_probed = self.gpu_stores.len();
+        let gpu_label = text(format!("GPU PATH — {n_probed} sources"))
+            .size(11)
+            .color(Color::WHITE);
+        let gpu_side_panel = container(column![gpu_label, gpu_grid].spacing(4))
             .style(dark_panel_bg)
             .width(Length::Fixed(GPU_PANEL_W))
             .height(Length::Fill)
@@ -996,32 +1018,24 @@ fn try_init(
 
     bridge::install(pipeline.appsink(), frame_store.clone());
 
-    // GPU presentation path (ADR-0024, Block 1): probe the first source with
-    // a video pad.  The pad carries tile-res RGBA; the probe copies each frame
-    // (with its raw PTS) into the FrameRing without disturbing the compositor.
-    let (gpu_frame_store, gpu_source_id) = {
-        let first_video_source = sources.iter().find(|s| {
+    // GPU presentation path (ADR-0024, Block 2): probe every source with a
+    // video pad.  Ring sized by the scene's offset ceiling (time-based, not
+    // frame-count) — same lesson as the Phase-2.3 voff_q fix.
+    let gpu_stores: HashMap<String, GpuFrameStore> = sources
+        .iter()
+        .filter_map(|s| {
             pipeline
                 .source_pads()
                 .get(&s.id)
                 .and_then(|p| p.video_src.as_ref())
-                .is_some()
-        });
-        if let Some(src) = first_video_source {
-            let store = gpu_path::new_store();
-            if let Some(pad) = pipeline
-                .source_pads()
-                .get(&src.id)
-                .and_then(|p| p.video_src.as_ref())
-            {
-                gpu_path::install_probe(pad, store.clone());
-                eprintln!("[gpu-path] probe installed on vcaps_{}", src.id);
-            }
-            (Some(store), Some(src.id.clone()))
-        } else {
-            (None, None)
-        }
-    };
+                .map(|pad| {
+                    let store = gpu_path::new_store(scene.grid.live_offset_ceiling_ms as u64);
+                    gpu_path::install_probe(pad, store.clone());
+                    eprintln!("[gpu-path] probe installed on vcaps_{}", s.id);
+                    (s.id.clone(), store)
+                })
+        })
+        .collect();
 
     let mut transport = fm_core::transport::Transport::new(pipeline);
     for (id, (min, max)) in &source_effective_bounds {
@@ -1073,8 +1087,7 @@ fn try_init(
         last_offset_change: None,
         tick_count: 0,
         external_source_ids: external_ids,
-        gpu_frame_store,
-        gpu_source_id,
-        current_gpu_frame: None,
+        gpu_stores,
+        current_gpu_frames: HashMap::new(),
     })
 }

@@ -1,5 +1,5 @@
 // Per-source frame ring-buffer and scheduler for the GPU presentation path
-// (ADR-0024, Phase 3 Block 1).
+// (ADR-0024, Phase 3).
 //
 // Frames arrive from a pad probe on vcaps_{id}:src (tile-res RGBA, with the
 // buffer's raw PTS).  The scheduler selects the frame whose PTS best matches
@@ -8,14 +8,14 @@
 // provides "for free" on the CPU path — proving that a per-source renderer
 // can maintain frame accuracy against the shared clock (ADR-0005).
 //
-// Resolution note (Block 1): probing vcaps:src gives tile-res RGBA (the same
+// Resolution note (Block 2): probing vcaps:src gives tile-res RGBA (the same
 // resolution the compositor receives after scaling).  Native-res tap is the
-// next block once the scheduler is proven.
+// next block once the scheduler is proven at scale.
 
 use gstreamer::prelude::*;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-
-const RING_SIZE: usize = 16;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct TimedFrame {
@@ -28,30 +28,48 @@ pub struct TimedFrame {
     pub pts_ns: u64,
 }
 
+struct RingEntry {
+    frame: Arc<TimedFrame>,
+    captured_at: Instant,
+}
+
 pub struct FrameRing {
-    slots: Vec<Option<Arc<TimedFrame>>>,
-    next: usize,
+    entries: VecDeque<RingEntry>,
+    window: Duration,
 }
 
 impl FrameRing {
-    fn new() -> Self {
+    // Size by time, not frame count — same lesson as the Phase-2.3 voff_q
+    // fix: a 16-slot count-ring holds ~133 ms at 120 fps, far short of the
+    // 2000 ms offset ceiling.  Wall-clock eviction is framerate-independent.
+    fn new(ceiling_ms: u64) -> Self {
         Self {
-            slots: (0..RING_SIZE).map(|_| None).collect(),
-            next: 0,
+            entries: VecDeque::new(),
+            window: Duration::from_millis(ceiling_ms + 500),
         }
     }
 
     pub fn push(&mut self, frame: Arc<TimedFrame>) {
-        self.slots[self.next] = Some(frame);
-        self.next = (self.next + 1) % RING_SIZE;
+        let now = Instant::now();
+        self.entries.push_back(RingEntry {
+            frame,
+            captured_at: now,
+        });
+        while let Some(front) = self.entries.front() {
+            if now.duration_since(front.captured_at) > self.window {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     /// Return the frame whose pts_ns is closest to `target_ns`.
     /// Returns `None` when the ring is empty.
     pub fn select(&self, target_ns: u64) -> Option<Arc<TimedFrame>> {
-        self.slots
+        self.entries
             .iter()
-            .filter_map(|s| s.as_ref())
+            .map(|e| &e.frame)
             .min_by_key(|f| {
                 let diff = f.pts_ns as i64 - target_ns as i64;
                 diff.unsigned_abs()
@@ -62,8 +80,8 @@ impl FrameRing {
 
 pub type GpuFrameStore = Arc<Mutex<FrameRing>>;
 
-pub fn new_store() -> GpuFrameStore {
-    Arc::new(Mutex::new(FrameRing::new()))
+pub fn new_store(ceiling_ms: u64) -> GpuFrameStore {
+    Arc::new(Mutex::new(FrameRing::new(ceiling_ms)))
 }
 
 /// Install a pad probe on `pad` (a tile-res RGBA video src pad such as

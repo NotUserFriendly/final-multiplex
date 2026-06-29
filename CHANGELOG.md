@@ -7,16 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **GPU presentation path — Phase 3 Block 1 (experimental, additive):** a per-source
-  frame ring-buffer and renderer-side presentation scheduler running in parallel with
-  the existing GStreamer compositor path (ADR-0024).  A pad probe on `vcaps_{id}:src`
-  captures tile-res RGBA frames with their raw PTS into a 16-slot ring; at each display
-  refresh the scheduler selects the frame whose PTS is closest to
-  `(pipeline_running_time − source_offset_ns)` — the same frame-selection logic the
-  compositor performs, re-implemented in the renderer.  The selected frame is uploaded
-  as a wgpu texture and drawn at an arbitrary NDC rect via a new `GpuRectProg` shader
-  widget, proving the rect interface that focus mode and layout editing will reuse.
-  The compositor path is untouched and continues to run beneath the GPU overlay.
+- **GPU presentation path — Phase 3 Block 2 (experimental, additive):** generalises
+  the Block 1 single-source GPU path to all N scene sources.  Each source gets its own
+  pad probe on `vcaps_{id}:src` and an independent frame ring; at each display refresh
+  the renderer-side scheduler selects per-source frames against the shared pipeline
+  clock (`pipeline_running_time − source_offset_ns`).  All sources are rendered as a
+  mini-grid in the side panel at their computed NDC rects, mirroring the compositor
+  layout for direct alignment comparison.  The compositor path is untouched.
+- **Time-based GPU frame ring:** the fixed 16-slot count ring from Block 1 is replaced
+  with a wall-clock-evicted `VecDeque` sized to `(live_offset_ceiling_ms + 500) ms`.
+  A 120 fps source at a 2000 ms offset ceiling retains ~2500 ms of history (300 frames)
+  instead of the previous 133 ms (16 slots) — same fix as the Phase 2.3 `voff_q`
+  frame-count bug.
 
 ### Fixed
 - **Ratchet jitter-fired on measurement noise:** the 1-second fps_in measurement

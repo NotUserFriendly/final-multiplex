@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`fm-youtube-adapter` (Phase 4 Block 1, experimental):** new out-of-process adapter that
+  resolves a YouTube watch URL via `yt-dlp` and ingests the stream through GStreamer
+  (`uridecodebin3`), emitting RGBA video and S16LE audio over the existing unixfd transport.
+  Follows the same SDK contract as `fm-rtsp-adapter` (ADR-0014, ADR-0022).  VOD playback
+  proven; URL-expiry re-resolution deferred to Block 2.
+- **`scenes/scene-youtube-test.toml`:** three-source test scene (dummy + file + YouTube)
+  targeting the Phase 4 prototype milestone.
+
 ## [0.3.0] - 2026-06-29
 
 ### Fixed

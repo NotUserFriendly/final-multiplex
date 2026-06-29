@@ -1,0 +1,31 @@
+# Phase 4 Block 1 test: dummy + file + YouTube — the three-source prototype milestone.
+# YouTube URL is a public VOD; no credentials required.
+
+[grid]
+columns                    = 2
+width                      = 1920
+height                     = 1080
+fps                        = 30
+adapter_ready_timeout_secs = 90
+
+[[source]]
+id          = "dummy"
+source_type = "external"
+adapter     = "fm-dummy-adapter"
+volume      = 0.3
+muted       = true
+
+[[source]]
+id        = "fnaf2"
+uri       = "file:///home/locad/Desktop/FNAF2-cropped.mkv"
+volume    = 0.3
+offset_ms = 0
+muted     = true
+
+[[source]]
+id          = "yt-map"
+source_type = "external"
+adapter     = "fm-youtube-adapter"
+uri         = "https://www.youtube.com/watch?v=9vntypeV5QU"
+volume      = 0.0
+offset_ms   = 0

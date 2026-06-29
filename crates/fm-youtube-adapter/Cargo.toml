@@ -1,0 +1,19 @@
+[package]
+name        = "fm-youtube-adapter"
+description = "YouTube source adapter for Final Multiplex (Phase 4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fm-youtube-adapter"
+path = "src/main.rs"
+
+[dependencies]
+fm-adapter-sdk.workspace = true
+gstreamer.workspace      = true
+gstreamer-net.workspace  = true
+serde_json.workspace     = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

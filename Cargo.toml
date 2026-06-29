@@ -5,6 +5,7 @@ members = [
     "crates/fm-app",
     "crates/fm-dummy-adapter",
     "crates/fm-rtsp-adapter",
+    "crates/fm-youtube-adapter",
 ]
 resolver = "2"
 

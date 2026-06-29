@@ -77,6 +77,64 @@ timer at ~62.5 Hz beating against ~60 Hz vsync), independent of capture resoluti
 Deferred — fullscreen 4K measurement should be taken after the vsync/timer-beat fix so it
 reflects capture copy cost alone, not the timing beat.  See ADR-0025.
 
+**CORRECTION — 2026-06-29 (post-vsync-fix investigation):**
+The A/B conclusion and the timer-beat hypothesis were both wrong.  See the render-rate
+finding section below.  ADR-0025's stated root cause needs revision.
+
+---
+
+## Render rate bottleneck — iced `window::frames()` fires at ~19 fps (2026-06-29)
+
+**Symptom:** Persistent constant stutter on both compositor and GPU panels after the
+vsync fix (`window::frames()` replacing `time::every(16ms)`).  Stutter is not periodic;
+it is constant and looks like a framerate issue (~19 fps content on a 60 Hz display).
+
+**Diagnostic (CC-measured 2026-06-29):**
+Instrumented `Message::Frame` and `Message::Poll` with per-event eprintln timestamps.
+- `Message::Poll` fires correctly at ~500 ms.
+- `Message::Frame` fires at **~19 fps** (batches of 30 frames measured over 88 s: average
+  18–21 fps, sustained ~19 fps).  It is NOT a 60 Hz vsync-locked stream.
+
+**Root cause:**
+`iced::window::frames()` fires once per completed render cycle, not once per display
+vsync.  After each render + present, iced's event loop must go through
+`RedrawRequested → subscription fires → Message::Frame queued → AboutToWait processes
+message → request_redraw() → next RedrawRequested`.  On this hardware each full cycle
+takes ~53 ms, consuming 3–4 vsync periods per rendered frame.  Two factors contribute:
+
+1. **Native-res texture upload cost:** 4 sources × 1920×1080 RGBA = 33 MB of CPU→GPU
+   staging buffer writes per render.  At tile-res this is 8 MB (4×).
+2. **iced event-loop overhead between renders:** iced's reactive model adds 1–2 vsync
+   periods of dispatch latency between present completion and the next render start.
+
+The combined effect: ~19 fps render throughput → each content frame shown for 3–4
+display periods → constant cadence judder visible on both panels.
+
+**Why the A/B comparison was misleading:**
+Both tile-res and native-res recordings showed "identical stutter" because the render
+was at ~19 fps in both cases.  At tile-res the upload cost is 4× lower, but the iced
+event-loop overhead was already the dominant bottleneck, keeping the effective rate near
+19 fps regardless of texture size.  The timer-beat hypothesis (62.5 Hz vs 60 Hz) was
+wrong — or at minimum not the primary cause.  The vsync fix was architecturally correct
+but irrelevant while the render is below 60 fps.
+
+**Status: Flagged for review chat.**
+ADR-0025's stated root cause ("present-timing beat, independent of capture resolution")
+is incorrect and requires revision.  Three paths forward (decision for review chat):
+
+1. **Tile-res textures for GPU upload** — reduces upload 4× (8 MB/frame); likely
+   restores ≥60 fps render throughput and smooth display.  Capture tap can stay at
+   native-res (`vdeint:src`) while the ring buffer downscales before upload.  Or revert
+   the probe to `vcaps:src`.  Lowest effort; highest immediate impact.
+
+2. **dmabuf zero-copy** — eliminates CPU→GPU upload entirely (ADR-0025 B1, blocked on
+   wgpu-hal Vulkan import API).  Correct long-term fix; deferred.
+
+3. **Dedicated GPU surface outside iced** — GPU compositor runs its own wgpu present
+   loop outside iced's event dispatch, eliminating the per-frame event-loop overhead.
+   Architectural change; the taskblock named this as the fallback if iced friction
+   materialised.  It has.
+
 **Measured perf (tile-res revert, windowed, 3-sample average, CC-measured 2026-06-29):**
 
 | Process | CPU % | RSS | Notes |

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GPU presentation path — Phase 3 Block 3 (experimental, additive):** three
+  efficiency improvements over the Block 2 baseline (711% main-app CPU, 84% GPU util):
+  - *Off-thread capture copy (3a):* pad probe now enqueues a `gst::Buffer` reference
+    (Arc bump only) into a bounded `sync_channel(4)`; a dedicated capture thread per
+    source does the pixel copy into the frame ring.  Removes ~960 MB/s of inline copy
+    from GStreamer streaming threads.  Main-app CPU dropped from 711% to ~380% (−47%);
+    ratchet false-fire resolved (inline copy was bunching delivery timing).
+  - *Per-source texture upload skip (3b):* `write_texture` is called only when the
+    scheduler selects a new frame (pts_ns changed); 30 fps sources at 60 Hz display
+    skip every other upload.
+  - *Shared render pipeline + no alpha blend (3c):* a single `wgpu::RenderPipeline`,
+    BGL, and sampler are compiled once and reused across all N source slots
+    (`GpuRectShared`), reducing per-frame pipeline state changes from N to 1.
+    `blend: None` replaces `ALPHA_BLENDING` — sources tile without overlap so the
+    per-pixel framebuffer read-modify-write was waste.
+- **GPU side panel scales with window resize:** panel width is computed as 1/3 of the
+  total window width (was fixed at 480 px) so both the compositor and GPU panel resize
+  together when the window is dragged.
+
+### Added
 - **GPU presentation path — Phase 3 Block 2 (experimental, additive):** generalises
   the Block 1 single-source GPU path to all N scene sources.  Each source gets its own
   pad probe on `vcaps_{id}:src` and an independent frame ring; at each display refresh

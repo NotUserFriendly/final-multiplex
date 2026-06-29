@@ -14,6 +14,7 @@
 
 use gstreamer::prelude::*;
 use std::collections::VecDeque;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -84,12 +85,56 @@ pub fn new_store(ceiling_ms: u64) -> GpuFrameStore {
     Arc::new(Mutex::new(FrameRing::new(ceiling_ms)))
 }
 
+struct CaptureMsg {
+    buf: gstreamer::Buffer,
+    pts_ns: u64,
+    width: u32,
+    height: u32,
+    stride: usize,
+}
+
 /// Install a pad probe on `pad` (a tile-res RGBA video src pad such as
-/// `vcaps_{id}:src`) that copies each buffer into `store` with its PTS.
+/// `vcaps_{id}:src`) that enqueues each buffer into `store` with its PTS.
 ///
-/// The probe is non-blocking — it copies pixel data then returns `Ok` so the
-/// buffer continues downstream to the compositor unchanged.
+/// The probe does an Arc bump (no pixel copy) on the streaming thread;
+/// a dedicated capture thread does the pixel copy into the ring.
+/// Channel bound = 4: if the capture thread falls behind, frames are dropped
+/// rather than blocking the streaming thread or growing memory unboundedly.
 pub fn install_probe(pad: &gstreamer::Pad, store: GpuFrameStore) {
+    let (tx, rx) = mpsc::sync_channel::<CaptureMsg>(4);
+
+    std::thread::spawn(move || {
+        while let Ok(msg) = rx.recv() {
+            let row_bytes = msg.width as usize * 4;
+            let Ok(map) = msg.buf.map_readable() else {
+                continue;
+            };
+            let src = map.as_slice();
+            let expected = msg.stride * (msg.height as usize).saturating_sub(1) + row_bytes;
+            if src.len() < expected {
+                continue;
+            }
+            let rgba = if msg.stride == row_bytes {
+                src[..row_bytes * msg.height as usize].to_vec()
+            } else {
+                let mut packed = Vec::with_capacity(row_bytes * msg.height as usize);
+                for row in 0..msg.height as usize {
+                    let start = row * msg.stride;
+                    packed.extend_from_slice(&src[start..start + row_bytes]);
+                }
+                packed
+            };
+            drop(map);
+            let frame = Arc::new(TimedFrame {
+                width: msg.width,
+                height: msg.height,
+                rgba,
+                pts_ns: msg.pts_ns,
+            });
+            store.lock().unwrap().push(frame);
+        }
+    });
+
     pad.add_probe(gstreamer::PadProbeType::BUFFER, move |pad, info| {
         let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data else {
             return gstreamer::PadProbeReturn::Ok;
@@ -100,40 +145,15 @@ pub fn install_probe(pad: &gstreamer::Pad, store: GpuFrameStore) {
         let Ok(vinfo) = gstreamer_video::VideoInfo::from_caps(&caps) else {
             return gstreamer::PadProbeReturn::Ok;
         };
-
         let pts_ns = buf.pts().map(|t| t.nseconds()).unwrap_or(0);
-        let w = vinfo.width();
-        let h = vinfo.height();
-        let stride = vinfo.stride()[0] as usize;
-        let row_bytes = w as usize * 4; // RGBA
-
-        let Ok(map) = buf.map_readable() else {
-            return gstreamer::PadProbeReturn::Ok;
-        };
-        let src = map.as_slice();
-        let expected = stride * (h as usize).saturating_sub(1) + row_bytes;
-        if src.len() < expected {
-            return gstreamer::PadProbeReturn::Ok;
-        }
-        let rgba = if stride == row_bytes {
-            src[..row_bytes * h as usize].to_vec()
-        } else {
-            let mut packed = Vec::with_capacity(row_bytes * h as usize);
-            for row in 0..h as usize {
-                let start = row * stride;
-                packed.extend_from_slice(&src[start..start + row_bytes]);
-            }
-            packed
-        };
-        drop(map);
-
-        let frame = Arc::new(TimedFrame {
-            width: w,
-            height: h,
-            rgba,
+        // Arc bump only — no pixel copy on the streaming thread.
+        let _ = tx.try_send(CaptureMsg {
+            buf: buf.clone(),
             pts_ns,
+            width: vinfo.width(),
+            height: vinfo.height(),
+            stride: vinfo.stride()[0] as usize,
         });
-        store.lock().unwrap().push(frame);
         gstreamer::PadProbeReturn::Ok
     });
 }

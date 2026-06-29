@@ -424,10 +424,11 @@ impl App {
         }
 
         // ── Compute video display dimensions locked to output aspect ratio ──
-        // The GPU side panel takes GPU_PANEL_W from the right; the compositor
-        // output is sized from the remaining width.
+        // GPU panel is 1/3 of total window width (min 240 px) so both panels
+        // scale together when the window is resized.
+        let gpu_panel_w = (self.win_w / 3.0).max(240.0_f32);
         let avail_h = (self.win_h - CHROME_H).max(1.0);
-        let avail_w = (self.win_w - GPU_PANEL_W).max(1.0);
+        let avail_w = (self.win_w - gpu_panel_w).max(1.0);
         let video_w = (avail_h * self.grid_ar).min(avail_w);
         let video_h = video_w / self.grid_ar;
 
@@ -477,7 +478,8 @@ impl App {
         // All N GPU-path sources rendered as a mini-grid, mirroring the
         // compositor layout.  Each source gets its computed NDC rect so the
         // positions match the compositor tiles for the alignment check.
-        let gpu_grid_h = GPU_PANEL_W / self.grid_ar;
+        let gpu_vid_w = (gpu_panel_w - 16.0).max(1.0); // 8 px padding each side
+        let gpu_vid_h = (gpu_vid_w / self.grid_ar).min(avail_h);
         let dark_panel_bg = |_: &iced::Theme| container::Style {
             background: Some(Background::Color(Color::from_rgb(0.05, 0.05, 0.05))),
             ..Default::default()
@@ -508,15 +510,15 @@ impl App {
             shader(GpuRectProg {
                 sources: gpu_sources,
             })
-            .width(Length::Fixed(GPU_PANEL_W))
-            .height(Length::Fixed(gpu_grid_h))
+            .width(Length::Fixed(gpu_vid_w))
+            .height(Length::Fixed(gpu_vid_h))
             .into()
         } else {
             container(text("waiting…").color(Color::WHITE))
-                .width(Length::Fixed(GPU_PANEL_W))
-                .height(Length::Fixed(gpu_grid_h))
-                .center_x(Length::Fixed(GPU_PANEL_W))
-                .center_y(Length::Fixed(gpu_grid_h))
+                .width(Length::Fixed(gpu_vid_w))
+                .height(Length::Fixed(gpu_vid_h))
+                .center_x(Length::Fixed(gpu_vid_w))
+                .center_y(Length::Fixed(gpu_vid_h))
                 .into()
         };
         let n_probed = self.gpu_stores.len();
@@ -525,7 +527,7 @@ impl App {
             .color(Color::WHITE);
         let gpu_side_panel = container(column![gpu_label, gpu_grid].spacing(4))
             .style(dark_panel_bg)
-            .width(Length::Fixed(GPU_PANEL_W))
+            .width(Length::Fixed(gpu_panel_w))
             .height(Length::Fill)
             .padding(8);
 

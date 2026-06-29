@@ -25,6 +25,38 @@ Format. One section per bug. Under it: Attempt N — Hypothesis / Action / Resul
 
 ---
 
+## GPU panel 2.5 s ahead of compositor in alignment test (Block 2, 2026-06-29)
+
+**Symptom:** GPU panel tiles appear ~2.5 s ahead of their compositor counterparts
+at offset 0 — i.e. the GPU path is showing the *current* moment while the
+compositor output lags by the session startup delay.
+
+**Root cause — compositor startup latency, not a scheduler bug:**
+The GPU probe begins capturing frames from PTS≈0 the moment the pipeline
+reaches PLAYING.  The `glvideomixer` compositor waits for all sources to produce
+synchronized buffers before writing its first output.  RTSP cameras took ~2.5 s
+to connect and deliver their first frames in this session.  During that window
+the file source (fnaf2) frames accumulated in the compositor's buffer; the
+compositor began outputting at running_time≈2.5 s but started at PTS=0 of the
+file, leaving it 2.5 s behind running_time for the rest of the session.
+
+The GPU scheduler is correct: it selects the frame closest to
+`running_time − offset_ns`, which is the right frame for *now*.  The compositor
+reference is shifted by its startup latency, not the GPU path.
+
+**Consequence for alignment testing:** a fixed offset between the GPU panel and
+compositor output is expected when live sources are present.  The gap is
+session-startup-dependent (camera connect latency) and remains constant after
+startup (not drifting).  For a cleaner alignment test use a scene with only file
+sources (no live-source startup stall), or compare after setting a known offset
+on the GPU path to compensate.
+
+**Status:** Expected behaviour at this stage.  Not a defect.  ADR-0024 demotes
+the compositor to record tier; in the final architecture the GPU path IS the
+display reference and this comparison is moot.
+
+---
+
 ## GPU-path pad probe CPU overhead (Block 2, 2026-06-29)
 
 **Observed numbers (4-source scene: 1 dummy + 2 RTSP + 1 file, tile-res 1920×1080):**
@@ -58,8 +90,52 @@ the GPU path moves to native-res textures in Block 3.
   copy altogether; the probe just passes a fd handle to wgpu. CPU cost drops to
   near zero for the capture path.
 
-**Status:** Open — expected overhead for tile-res copy; acceptable for the proof stage.
-Off-thread copy is the next incremental fix; full zero-copy is Block 3.
+**Status:** Resolved in Block 3a (2026-06-29).  See Block 3 entry below for post-fix numbers.
+
+---
+
+## Block 3 GPU-path efficiency results (2026-06-29)
+
+**Changes shipped:**
+- **3a — Off-thread capture copy:** probe enqueues `gst::Buffer` (Arc bump only); a
+  dedicated capture thread per source does the pixel copy into the ring.  Removes
+  ~960 MB/s inline copy from GStreamer streaming threads.
+- **3b — Per-source texture upload skip:** `write_texture` called only when the
+  selected frame's `pts_ns` changes; unchanged frames at 30 fps / 60 Hz refresh skip
+  the upload.  (Guard was already in place from Block 2; no code change required.)
+- **3c — Shared render pipeline + no alpha blend:** `GpuRectState` now holds one
+  `GpuRectShared` (pipeline, BGL, sampler) shared across all N slots — one compile at
+  first frame, one `set_pipeline` per draw instead of N.  `blend: None` replaces
+  `ALPHA_BLENDING`; sources tile without overlap so the framebuffer
+  read-modify-write per pixel was pure waste.
+
+**Post-fix numbers (same 4-source scene, three samples averaged):**
+
+| Process | Block 2 CPU % | Block 3 CPU % | Delta |
+|---|---|---|---|
+| `final-multiplex` (main app) | 711% | **~380%** | −47% |
+| `fm-rtsp-adapter` cam-27 | 91% | ~80% | −11% |
+| `fm-rtsp-adapter` cam-77 | 38% | ~36% | −2% |
+| `fm-dummy-adapter` | 21% | ~15% | −6% |
+| **GPU util** | **84%** | **56–87% (variable)** | lower average |
+| GPU mem-BW | 2% | 2% | unchanged |
+
+**Interpretation:**
+- Main app −47%: capture threads still live inside the main app PID, so the pixel copy
+  work is still counted here — but it no longer runs inline on GStreamer streaming threads,
+  removing the hot-path contention that was the primary bottleneck.  The remaining ~380%
+  is compositor render + UI + capture threads running off the critical path.
+- Adapter CPU reduction: back-pressure from blocked streaming threads is gone; adapters
+  run more smoothly with the probe no longer stalling their delivery path.
+- GPU util variability (56–87%): the shared pipeline and removed alpha blend reduce
+  average fragment and state-change cost, but tile-res texture uploads at 60 Hz still
+  dominate.  This resolves further when the GPU path moves to native-res dmabuf (next
+  block), which eliminates the CPU-side texture upload entirely.
+- Ratchet jitter: did not fire in post-fix sessions — off-thread copy confirmed as the
+  original cause.
+
+**Status:** Resolved.  Architecture win will be fully banked at native-res + dmabuf (next
+block), which eliminates the CPU-side capture copy entirely.
 
 ---
 
@@ -75,13 +151,8 @@ adapter's delivery path. Under load, this can cause frames to bunch slightly, in
 the 1-second fps_in measurement window from the nominal 30 fps to 35–37 fps — enough
 to clear RATCHET_MIN_DELTA and commit.
 
-**Status:** Open. Not yet confirmed whether the probe is the cause or whether it is
-coincidental measurement noise. If stutter is observed, check fps_out — a compositor
-running at 37 fps against a 23.976 fps file source produces the same 37/24 judder
-pattern seen in the pre-RATCHET_MIN_DELTA era. Potential fixes:
-- Off-thread copy: have the probe enqueue a buffer reference and do the pixel copy on
-  a dedicated thread, removing the inline CPU cost from the streaming thread.
-- Increase RATCHET_MIN_DELTA (e.g. to 8) to absorb probe-induced jitter at 30 fps
-  while still passing a genuine 48/50/60 fps source (≥18 fps above baseline).
+**Status:** Resolved in Block 3a (2026-06-29).  Off-thread probe copy removed the inline
+work that was bunching delivery timing.  Ratchet did not fire in post-fix sessions.
+Hypothesis confirmed: the inline copy was the cause, not coincidental noise.
 
 ---

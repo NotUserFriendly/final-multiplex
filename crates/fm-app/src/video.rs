@@ -322,7 +322,9 @@ struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 // Primitive type, so stacking N separate shader(GpuRectProg) widgets would
 // have them overwrite each other's texture in the shared pipeline state.
 // Instead, one GpuRectProg widget carries all N (frame, rect) pairs and
-// makes N draw calls in a single pass, each with its own per-slot GpuRectInner.
+// makes N draw calls in a single pass, each with its own per-slot bind group
+// and texture.  The wgpu RenderPipeline, BGL, and sampler live in
+// GpuRectShared — one compile, one set_pipeline call per frame.
 
 pub struct GpuRectProg {
     /// One entry per source: (frame, [x0, y0, x1, y1]).
@@ -359,6 +361,12 @@ impl shader::Primitive for GpuRectPrim {
         _bounds: &Rectangle,
         _viewport: &Viewport,
     ) {
+        // Lazily create the shared pipeline/BGL/sampler on first frame.
+        if pipeline.shared.is_none() {
+            pipeline.shared = Some(GpuRectShared::new(device, pipeline.format));
+        }
+        let shared = pipeline.shared.as_ref().unwrap();
+
         // Grow the per-slot vec to match source count.
         if pipeline.slots.len() < self.sources.len() {
             pipeline.slots.resize_with(self.sources.len(), || None);
@@ -373,7 +381,7 @@ impl shader::Primitive for GpuRectPrim {
                 .map(|i: &GpuRectInner| i.tex_w != w || i.tex_h != h)
                 .unwrap_or(true);
             if rebuild {
-                pipeline.slots[slot] = Some(GpuRectInner::new(device, pipeline.format, w, h));
+                pipeline.slots[slot] = Some(GpuRectInner::new(device, shared, w, h));
             }
 
             let inner = pipeline.slots[slot].as_mut().unwrap();
@@ -411,9 +419,13 @@ impl shader::Primitive for GpuRectPrim {
     }
 
     fn draw(&self, pipeline: &GpuRectState, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+        let Some(shared) = &pipeline.shared else {
+            return false;
+        };
+        // Set the shared pipeline once, then N bind-group swaps + draws.
+        render_pass.set_pipeline(&shared.pipeline);
         let mut drew_any = false;
         for inner in pipeline.slots.iter().flatten() {
-            render_pass.set_pipeline(&inner.pipeline);
             render_pass.set_bind_group(0, &inner.bind_group, &[]);
             render_pass.draw(0..4, 0..1);
             drew_any = true;
@@ -425,6 +437,7 @@ impl shader::Primitive for GpuRectPrim {
 pub struct GpuRectState {
     format: wgpu::TextureFormat,
     slots: Vec<Option<GpuRectInner>>,
+    shared: Option<GpuRectShared>,
 }
 
 impl shader::Pipeline for GpuRectState {
@@ -432,51 +445,25 @@ impl shader::Pipeline for GpuRectState {
         Self {
             format,
             slots: Vec::new(),
+            shared: None,
         }
     }
 }
 
-struct GpuRectInner {
-    texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+// Shared across all slots: one shader compile, one set_pipeline per frame.
+struct GpuRectShared {
     pipeline: wgpu::RenderPipeline,
-    rect_buf: wgpu::Buffer,
-    last_pts: u64,
-    tex_w: u32,
-    tex_h: u32,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
 }
 
-impl GpuRectInner {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fm_gpu_rect_tex"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+impl GpuRectShared {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-
-        // Rect uniform: vec4<f32> = 16 bytes.
-        let rect_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fm_gpu_rect_buf"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fm_gpu_rect_bgl"),
             entries: &[
@@ -508,26 +495,6 @@ impl GpuRectInner {
                 },
             ],
         });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fm_gpu_rect_bg"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&tex_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: rect_buf.as_entire_binding(),
-                },
-            ],
-        });
-
         let shader_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fm_gpu_rect_shader"),
             source: wgpu::ShaderSource::Wgsl(RECT_SHADER.into()),
@@ -552,7 +519,8 @@ impl GpuRectInner {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // Sources tile the widget without overlap; no alpha needed.
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -565,11 +533,71 @@ impl GpuRectInner {
             multiview: None,
             cache: None,
         });
+        Self {
+            pipeline,
+            bgl,
+            sampler,
+        }
+    }
+}
+
+struct GpuRectInner {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    rect_buf: wgpu::Buffer,
+    last_pts: u64,
+    tex_w: u32,
+    tex_h: u32,
+}
+
+impl GpuRectInner {
+    fn new(device: &wgpu::Device, shared: &GpuRectShared, w: u32, h: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fm_gpu_rect_tex"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Rect uniform: vec4<f32> = 16 bytes.
+        let rect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fm_gpu_rect_buf"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fm_gpu_rect_bg"),
+            layout: &shared.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&shared.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: rect_buf.as_entire_binding(),
+                },
+            ],
+        });
 
         Self {
             texture,
             bind_group,
-            pipeline,
             rect_buf,
             last_pts: u64::MAX,
             tex_w: w,

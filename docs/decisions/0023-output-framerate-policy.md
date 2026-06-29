@@ -52,3 +52,6 @@ the maximum input rate observed across active sources and **never comes back dow
   (encoders, the canary window) must read it dynamically rather than assume a constant.
 
 This is the policy Phase 2.3 implements.
+
+- **Scoped by ADR-0024** — the ratchet applies to the compositor/record tier only; it is
+  moot on the GPU presentation path, where each source renders at its native rate.

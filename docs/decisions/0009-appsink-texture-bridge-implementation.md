@@ -55,3 +55,5 @@ it by mutable reference on each frame, performs the conditional `write_texture`,
 - The seam described in ADR-0006 is preserved: `bridge.rs` and `video.rs` together are
   still the only files that touch the appsink→GPU path, and swapping to a different
   renderer (Slint or GTK4) still costs only those two files.
+- **Extended by ADR-0024** — the single composited texture becomes N per-source textures
+  composited in wgpu on the GPU presentation path.

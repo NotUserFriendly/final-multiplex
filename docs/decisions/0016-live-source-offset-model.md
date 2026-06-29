@@ -67,3 +67,6 @@ the core directly and keep the signed range.
   ceiling. Noted as the forward path, not built now.
 - The offset/queue construction branches on the source's declared constraints (ADR-0017) for
   live sources and core-known defaults for in-core files.
+- **Extended by ADR-0024** — the offset concept (shared clock + per-source delay) is
+  unchanged; on the GPU path the mechanism moves from `gst_pad_set_offset()` to
+  renderer-side frame-selection in the presentation scheduler.

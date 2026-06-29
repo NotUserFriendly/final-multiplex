@@ -147,3 +147,5 @@ from a supervisor-triggered restart.
   JSON protocol.  Adapters must ensure all debug/diagnostic output goes to stderr.  The
   correct long-term fix is a dedicated control file-descriptor (not stdout); deferred
   until a concrete breakage is seen in practice (see BUGS.md).
+- **Scoped by ADR-0024** — the core-owned resize-to-tile applies to the compositor path
+  only; on the GPU path each source is scaled per-rect by the GPU.

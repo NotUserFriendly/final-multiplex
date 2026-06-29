@@ -1,8 +1,14 @@
-// Persistent-texture wgpu shader widget for video display (ADR-0006 bridge
-// replacement). Creates a GPU texture once via Pipeline::new and updates it
-// in-place with queue.write_texture — no delete/re-upload cycle, no flicker.
+// Persistent-texture wgpu shader widgets for video display.
+//
+// `VideoProg` (ADR-0006) — the compositor-path output: one composited texture
+// drawn full-widget with letterbox/pillarbox scaling.
+//
+// `GpuRectProg` (ADR-0024 Phase 3) — the GPU presentation path: a single
+// source's texture drawn at an arbitrary NDC rect [x0, y0, x1, y1].  This is
+// the "arbitrary rect" interface the ADR specifies as general from day one.
 
 use crate::bridge::FrameData;
+use crate::gpu_path::TimedFrame;
 use iced::widget::shader::{self, Viewport};
 use iced::{mouse, Rectangle};
 use std::sync::Arc;
@@ -304,5 +310,292 @@ struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 
 @fragment fn fs_main(v: V) -> @location(0) vec4<f32> {
     return textureSample(t, s, v.uv);
+}
+"#;
+
+// ── GPU presentation path: arbitrary-rect shader widget (ADR-0024) ───────────
+//
+// Draws one source's texture at an arbitrary NDC rect [x0, y0, x1, y1].
+// NDC convention: X ∈ [-1, 1] left→right; Y ∈ [-1, 1] bottom→top.
+// Example — bottom-right quarter: [-1.0, -1.0, 1.0, 0.0] … err, [0.0, -1.0, 1.0, 0.0].
+//
+// The rect is the "general interface" ADR-0024 requires from day one:
+// focus mode, per-source fit, and layout editing all change only the rect
+// values, not the renderer.
+
+pub struct GpuRectProg {
+    pub frame: Option<Arc<TimedFrame>>,
+    /// [x0, y0, x1, y1] in NDC clip space.  Y=-1 is bottom, Y=+1 is top.
+    pub rect: [f32; 4],
+}
+
+impl<Msg> shader::Program<Msg> for GpuRectProg
+where
+    Msg: Clone + std::fmt::Debug + Send + 'static,
+{
+    type State = ();
+    type Primitive = GpuRectPrim;
+
+    fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> GpuRectPrim {
+        GpuRectPrim {
+            frame: self.frame.clone(),
+            rect: self.rect,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GpuRectPrim {
+    frame: Option<Arc<TimedFrame>>,
+    rect: [f32; 4],
+}
+
+impl shader::Primitive for GpuRectPrim {
+    type Pipeline = GpuRectState;
+
+    fn prepare(
+        &self,
+        pipeline: &mut GpuRectState,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _bounds: &Rectangle,
+        _viewport: &Viewport,
+    ) {
+        let frame = match &self.frame {
+            Some(f) => f,
+            None => return,
+        };
+        let (w, h) = (frame.width, frame.height);
+
+        let rebuild = pipeline
+            .inner
+            .as_ref()
+            .map(|i| i.tex_w != w || i.tex_h != h)
+            .unwrap_or(true);
+        if rebuild {
+            pipeline.inner = Some(GpuRectInner::new(device, pipeline.format, w, h));
+        }
+
+        let inner = pipeline.inner.as_mut().unwrap();
+
+        // Upload rect uniform [x0, y0, x1, y1] as 16 bytes (vec4<f32>).
+        let mut rect_bytes = [0u8; 16];
+        for (i, v) in self.rect.iter().enumerate() {
+            rect_bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        queue.write_buffer(&inner.rect_buf, 0, &rect_bytes);
+
+        // Upload texture only when the frame changes.
+        if frame.pts_ns != inner.last_pts {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &inner.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            inner.last_pts = frame.pts_ns;
+        }
+    }
+
+    fn draw(&self, pipeline: &GpuRectState, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+        let Some(inner) = &pipeline.inner else {
+            return false;
+        };
+        render_pass.set_pipeline(&inner.pipeline);
+        render_pass.set_bind_group(0, &inner.bind_group, &[]);
+        render_pass.draw(0..4, 0..1);
+        true
+    }
+}
+
+pub struct GpuRectState {
+    format: wgpu::TextureFormat,
+    inner: Option<GpuRectInner>,
+}
+
+impl shader::Pipeline for GpuRectState {
+    fn new(_device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        Self {
+            format,
+            inner: None,
+        }
+    }
+}
+
+struct GpuRectInner {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
+    rect_buf: wgpu::Buffer,
+    last_pts: u64,
+    tex_w: u32,
+    tex_h: u32,
+}
+
+impl GpuRectInner {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fm_gpu_rect_tex"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // Rect uniform: vec4<f32> = 16 bytes.
+        let rect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fm_gpu_rect_buf"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fm_gpu_rect_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fm_gpu_rect_bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: rect_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let shader_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fm_gpu_rect_shader"),
+            source: wgpu::ShaderSource::Wgsl(RECT_SHADER.into()),
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fm_gpu_rect_pl"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fm_gpu_rect_rp"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_mod,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            texture,
+            bind_group,
+            pipeline,
+            rect_buf,
+            last_pts: u64::MAX,
+            tex_w: w,
+            tex_h: h,
+        }
+    }
+}
+
+const RECT_SHADER: &str = r#"
+struct Vert { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+
+// [x0, y0, x1, y1] in NDC; Y=-1=bottom, Y=+1=top.
+@group(0) @binding(2) var<uniform> rect: vec4<f32>;
+
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> Vert {
+    // Triangle strip BL→BR→TL→TR.
+    let px = array<f32,4>(rect.x, rect.z, rect.x, rect.z);
+    let py = array<f32,4>(rect.y, rect.y, rect.w, rect.w);
+    let pu = array<f32,4>(0.0, 1.0, 0.0, 1.0);
+    let pv = array<f32,4>(1.0, 1.0, 0.0, 0.0);
+    return Vert(vec4(px[i], py[i], 0.0, 1.0), vec2(pu[i], pv[i]));
+}
+
+@group(0) @binding(0) var vid_tex: texture_2d<f32>;
+@group(0) @binding(1) var vid_samp: sampler;
+
+@fragment fn fs_main(v: Vert) -> @location(0) vec4<f32> {
+    return textureSample(vid_tex, vid_samp, v.uv);
 }
 "#;

@@ -211,6 +211,12 @@ impl Transport {
         &self.pipeline
     }
 
+    /// Current pipeline running time in nanoseconds for the GPU-path scheduler
+    /// (ADR-0024).  Delegates to `Pipeline::current_running_time_ns`.
+    pub fn pipeline_running_time_ns(&self) -> Option<u64> {
+        self.pipeline.current_running_time_ns()
+    }
+
     /// Poll each source's input fps and ratchet the output rate up to the
     /// observed maximum (ADR-0023).  Call ~once per second from the Tick loop.
     ///

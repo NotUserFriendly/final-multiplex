@@ -1,4 +1,5 @@
 mod bridge;
+mod gpu_path;
 mod ui;
 mod video;
 

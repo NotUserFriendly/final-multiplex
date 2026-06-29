@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **GPU presentation path — Phase 3 Block 1 (experimental, additive):** a per-source
+  frame ring-buffer and renderer-side presentation scheduler running in parallel with
+  the existing GStreamer compositor path (ADR-0024).  A pad probe on `vcaps_{id}:src`
+  captures tile-res RGBA frames with their raw PTS into a 16-slot ring; at each display
+  refresh the scheduler selects the frame whose PTS is closest to
+  `(pipeline_running_time − source_offset_ns)` — the same frame-selection logic the
+  compositor performs, re-implemented in the renderer.  The selected frame is uploaded
+  as a wgpu texture and drawn at an arbitrary NDC rect via a new `GpuRectProg` shader
+  widget, proving the rect interface that focus mode and layout editing will reuse.
+  The compositor path is untouched and continues to run beneath the GPU overlay.
+
 ### Fixed
 - **Ratchet jitter-fired on measurement noise:** the 1-second fps_in measurement
   window can round a nominally-30 fps source up to 31–34 fps under normal frame

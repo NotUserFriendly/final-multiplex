@@ -851,6 +851,14 @@ impl Pipeline {
         &self.appsink
     }
 
+    /// Current pipeline running time in nanoseconds.  This is the shared clock
+    /// value used by all GStreamer elements — the same timebase the compositor
+    /// uses for frame alignment (ADR-0005).  Used by the GPU-path scheduler
+    /// (ADR-0024) to select frames at (running_time − source_offset_ns).
+    pub fn current_running_time_ns(&self) -> Option<u64> {
+        self.inner.current_running_time().map(|t| t.nseconds())
+    }
+
     pub fn source_pads(&self) -> &HashMap<String, SourcePads> {
         &self.source_pads
     }

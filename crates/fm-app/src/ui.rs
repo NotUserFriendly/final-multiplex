@@ -1,5 +1,6 @@
 use crate::bridge::{self, FrameData};
-use crate::video::VideoProg;
+use crate::gpu_path::{self, GpuFrameStore, TimedFrame};
+use crate::video::{GpuRectProg, VideoProg};
 use fm_adapter_sdk::metrics::SourceMetrics;
 use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
@@ -58,6 +59,13 @@ pub struct App {
     tick_count: u64,
     /// IDs of external sources — used to query chain state for delivery watchdog.
     external_source_ids: Vec<String>,
+    /// GPU presentation path (ADR-0024, Phase 3 Block 1).
+    /// Populated for the first source that has a video pad.
+    gpu_frame_store: Option<GpuFrameStore>,
+    /// The source ID whose vcaps:src pad is being GPU-pathed.
+    gpu_source_id: Option<String>,
+    /// Most recently scheduler-selected frame for the GPU-path source.
+    current_gpu_frame: Option<Arc<TimedFrame>>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +135,9 @@ impl App {
                     last_offset_change: None,
                     tick_count: 0,
                     external_source_ids: Vec::new(),
+                    gpu_frame_store: None,
+                    gpu_source_id: None,
+                    current_gpu_frame: None,
                 }
             }
         }
@@ -154,6 +165,22 @@ impl App {
 
                 if let Some(frame) = bridge::latest_frame(&self.frame_store, &mut self.frame_gen) {
                     self.current_frame = Some(frame);
+                }
+                // GPU-path scheduler (ADR-0024): select the frame whose PTS
+                // is closest to (pipeline_running_time − source_offset_ns).
+                if let (Some(store), Some(src_id), Some(t)) =
+                    (&self.gpu_frame_store, &self.gpu_source_id, &self.transport)
+                {
+                    if let Some(running_ns) = t.pipeline_running_time_ns() {
+                        let offset_ns = self
+                            .sources
+                            .iter()
+                            .find(|s| &s.id == src_id)
+                            .map(|s| s.offset_ms as i64 * 1_000_000)
+                            .unwrap_or(0);
+                        let target_ns = (running_ns as i64 - offset_ns).max(0) as u64;
+                        self.current_gpu_frame = store.lock().unwrap().select(target_ns);
+                    }
                 }
                 if let Some(metrics) = &self.metrics {
                     self.source_metrics = self
@@ -413,12 +440,32 @@ impl App {
                 .into()
         };
 
-        // ── Layer 1: per-tile overlay grid ─────────────────────────────────
+        // ── Layer 1: GPU-path PiP (ADR-0024 Block 1 proof) ────────────────
+        // Draws the GPU-path source in the bottom-right quarter of the video
+        // area using the arbitrary-rect wgpu shader.  The compositor path
+        // (layer 0) continues to run beneath it — both paths are live.
+        // rect = [x0=-1+1=0, y0=-1, x1=1, y1=0] → bottom-right quarter in NDC.
+        let gpu_rect_layer: Element<Message> = if self.current_gpu_frame.is_some() {
+            shader(GpuRectProg {
+                frame: self.current_gpu_frame.clone(),
+                rect: [-0.5, -0.5, 0.5, 0.5],
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        } else {
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        // ── Layer 2: per-tile overlay grid ─────────────────────────────────
         let overlay_layer = self.tile_overlay_grid();
 
         // Stack + centre in black surround
         let video_area = container(
-            stack([video_layer, overlay_layer])
+            stack([video_layer, gpu_rect_layer, overlay_layer])
                 .width(Length::Fixed(video_w))
                 .height(Length::Fixed(video_h)),
         )
@@ -926,6 +973,33 @@ fn try_init(
 
     bridge::install(pipeline.appsink(), frame_store.clone());
 
+    // GPU presentation path (ADR-0024, Block 1): probe the first source with
+    // a video pad.  The pad carries tile-res RGBA; the probe copies each frame
+    // (with its raw PTS) into the FrameRing without disturbing the compositor.
+    let (gpu_frame_store, gpu_source_id) = {
+        let first_video_source = sources.iter().find(|s| {
+            pipeline
+                .source_pads()
+                .get(&s.id)
+                .and_then(|p| p.video_src.as_ref())
+                .is_some()
+        });
+        if let Some(src) = first_video_source {
+            let store = gpu_path::new_store();
+            if let Some(pad) = pipeline
+                .source_pads()
+                .get(&src.id)
+                .and_then(|p| p.video_src.as_ref())
+            {
+                gpu_path::install_probe(pad, store.clone());
+                eprintln!("[gpu-path] probe installed on vcaps_{}", src.id);
+            }
+            (Some(store), Some(src.id.clone()))
+        } else {
+            (None, None)
+        }
+    };
+
     let mut transport = fm_core::transport::Transport::new(pipeline);
     for (id, (min, max)) in &source_effective_bounds {
         transport.set_source_bounds(id, *min as i64, *max as i64);
@@ -976,5 +1050,8 @@ fn try_init(
         last_offset_change: None,
         tick_count: 0,
         external_source_ids: external_ids,
+        gpu_frame_store,
+        gpu_source_id,
+        current_gpu_frame: None,
     })
 }

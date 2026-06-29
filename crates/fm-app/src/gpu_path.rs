@@ -1,11 +1,11 @@
 // Per-source frame ring-buffer and scheduler for the GPU presentation path
-// (ADR-0024, Phase 3).
+// (ADR-0024, Phase 3 / ADR-0025).
 //
-// Frames arrive from a pad probe on vdeint_{id}:src (native-res RGBA, with
-// the buffer's raw PTS).  The tap is before vscale so the GPU path receives
-// frames at the source's actual input resolution — the camera's native res
-// for RTSP sources, the decoded file res for file sources (ADR-0024 B2).
-// The compositor path's vscale→vcaps(tile) is unaffected.
+// Frames arrive from a pad probe on vcaps_{id}:src (tile-res RGBA, post-scale,
+// with the buffer's raw PTS).  The tap is after vscale so the GPU path
+// captures exactly the pixels the compositor would display — no extra copy
+// cost from native-res frames that are discarded at draw time on a uniform
+// equal-size grid (ADR-0025).
 //
 // The scheduler selects the frame whose PTS best matches
 // (pipeline_running_time − source_offset_ns) at each display refresh.  This
@@ -13,11 +13,11 @@
 // provides "for free" on the CPU path — proving that a per-source renderer
 // can maintain frame accuracy against the shared clock (ADR-0005).
 //
-// Res-appropriate-to-rect (ADR-0024 B2): when tiles have different sizes
-// (focus mode, Phase 5+), the GPU path should import native-res only for
-// large tiles and tile-res for thumbnails, reducing bandwidth for small rects.
-// Not yet implemented — all tiles are equal-size today, making the
-// distinction moot.  Wire it here when focus mode is built.
+// Res-appropriate-to-rect (ADR-0025, Phase 5): when focus mode introduces
+// variable-size tiles, the GPU path should import native-res for large tiles
+// and tile-res for thumbnails.  At that point move the probe per-rect to the
+// pre-scale tap (vdeint:src) for the focused tile and keep vcaps:src for
+// thumbnails.  All tiles are equal-size today so the distinction is moot.
 
 use gstreamer::prelude::*;
 use std::collections::VecDeque;

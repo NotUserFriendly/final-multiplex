@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **GPU path reverted to tile-res capture (ADR-0025):** the B2 native-res probe
+  (pre-scale tap, `vdeint:src`) is reverted to the Block 1–3 post-scale tap (`vcaps:src`).
+  On a uniform equal-size grid the extra pixels were downscaled away at draw time — the
+  path was paying to copy pixels it then discarded.  Native-res capture is deferred to
+  focus mode (Phase 5, ADR-0025 res-appropriate-to-rect) where a large focused tile can
+  actually show the extra resolution.
+- **Transport tightened back to tile-res:** `vshmcaps` in the core and `vcaps` in the
+  RTSP adapter re-add `width`/`height` constraints (tile dimensions), so native-res
+  frames no longer cross the IPC transport unread.  Adapter-side `vscale` downscales
+  before the socket as before.
+
 ### Added
 - **GPU presentation path — native resolution (Phase 3 B2, experimental, additive):**
   the GPU path now captures frames at **native input resolution** instead of tile-res:

@@ -571,8 +571,8 @@ impl Pipeline {
                 let vs = vcaps.static_pad("src").ok_or("vcaps: no src pad")?;
                 vs.set_offset(offset_ns);
 
-                // GPU pre-scale tap: vdeint:src is before vscale, giving the
-                // GPU path frames at native input resolution (ADR-0024 B2).
+                // pre_scale_video_src kept for future use (focus-mode native-res
+                // per-rect, ADR-0025 Phase 5).  GPU path uses video_src today.
                 pre_scale_vcaps_src = Some(vdeint.static_pad("src").ok_or("vdeint: no src pad")?);
 
                 // For external (live) sources, insert the offset buffer queue
@@ -722,15 +722,12 @@ impl Pipeline {
                             gstreamer::ElementFactory::make("capsfilter")
                                 .name(format!("vshmcaps_{}", source.id))
                                 .build()?;
-                        // GPU native-res path (ADR-0024 B2): do NOT constrain
-                        // width/height here — the adapter now sends at its native
-                        // camera resolution.  vscale→vcaps(tile) in the core
-                        // handles the downscale for the compositor path; the GPU
-                        // path probes vdeint:src to capture at native resolution.
                         vshmcaps.set_property(
                             "caps",
                             gstreamer::Caps::builder("video/x-raw")
                                 .field("format", "RGBA")
+                                .field("width", tile_w)
+                                .field("height", tile_h)
                                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                                 .build(),
                         );
@@ -1015,13 +1012,12 @@ impl Pipeline {
         let vunixfdsrc = make_transport_src(&format!("vunixfdsrc_{source_id}"), &video_sock)?;
 
         let vshmcaps = make("capsfilter", &format!("vshmcaps_{source_id}"))?;
-        // Native-res GPU path (ADR-0024 B2): no width/height constraint here —
-        // the adapter sends at native camera resolution.  vscale→vcaps(tile)
-        // handles the downscale for the compositor path.
         vshmcaps.set_property(
             "caps",
             gstreamer::Caps::builder("video/x-raw")
                 .field("format", "RGBA")
+                .field("width", layout.tile_w)
+                .field("height", layout.tile_h)
                 .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                 .build(),
         );

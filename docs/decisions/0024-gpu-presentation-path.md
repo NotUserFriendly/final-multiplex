@@ -84,3 +84,6 @@ rate; compositing happens on the **GPU** (wgpu) by drawing each source's texture
 - **0023** (output framerate ratchet): scoped to the compositor/record tier under this ADR.
 - **0012** (core-owned resize): compositor-path; the GPU path scales per-rect (see bandwidth
   consequence).
+- **0025** (dmabuf import + tile-res capture): narrows the zero-copy target to Vulkan-HAL
+  interop, reverts blanket native-res capture to tile-res, and sequences native-res capture
+  as per-rect (focus mode, Phase 5). Supersedes B2's capture tap decision.

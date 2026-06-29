@@ -25,6 +25,44 @@ Format. One section per bug. Under it: Attempt N — Hypothesis / Action / Resul
 
 ---
 
+## GPU-path pad probe CPU overhead (Block 2, 2026-06-29)
+
+**Observed numbers (4-source scene: 1 dummy + 2 RTSP + 1 file, tile-res 1920×1080):**
+
+| Process | CPU % (instantaneous) | Notes |
+|---|---|---|
+| `final-multiplex` (main app) | **711%** | 8.3 GB RSS, 111 threads |
+| `fm-rtsp-adapter` cam-27 | 91% | decode + convert + scale |
+| `fm-rtsp-adapter` cam-77 | 38% | same pipeline, lighter load |
+| `fm-dummy-adapter` | 21% | synthetic RGBA generation |
+| **GPU** | **84% util, 2% mem-BW** | wgpu render, 2120 MiB used / 24564 MiB |
+
+System load average at measurement time: 14.19 (1 min), 12.19 (5 min).
+
+**Root cause hypothesis:** 4 pad probes each copy a full 1920×1080 RGBA frame (~8 MB)
+inline on the GStreamer streaming thread at 30 fps per source.
+`4 × 8 MB × 30 fps ≈ 960 MB/s` of synchronous memory copy on hot streaming threads.
+This also explains the ratchet jitter (see entry below) — the inline copy work
+bunches frame delivery timing, inflating the fps_in measurement window.
+
+**GPU observation:** 84% GPU utilization with only 2% memory bandwidth is unusual —
+suggests the GPU is compute-bound on the wgpu render passes (4 sources × 60 Hz,
+each uploading a full tile-res texture), not bandwidth-bound. This will change when
+the GPU path moves to native-res textures in Block 3.
+
+**Remediation options (deferred to Block 3):**
+- **Off-thread copy (primary fix):** probe enqueues the `gst::Buffer` reference
+  (zero-copy, just an Arc bump), a dedicated thread does the pixel copy into the
+  ring. Removes inline copy cost from the streaming thread entirely.
+- **Zero-copy / dmabuf (Block 3 goal):** native-res dmabuf import bypasses the CPU
+  copy altogether; the probe just passes a fd handle to wgpu. CPU cost drops to
+  near zero for the capture path.
+
+**Status:** Open — expected overhead for tile-res copy; acceptable for the proof stage.
+Off-thread copy is the next incremental fix; full zero-copy is Block 3.
+
+---
+
 ## Ratchet firing to 37 fps with GPU-path pad probe active (2026-06-28)
 
 **Symptom:** On launch with the Block 1 GPU-path probe installed on `vcaps_dummy:src`,

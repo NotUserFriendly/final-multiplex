@@ -69,16 +69,30 @@ H.264 decode at 1920×1080) creates frame delivery jitter. On a machine near 7/8
 cores total, OS scheduling jitter tips the compositor into dropping frames, which
 shows as all-tile stutter.
 
-### Next steps (not yet attempted)
+### Attempt 3 — Resolution sweep (2026-06-28)
 
-**Option A — Hardware decode in the RTSP adapter:** replace `decodebin3` with a
-hardware-accelerated path (`vaapidecodebin` / `nvh264dec`). Drops cam-27's adapter
-from ~1 core to near zero. Likely the correct long-term fix; touches RTSP adapter
-pipeline construction and has hardware/driver assumptions — flagged for review chat.
+The machine received OS/package updates between the initial investigation and this run;
+4K compositor CPU dropped from ~527% to ~318% (likely a GStreamer or Mesa update).
+Resolution was varied across four settings to bracket the CPU ceiling:
 
-**Option B — Reduce tile resolution:** change `width`/`height` per tile in the scene
-(e.g., 960×540 → 1920×1080 canvas). Cuts pixel throughput 4×; would confirm
-CPU-ceiling diagnosis. Scene config change only, no code.
+| Tile size | Canvas | Compositor | cam-27 adapter | cam-77 adapter | dummy | Result |
+|-----------|--------|------------|----------------|----------------|-------|--------|
+| 960×540 | 1920×1080 | 57% | 60% | 22% | 3% | Smooth |
+| 1280×720 | 2560×1440 | 138% | 65% | 28% | 5% | Smooth |
+| 1920×1080 | 3840×2160 | 318% | 76% | 35% | 11% | Marginal |
+| 2560×1440 | 5120×2880 | 557% | 87% | 41% | 22% | Very stuttery |
+
+RTSP adapter CPU barely scales with output resolution (decode cost is fixed by source
+resolution). Compositor scales roughly quadratically — confirms the bottleneck is
+software pixel throughput, not decode.
+
+**Conclusion:** the 4K (1920×1080 per tile) scene is marginal on this hardware post-update
+and will stutter under load. 1440p total canvas (1280×720 per tile) is smooth with headroom.
+Scene restored to 1920×1080 per tile (user's preferred setting).
+
+**Option A — Hardware decode** remains the correct long-term fix: replace `decodebin3`
+with `vaapidecodebin` / `nvh264dec` in the RTSP adapter. Flagged for review chat
+(hardware assumptions, adapter pipeline change).
 
 ---
 

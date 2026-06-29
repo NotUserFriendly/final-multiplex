@@ -30,6 +30,10 @@ Desktop.ini
 .env
 .env.*
 /secrets/
+exampleInputs.md
+
+# --- Local scene files (may contain real credentials) ---
+scenes/scene-mixed-dummy.toml
 
 # --- Local-only task scratchpads ---
 TaskBlock*.md

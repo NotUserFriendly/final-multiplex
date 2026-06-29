@@ -153,6 +153,23 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
   aligned** — 80% of focus mode's rendering with none of its UX, which de-risks the whole feature
   line behind it.
 
+- **Status (2026-06-29): functionally complete.** Per-source scheduler, N-source GPU composite,
+  and a **dedicated wgpu present loop** (own render thread, vsync-locked, outside iced — ADR-0026)
+  are built and validated: ~95–102 fps sustained (vs a 19 fps iced-driven baseline), no
+  degradation, alignment + offsets confirmed, compositor/record tier untouched. The stutter that
+  motivated the rephase is resolved. Exit criteria met.
+- **Open / deferred (do later, tracked):**
+  - *Capture/upload resolution policy* — native vs per-rect (res-appropriate-to-rect). Settled by a
+    post-dedicated-loop fullscreen measurement; the per-rect form is Phase 5. **[open]**
+  - *Zero-copy dmabuf* — ADR-0025; deferred to its own block after Phase 4, coupled to the
+    focus-mode native tile + fullscreen many-source case. **[deferred]**
+  - *Present-loop portability* — the dedicated loop is Wayland-specific (`wl_subsurface`); Windows
+    and Mac each need their own surface integration. Cross-platform-step debt. **[deferred]**
+  - *Compositor present ceiling under Mutter (<160 Hz)* — parked for a later architecture decision;
+    non-issue at current rates. **[parked]**
+- **Near a tag:** Phase 3 is the natural **0.3.0** milestone once the capture-res question settles
+  and `[Unreleased]` is rolled.
+
 ### Phase 4 — YouTube adapter (3rd source)
 - **Deliverable:** yt-dlp resolver subprocess + stream ingest + periodic re-resolve on
   URL expiry, as an out-of-process adapter. **Lands on the Phase-3 GPU path** — the prototype's

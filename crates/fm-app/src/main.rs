@@ -2,6 +2,8 @@ mod bridge;
 mod gpu_path;
 mod ui;
 mod video;
+#[cfg(target_os = "linux")]
+mod wayland_sub;
 
 // Layer 2: set by the SIGTERM signal handler so the iced Tick loop can
 // call shutdown_all() on the main thread where it is safe to do so.
@@ -82,5 +84,10 @@ fn main() -> iced::Result {
         .subscription(ui::App::subscription)
         .window_size(initial_size)
         .exit_on_close_request(false)
+        .transparent(true)
+        .style(|_app, theme: &iced::Theme| iced::theme::Style {
+            background_color: iced::Color::TRANSPARENT,
+            text_color: theme.palette().text,
+        })
         .run()
 }

@@ -331,3 +331,176 @@ work that was bunching delivery timing.  Ratchet did not fire in post-fix sessio
 Hypothesis confirmed: the inline copy was the cause, not coincidental noise.
 
 ---
+
+## Phase 3 dedicated-surface — Step 0: RSS / leak check (2026-06-29)
+
+**Setup:** 4-source 2×2 scene; `[diag-rss]` instrumentation in `Message::Frame` emitting
+RSS and batch fps every 60 frames to the session log.  Run duration ~17 min (PID 67348).
+
+**RSS data:**
+
+| Frame | Batch fps | RSS (MB) |
+|---|---|---|
+| 60 | 23 | 8804 |
+| ~600 | 18–24 (oscillating) | 8742–8864 |
+| 21720 | 20 | 9016 |
+
+Total RSS drift over 17 min: **+206 MB** (8804 → 9016 MB, non-monotone with occasional drops).
+
+**Conclusion: no pathological memory leak.**  RSS growth is flat and non-monotone —
+consistent with minor GStreamer internal caching (decoder/pad state, dmabuf handles)
+that is periodically released.  Not a frame-ring or application-level leak.
+
+**fps degradation is thermal/event-loop, not memory:**  fps declined from 22–23 cold
+to 18–20 late-session with flat RSS.  This matches the iced event-loop pressure and
+thermal throttle hypothesis from the render-rate split measurement.
+
+**Display refresh rate finding (same session):** `xrandr`/compositor output confirmed
+the display runs at **159.92 Hz** (3440×1440), not 60 Hz as previously assumed.
+vsync interval = **6.25 ms**. This makes the iced event-loop overhead (22 ms at startup,
+35+ ms late session) even more severe relative to vsync — and confirms Path 3 (dedicated
+wgpu present loop) is required. 40fps from iced's loop is ~6.5 vsyncs/frame at 160 Hz.
+
+**Pre-composite texture approach also evaluated and rejected:** even with 1 ms blit, iced's
+22 ms event-loop overhead → 23 ms cycle → ~40 fps ceiling. iced's loop still gates presents
+regardless of how fast the GPU work is. Path 3 only.
+
+**Step 0 diagnostic code stripped** (2026-06-29); findings recorded here.
+
+---
+
+## Phase 3 dedicated-surface — Step 1 spike: wl_subsurface (2026-06-29)
+
+**What was built:**
+`crates/fm-app/src/wayland_sub.rs` — creates a `wl_subsurface` under iced's window via
+libwayland C FFI (`wayland-sys` crate, isolated `wl_event_queue` to avoid racing winit).
+On the `Opened` event, `iced::window::run()` fetches raw Wayland handles; `update()` then
+calls `create_subsurface()` (on the event-loop/Wayland thread) and spawns a dedicated
+wgpu render thread that presents solid magenta at Fifo vsync.
+
+**What to check when running:**
+1. `[wayland-sub] subsurface created at (0, 0)` appears in session log → Wayland protocol worked.
+2. `[wayland-sub] surface configured NxN Bgra8UnormSrgb Fifo — presenting magenta` appears → wgpu surface up.
+3. The window shows a magenta fill (covers the full window including chrome — this is expected for the spike).
+4. The magenta is solid, not flickering — confirms the render thread is presenting at vsync.
+5. iced's event loop continues running (you can still observe the process running; SIGTERM exits cleanly).
+
+**Bugs found and fixed during bringup (2026-06-29, CC-diagnosed):**
+
+1. `wl_registry.bind` version: initially bound globals at their advertised version (e.g., 4)
+   but the registry proxy is always version 1 — `wl_proxy_marshal_array_constructor_versioned`
+   checks `factory->version < requested_version` → EINVAL.  Fixed: bind at version 1.
+
+2. `wl_registry.bind` args count: initially passed 2 args `[{u:name}, {n:0}]` but the wire
+   signature for an untyped new_id is `"usun"` (4 args: uint name, string iface_name, uint
+   version, new_id).  `strlen` was called on `args[1].s = NULL` → SIGSEGV inside
+   `wl_proxy_marshal_array_flags`.  Fixed: pass all 4 args, with `{s: iface.name}` as
+   args[1].
+   Diagnosed with: `strace -s 200` (found EINVAL message) and `gdb -batch` (found SIGSEGV
+   frame in `__strlen_avx2 ← wl_proxy_marshal_array_flags ← on_global`).
+
+**CC-observed run result (2026-06-29):**
+- `[wayland-sub] subsurface created at (0, 0)` ✓
+- `[wayland-sub] using adapter: NVIDIA GeForce RTX 3090 Ti` ✓
+- `[wayland-sub] surface configured 1760×770 Rgba8UnormSrgb Fifo — presenting magenta` ✓
+- Process ran stably for 20+ minutes with no crash.
+- CPU at 665% during run — expected, render loop is a tight spin (no throttle in spike; Step 2 will fix).
+
+**Status:** Confirmed — maintainer verified full-screen magenta coverage (2026-06-29). Step 1 complete; proceeding to Step 2.
+
+---
+
+## Phase 3 dedicated-surface — Step 2: video compositor (2026-06-29)
+
+**What changed from Step 1:**
+`render_loop` now reads `running_time` from `Arc<AtomicU64>` (written by
+`Message::Frame`), selects each source's closest frame from its ring at
+`running_time − offset_ns`, uploads textures to per-slot `wgpu::Texture`, and composites
+N NDC rects with the rect shader before present.  Offset changes propagate via
+`try_lock` on `Arc<Mutex<Vec<RenderSlot>>>`.
+
+**CC-observed run result (2026-06-29):**
+- `[sub] surface 1760×770 Rgba8UnormSrgb Fifo — video compositor active` ✓
+- Process ran stably 3+ minutes with no crash.
+- CPU at ~588% — render thread still spinning; Fifo vsync throttles GPU submits but the
+  CPU selection loop is not blocked.  Step 3 will measure actual present rate.
+
+**What to check:**
+1. Full-window composite of N sources appears (black background, sources in equal-split grid).
+2. Each tile shows live video from its source (RTSP cams + dummy animated + FNAF2 file).
+3. Tile positions match the expected equal-split layout (2×2 for 4 sources).
+4. Adjusting an offset in iced's UI changes the corresponding tile's frame selection.
+
+**Follow-up fixes (2026-06-29):**
+- Surface format changed from `Rgba8UnormSrgb` → `Rgba8Unorm`: GStreamer delivers
+  gamma-encoded RGBA; the sRGB surface was applying a second gamma pass and washing
+  out mid-tones.  Dummy feed was unaffected (synthetic flat primaries insensitive to gamma).
+- Letterboxed AR: `letterbox_rect()` computes the largest axis-aligned sub-rect within each
+  grid cell that preserves the source's native AR (pillarbox/letterbox with black bars).
+  `last_lb_rect` tracks the last-written value; buffer writes are skipped unless dims or
+  cell rect changed.
+- Window resize: `Arc<AtomicU64> WindowSize` (packed `width<<32|height`) written by
+  `Message::Resized`, read by the render thread before each `get_current_texture()` call
+  (must precede acquire — wgpu forbids configure while a SurfaceTexture is live).
+  On change: reconfigure surface, update `width`/`height` locals, reset all `last_lb_rect`.
+
+**Maintainer confirmed (2026-06-29):**
+- Live video appears in all 4 tiles ✓
+- Colors correct after `Rgba8Unorm` fix ✓
+- Tiles letterboxed to 16:9, black pillar bars on sides ✓
+- Window resize correctly reflows tiles, no iced content visible behind subsurface ✓
+
+**Status:** Step 2 complete. Proceeding to Step 3 (render rate measurement + alignment validation).
+
+---
+
+## Phase 3 dedicated-surface — Step 3: validation (2026-06-29)
+
+**Display:** LG ULTRAGEAR 3440×1440 @ 160 Hz (`is-current: true` from Mutter DisplayConfig).
+
+**Render-rate measurement (release build, `[sub] present fps=` every 5 s):**
+
+| Phase | fps range | Notes |
+|---|---|---|
+| Initial run (GPU sched still double-running) | 57–59 | Before double-render fix |
+| After double-render fix + place_below | 90–109 | 95–102 typical; no floor |
+
+- No crash, no panic over 3+ min observed run.
+- RSS: ~9.4 GB (release build with 4 sources; consistent with Step 0 profile — no leak).
+- No degradation after warmup; readings flat over the full measurement window.
+
+**Double-render fix (discovered during Step 3):**
+With `spike_thread` active, `Message::Frame` was still running the per-source GPU scheduler
+(`store.lock().unwrap().select(...)` × N sources) every vsync.  This caused mutex contention
+between the event loop and the render thread, halving effective fps (57 → ~100 fps once fixed).
+Fix: skip the GPU scheduler in `Message::Frame` when `spike_thread.is_some()`.
+
+**Controls-visibility fix (discovered during Step 3):**
+Subsurface was `place_above` the parent — iced's tile overlay (offset controls) was buried.
+Fix: `wl_subsurface.place_below(parent)` so iced renders on top; iced window set to
+`transparent(true)` + `style(background_color: Color::TRANSPARENT)` so the subsurface
+video shows through iced's transparent video area.  Subsurface height = `win_h − CHROME_H`
+so the chrome bar (Play/Pause, Reset Rate) is always visible at the bottom.
+
+**Rate ceiling analysis:**
+Steady-state fps (~95–102) is well below 160 Hz.  Root cause: in GNOME Mutter, even a
+`wl_subsurface` in desync mode couples its effective buffer-consumption rate to the parent
+surface's commit cycle once GPU work is present.  `get_current_texture()` blocks until the
+compositor consumes the previous buffer; the parent commits at iced's vsync rate, not 160 Hz.
+**Flagged for ADR consideration** (CC does not author ADRs — review-chat decision).
+
+**Compositor tier check (CC-observed):**
+- `[pipeline] output fps ratcheted → 35` in session log ✓  
+- Supervisor spawned all adapters; dummy/cam-27/cam-77 all Ready ✓.
+
+**Maintainer confirmed (2026-06-29):**
+- Video visible through transparent iced layer ✓
+- Tile overlay controls visible and functional ✓
+- Offset adjustments take effect correctly; user noted "better than they used to" ✓
+- Resize works as expected ✓
+
+**Status:** Step 3 complete. Phase 3 exit criteria met: no 19 fps cap (→ ~100 fps), no
+degradation, alignment preserved, compositor tier unaffected.  Rate ceiling (not reaching
+160 Hz) flagged for ADR decision on next architecture step.
+
+---

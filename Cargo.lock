@@ -1033,6 +1033,9 @@ dependencies = [
  "gstreamer-video",
  "iced",
  "libc",
+ "raw-window-handle",
+ "wayland-client",
+ "wayland-sys",
  "wgpu",
 ]
 

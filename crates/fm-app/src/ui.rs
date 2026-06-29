@@ -4,7 +4,11 @@ use crate::video::{GpuRectProg, VideoProg};
 use fm_adapter_sdk::metrics::SourceMetrics;
 use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,6 +69,18 @@ pub struct App {
     gpu_stores: HashMap<String, GpuFrameStore>,
     /// Most recently scheduler-selected frame per GPU-pathed source.
     current_gpu_frames: HashMap<String, Arc<TimedFrame>>,
+    /// Phase 3 dedicated present loop (ADR-0026): handle to the render thread.
+    #[cfg(target_os = "linux")]
+    spike_thread: Option<std::thread::JoinHandle<()>>,
+    /// Shared source list for the render thread; updated when layout/offsets change.
+    #[cfg(target_os = "linux")]
+    render_shared: Option<crate::wayland_sub::RenderShared>,
+    /// Pipeline running time fed to the render thread each vsync.
+    #[cfg(target_os = "linux")]
+    render_running_time: Option<crate::wayland_sub::RunningTime>,
+    /// Window pixel dims (packed u64) fed to the render thread on each resize.
+    #[cfg(target_os = "linux")]
+    window_size: Option<crate::wayland_sub::WindowSize>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +125,12 @@ pub enum Message {
         width: f32,
         height: f32,
     },
+    /// Step 1 spike: window opened — request raw handles to create subsurface.
+    #[cfg(target_os = "linux")]
+    SpikeInit(iced::window::Id, f32, f32),
+    /// Step 1 spike: raw handles delivered — create subsurface + spawn render thread.
+    #[cfg(target_os = "linux")]
+    SpikeHandles(Option<(usize, usize)>, f32, f32),
 }
 
 impl App {
@@ -140,6 +162,14 @@ impl App {
                     external_source_ids: Vec::new(),
                     gpu_stores: HashMap::new(),
                     current_gpu_frames: HashMap::new(),
+                    #[cfg(target_os = "linux")]
+                    spike_thread: None,
+                    #[cfg(target_os = "linux")]
+                    render_shared: None,
+                    #[cfg(target_os = "linux")]
+                    render_running_time: None,
+                    #[cfg(target_os = "linux")]
+                    window_size: None,
                 }
             }
         }
@@ -164,18 +194,49 @@ impl App {
                 }
                 // GPU-path scheduler (ADR-0024): select the frame whose PTS
                 // is closest to (running_time − offset_ns) at each vsync.
+                // Also feeds running_time to the dedicated render thread (ADR-0026).
                 if let Some(t) = &self.transport {
                     if let Some(running_ns) = t.pipeline_running_time_ns() {
-                        for (src_id, store) in &self.gpu_stores {
-                            let offset_ns = self
-                                .sources
-                                .iter()
-                                .find(|s| &s.id == src_id)
-                                .map(|s| s.offset_ms as i64 * 1_000_000)
-                                .unwrap_or(0);
-                            let target_ns = (running_ns as i64 - offset_ns).max(0) as u64;
-                            if let Some(frame) = store.lock().unwrap().select(target_ns) {
-                                self.current_gpu_frames.insert(src_id.clone(), frame);
+                        // Feed the dedicated render thread.
+                        #[cfg(target_os = "linux")]
+                        if let Some(rt) = &self.render_running_time {
+                            rt.store(running_ns, Ordering::Relaxed);
+                        }
+                        // GPU panel scheduler — skipped when the subsurface is active
+                        // to avoid double-rendering the same stores every vsync.
+                        #[cfg(target_os = "linux")]
+                        let sub_active = self.spike_thread.is_some();
+                        #[cfg(not(target_os = "linux"))]
+                        let sub_active = false;
+                        if !sub_active {
+                            for (src_id, store) in &self.gpu_stores {
+                                let offset_ns = self
+                                    .sources
+                                    .iter()
+                                    .find(|s| &s.id == src_id)
+                                    .map(|s| s.offset_ms as i64 * 1_000_000)
+                                    .unwrap_or(0);
+                                let target_ns = (running_ns as i64 - offset_ns).max(0) as u64;
+                                if let Some(frame) = store.lock().unwrap().select(target_ns) {
+                                    self.current_gpu_frames.insert(src_id.clone(), frame);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Propagate any offset changes to the render thread's slot list.
+                #[cfg(target_os = "linux")]
+                if let Some(shared) = &self.render_shared {
+                    if let Ok(mut guard) = shared.try_lock() {
+                        for slot in guard.iter_mut() {
+                            if let Some(src) = self.sources.iter().find(|s| {
+                                self.gpu_stores
+                                    .get(&s.id)
+                                    .map(|st| Arc::ptr_eq(st, &slot.store))
+                                    .unwrap_or(false)
+                            }) {
+                                slot.offset_ns = src.offset_ms as i64 * 1_000_000;
                             }
                         }
                     }
@@ -400,8 +461,95 @@ impl App {
             Message::Resized { width, height } => {
                 self.win_w = width;
                 self.win_h = height;
+                #[cfg(target_os = "linux")]
+                if let Some(ws) = &self.window_size {
+                    ws.store(
+                        crate::wayland_sub::pack_window_size(
+                            width as u32,
+                            (height - CHROME_H).max(1.0) as u32,
+                        ),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+
+            // ── Step 1 spike: subsurface creation ─────────────────────────
+            // Fetch raw Wayland handles on the event-loop thread (which IS
+            // the Wayland socket thread), create a wl_subsurface under iced's
+            // window, then spawn a dedicated wgpu render thread.
+            #[cfg(target_os = "linux")]
+            Message::SpikeInit(win_id, w, h) => {
+                self.win_w = w;
+                self.win_h = h;
+                let (ww, wh) = (w, h);
+                return iced::window::run(win_id, move |window| {
+                    let Ok(wh_) = window.window_handle() else {
+                        return None;
+                    };
+                    let Ok(dh_) = window.display_handle() else {
+                        return None;
+                    };
+                    match (wh_.as_raw(), dh_.as_raw()) {
+                        (RawWindowHandle::Wayland(surf_h), RawDisplayHandle::Wayland(disp_h)) => {
+                            Some((
+                                surf_h.surface.as_ptr() as usize,
+                                disp_h.display.as_ptr() as usize,
+                            ))
+                        }
+                        _ => None,
+                    }
+                })
+                .map(move |h| Message::SpikeHandles(h, ww, wh));
+            }
+
+            #[cfg(target_os = "linux")]
+            Message::SpikeHandles(handles, w, h) => {
+                self.win_w = w;
+                self.win_h = h;
+                if self.spike_thread.is_none() {
+                    if let Some((surf_ptr, disp_ptr)) = handles {
+                        let result = unsafe {
+                            crate::wayland_sub::create_subsurface(
+                                disp_ptr as *mut std::ffi::c_void,
+                                surf_ptr as *mut std::ffi::c_void,
+                                (0, 0),
+                            )
+                        };
+                        if let Some(sub) = result {
+                            // Build per-source render slots: store + offset + NDC rect.
+                            let slots = build_render_slots(
+                                &self.gpu_stores,
+                                &self.sources,
+                                self.grid_cols,
+                                self.grid_rows,
+                            );
+                            let render_shared = std::sync::Arc::new(std::sync::Mutex::new(slots));
+                            let running_time =
+                                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            // Subsurface height stops at the chrome bar so the
+                            // iced controls at the bottom remain unobscured.
+                            let sub_h = (h - CHROME_H).max(1.0) as u32;
+                            let window_size =
+                                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                                    crate::wayland_sub::pack_window_size(w as u32, sub_h),
+                                ));
+                            self.spike_thread = Some(crate::wayland_sub::spawn_render_thread(
+                                sub,
+                                w as u32,
+                                sub_h,
+                                std::sync::Arc::clone(&render_shared),
+                                std::sync::Arc::clone(&running_time),
+                                std::sync::Arc::clone(&window_size),
+                            ));
+                            self.render_shared = Some(render_shared);
+                            self.render_running_time = Some(running_time);
+                            self.window_size = Some(window_size);
+                        }
+                    }
+                }
             }
         }
+
         Task::none()
     }
 
@@ -415,22 +563,47 @@ impl App {
                 .into();
         }
 
+        // Is the wgpu subsurface active on this platform?
+        #[cfg(target_os = "linux")]
+        let sub_active = self.spike_thread.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let sub_active = false;
+
         // ── Compute video display dimensions locked to output aspect ratio ──
-        // GPU panel is 1/3 of total window width (min 240 px) so both panels
-        // scale together when the window is resized.
-        let gpu_panel_w = (self.win_w / 3.0).max(240.0_f32);
+        // When the subsurface is active the GPU panel is suppressed so the full
+        // width is available for the video area (and the subsurface fills it).
+        let gpu_panel_w = if sub_active {
+            0.0_f32
+        } else {
+            (self.win_w / 3.0).max(240.0_f32)
+        };
         let avail_h = (self.win_h - CHROME_H).max(1.0);
         let avail_w = (self.win_w - gpu_panel_w).max(1.0);
-        let video_w = (avail_h * self.grid_ar).min(avail_w);
-        let video_h = video_w / self.grid_ar;
+        let video_w = if sub_active {
+            avail_w // fill the width; subsurface handles AR internally
+        } else {
+            (avail_h * self.grid_ar).min(avail_w)
+        };
+        let video_h = if sub_active {
+            avail_h
+        } else {
+            video_w / self.grid_ar
+        };
 
         let black_bg = |_: &iced::Theme| container::Style {
             background: Some(Background::Color(Color::BLACK)),
             ..Default::default()
         };
 
-        // ── Layer 0: compositor output ─────────────────────────────────────
-        let video_layer: Element<Message> = if self.current_frame.is_some() {
+        // ── Layer 0: compositor output (suppressed when subsurface is active) ──
+        // When active the wgpu subsurface renders video below iced's layer;
+        // iced renders a transparent background so the subsurface shows through.
+        let video_layer: Element<Message> = if sub_active {
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.current_frame.is_some() {
             container(
                 shader(VideoProg {
                     frame: self.current_frame.clone(),
@@ -455,16 +628,29 @@ impl App {
         // ── Layer 1: per-tile overlay grid ─────────────────────────────────
         let overlay_layer = self.tile_overlay_grid();
 
-        let compositor_area = container(
-            stack([video_layer, overlay_layer])
-                .width(Length::Fixed(video_w))
-                .height(Length::Fixed(video_h)),
-        )
-        .style(black_bg)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill);
+        let stack_w = Length::Fixed(video_w);
+        let stack_h = Length::Fixed(video_h);
+        let compositor_area = if sub_active {
+            container(
+                stack([video_layer, overlay_layer])
+                    .width(stack_w)
+                    .height(stack_h),
+            )
+            // Transparent: subsurface below shows through.
+            .width(Length::Fill)
+            .height(Length::Fill)
+        } else {
+            container(
+                stack([video_layer, overlay_layer])
+                    .width(stack_w)
+                    .height(stack_h),
+            )
+            .style(black_bg)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+        };
 
         // ── GPU side panel (ADR-0024 Block 2) ─────────────────────────────
         // All N GPU-path sources rendered as a mini-grid, mirroring the
@@ -523,9 +709,14 @@ impl App {
             .height(Length::Fill)
             .padding(8);
 
-        let video_area = row![compositor_area, gpu_side_panel]
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let video_area: Element<Message> = if sub_active {
+            compositor_area.into()
+        } else {
+            row![compositor_area, gpu_side_panel]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
 
         // ── Chrome: master Play/Pause only ─────────────────────────────────
         let play_label = if self.playing {
@@ -773,7 +964,7 @@ impl App {
 fn on_window_event(
     event: iced::Event,
     _status: iced::event::Status,
-    _id: iced::window::Id,
+    id: iced::window::Id,
 ) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Exit),
@@ -782,6 +973,13 @@ fn on_window_event(
             height: s.height,
         }),
         iced::Event::Window(iced::window::Event::Opened { size: s, .. }) => {
+            // On Linux/Wayland: SpikeInit fetches raw handles then kicks off
+            // subsurface creation.  On other platforms fall back to Resized.
+            #[cfg(target_os = "linux")]
+            {
+                return Some(Message::SpikeInit(id, s.width, s.height));
+            }
+            #[cfg(not(target_os = "linux"))]
             Some(Message::Resized {
                 width: s.width,
                 height: s.height,
@@ -1097,5 +1295,46 @@ fn try_init(
         external_source_ids: external_ids,
         gpu_stores,
         current_gpu_frames: HashMap::new(),
+        #[cfg(target_os = "linux")]
+        spike_thread: None,
+        #[cfg(target_os = "linux")]
+        render_shared: None,
+        #[cfg(target_os = "linux")]
+        render_running_time: None,
+        #[cfg(target_os = "linux")]
+        window_size: None,
     })
+}
+
+/// Build the initial render slot list from the current gpu_stores + source layout.
+/// NDC rects computed as an equal-split grid matching the compositor layout.
+#[cfg(target_os = "linux")]
+fn build_render_slots(
+    gpu_stores: &HashMap<String, GpuFrameStore>,
+    sources: &[SourceRow],
+    grid_cols: u32,
+    grid_rows: u32,
+) -> Vec<crate::wayland_sub::RenderSlot> {
+    let cols_f = grid_cols as f32;
+    let rows_f = grid_rows as f32;
+    sources
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, src)| {
+            let store = gpu_stores.get(&src.id)?.clone();
+            let col = (idx as u32 % grid_cols) as f32;
+            let row = (idx as u32 / grid_cols) as f32;
+            let rect = [
+                -1.0 + 2.0 * col / cols_f,
+                1.0 - 2.0 * (row + 1.0) / rows_f,
+                -1.0 + 2.0 * (col + 1.0) / cols_f,
+                1.0 - 2.0 * row / rows_f,
+            ];
+            Some(crate::wayland_sub::RenderSlot {
+                store,
+                offset_ns: src.offset_ms as i64 * 1_000_000,
+                rect,
+            })
+        })
+        .collect()
 }

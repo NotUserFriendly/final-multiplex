@@ -17,6 +17,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries zero housekeeping work. `tick_count` removed from `App`.
 
 ### Added
+- **Phase 3 Step 3 — dedicated surface validation (experimental):**
+  release-build render rate: ~95–102 fps sustained (vs 19 fps iced GPU panel baseline).
+  No degradation; GStreamer compositor tier unaffected; alignment and offset controls
+  confirmed working.  Subsurface placed below iced's layer (`place_below`) so tile-overlay
+  controls render on top; iced window set to `transparent` with `Color::TRANSPARENT`
+  background so video shows through.  GPU scheduler skipped in `Message::Frame` when
+  subsurface is active (was causing double-rendering and halved fps).  Effective ceiling
+  below 160 Hz under GNOME Mutter — flagged for ADR decision on next architecture step.
+- **Phase 3 Step 2 — dedicated wgpu present loop (experimental, ADR-0026):**
+  the render thread composites live video sources; surface letterboxes each tile to
+  its native AR; window resize reconfigures the wgpu surface and reflows tiles.
+  Surface format is `Rgba8Unorm` (non-sRGB) so gamma-encoded video bytes are not
+  double-encoded through an sRGB write path.
+  Originally: the render thread composited live video sources instead of solid magenta.
+  On each vsync the thread reads `running_time` (fed via `Arc<AtomicU64>` from iced's
+  `Message::Frame` handler), selects each source's closest frame from its `FrameRing`
+  at `running_time − offset_ns`, uploads changed textures, draws N NDC rects with the
+  same WGSL rect-shader used by the iced GPU panel, and presents at Fifo.  Offset
+  changes made in iced's UI propagate to the render thread via `try_lock` on a shared
+  `Vec<RenderSlot>`.  The iced GPU side panel remains for reference during validation.
+- **Phase 3 Step 1 spike — wl_subsurface present loop (experimental):**
+  adds `wayland_sub.rs` which creates a Wayland `wl_subsurface` under iced's window
+  and spawns a dedicated wgpu render thread (Fifo, independent of iced's event loop).
+  On window open the app fetches raw Wayland handles via `iced::window::run()`, creates
+  a desync'd subsurface via libwayland C FFI (isolated `wl_event_queue` so winit's
+  dispatch is never raced), creates a wgpu Vulkan surface on the subsurface, and presents
+  solid magenta at vsync rate.  Proves the dedicated-present-loop architecture works
+  before the full GPU compositor is wired in (Step 2).
 - **GPU presentation path — native resolution (Phase 3 B2, experimental, additive):**
   the GPU path now captures frames at **native input resolution** instead of tile-res:
   - *Probe moved to pre-scale tap (`vdeint_{id}:src`):* the GPU ring receives frames

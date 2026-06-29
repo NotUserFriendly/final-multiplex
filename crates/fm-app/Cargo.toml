@@ -20,4 +20,7 @@ wgpu.workspace            = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+wayland-client = "0.31"
+wayland-sys    = { version = "0.31", features = ["client", "dlopen"] }
+raw-window-handle = "0.6"
 

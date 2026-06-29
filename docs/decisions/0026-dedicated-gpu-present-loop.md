@@ -6,7 +6,7 @@
 ## Context
 
 The GPU presentation path renders through iced's `shader()` widget (ADR-0009), driven by iced's
-reactive event loop. Measurement (troubleshooting.md, 2026-06-29): the render cycle is ~53 ms
+reactive event loop. Measurement (troubleshooting-0.3.md, 2026-06-29): the render cycle is ~53 ms
 (~19 fps, degrading to ~28 fps sustained), and the cost is iced's per-frame event dispatch, not
 upload (~50 µs) or GPU composite (62 % util). iced's reactive model is structurally unfit for
 frame-paced video presentation; no upload-size change can lift it to display refresh.

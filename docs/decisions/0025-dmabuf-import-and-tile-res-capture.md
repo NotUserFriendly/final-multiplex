@@ -41,7 +41,7 @@ as a texture.
 ## Scope — what this ADR deliberately does NOT decide
 
 The GPU-path stutter root cause and the capture/upload-resolution performance tradeoff are
-**unsettled empirical questions** tracked in `troubleshooting.md`. They are intentionally kept out
+**unsettled empirical questions** tracked in `troubleshooting-0.3.md`. They are intentionally kept out
 of this ADR: an ADR's rationale must be stable, and those findings have already revised more than
 once (native-res copy cost → present-timing beat → render-rate bottleneck). The settled outcome —
 e.g. a dedicated render surface, or an upload-resolution policy — will be captured in its own ADR

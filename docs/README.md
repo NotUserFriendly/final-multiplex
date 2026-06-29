@@ -12,4 +12,4 @@ Significant, hard-to-reverse decisions live in [`decisions/`](decisions/) as ADR
 
 ADRs answer *why*. The top-level `CHANGELOG.md` answers *what shipped, when*.
 `PLAN.md` answers *what we're doing next*. `BUGS.md` tracks deferred and known
-bugs. `troubleshooting.md` is the active hardware/runtime scratchpad.
+bugs. `troubleshooting-0.3.md` is the active hardware/runtime scratchpad.

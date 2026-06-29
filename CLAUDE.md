@@ -11,7 +11,7 @@
 - **`docs/PLAN.md`** — current objective, phases, and exit criteria. Read it before starting work; it is the source of truth for *what* to build next.
 - **`CHANGELOG.md`** — running record of shipped changes (Keep a Changelog format).
 - **`docs/BUGS.md`** — deferred and known bugs; log issues here when deferring a fix.
-- **`docs/troubleshooting.md`** — active hardware/runtime scratchpad.
+- **`docs/troubleshooting-0.3.md`** — active hardware/runtime scratchpad.
 - **`docs/decisions/`** — Architecture Decision Records (ADRs). One file per significant decision.
 
 ## Conventions
@@ -43,7 +43,7 @@
   over silence. When you're blocked waiting on the maintainer (a physical action like an
   unplug/replug, or a decision), state plainly that you're now waiting and on what.
 - **Record validation results, attributed — especially maintainer-run ones.** When a task
-  includes validation, record the outcome in `docs/troubleshooting.md`: who verified it and what
+  includes validation, record the outcome in `docs/troubleshooting-0.3.md`: who verified it and what
   they observed (e.g. "maintainer killed cam-27 → tile froze alone, others kept running,
   recovered on reboot — confirmed 2026-06-29"). This is CC's responsibility whether or not the
   task block restates it. CC already logs what it can see from its own runs; the gap is the

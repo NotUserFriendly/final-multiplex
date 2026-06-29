@@ -118,17 +118,59 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
 - **Position:** before Phase 3 — YouTube is a 60 fps source, so landing this first means the
   prototype handles native rates instead of downsampling YouTube to 30 and redoing it later.
 
-### Phase 3 — YouTube adapter
+### Phase 3 — GPU presentation rephase
+- **Deliverable:** a GPU presentation path. Each source becomes its own GPU texture at native
+  resolution and native rate, composited on the **GPU** (wgpu) instead of baked into one CPU
+  frame by the GStreamer compositor. The shared clock (ADR-0005) stays the timing authority —
+  what moves is *where* compositing and per-source presentation happen.
+- **Additive, not a rip-out.** The GStreamer compositor stays as (a) the **fallback tier** for
+  hardware without the GPU path (integrated/corporate, roadmap step 4) and (b) the
+  **record / single-output tier** (recording forces a cohesive framerate + one stitched frame,
+  which the per-source path otherwise loses). The validated machinery — offset model (0016),
+  canary, watchdog (0020), floors (0018) — stays intact on the fallback path while the GPU path
+  is built and proven beside it.
+- **The hard core — a renderer-side presentation scheduler.** Today the compositor hands you
+  frame-accurate alignment for free (all sources in one buffer at time T). Per-source, *you* own
+  it: a per-source frame ring-buffer, and at each display refresh, select each source's correct
+  frame for **(clock T − its offset)**. The offset *concept* is unchanged (0016: shared clock +
+  per-source delay); the *mechanism* moves from `gst_pad_set_offset()` to scheduler
+  frame-selection. This is where alignment correctness lives — design carefully, prove first.
+- **Build general from day one.** Per-source draw at an **arbitrary rect** (position + size), not
+  grid-locked. That rect is the *mechanism* behind focus mode, per-source fit, and layout editing
+  — building it general here makes all three cheap drop-ins later. (Those as *features* are
+  Phase 5+; the rect + scheduler *mechanism* is here.)
+- **Minimal now, full path target.** Minimal milestone: CPU decode → per-source texture upload →
+  GPU composite. Target: full zero-copy (hardware decode → dmabuf → wgpu import → GPU composite,
+  CPU never touches a pixel) — the discrete-GPU endgame, which folds in the decode-side stutter
+  win. Driver/dmabuf dependencies make full-path the target, not the first step.
+- **Payoffs (one body of work):** the measured compositor stutter goes (composite off the CPU —
+  the 318%-at-4K core load); native per-source res and rate (no resampling to one universal
+  rate); and **bad feeds stop dragging good ones** — per-source presentation decouples them, so a
+  stalled source freezes alone instead of hitching the shared frame.
+- **Exit:** N sources presented at native quality on the GPU path, **frame-accurately aligned**
+  (the scheduler proven against a known offset, canary-style); compositor demoted to
+  fallback/record tier. Acceptance proof: **draw one source large at native quality, correctly
+  aligned** — 80% of focus mode's rendering with none of its UX, which de-risks the whole feature
+  line behind it.
+
+### Phase 4 — YouTube adapter (3rd source)
 - **Deliverable:** yt-dlp resolver subprocess + stream ingest + periodic re-resolve on
-  URL expiry, as an out-of-process adapter.
+  URL expiry, as an out-of-process adapter. **Lands on the Phase-3 GPU path** — the prototype's
+  third source arrives on the final architecture, not a compositor it'd be rebuilt off.
 - **Exit:** a YouTube URL plays in a tile and survives URL expiry without manual action.
+- **Why here (before focus/fit):** the 3rd source is the make-or-break validation of the
+  architecture; deferring it risks building focus/fit on assumptions a new source type breaks.
 
 > **★ Prototype milestone — triggers the Windows build.** Reached when Final Multiplex
 > can show **three distinct media types at once** (local file, RTSP, YouTube) and the
-> whole scene is **driven from a config file**. This is the end of Phase 3, not Phase 1.
-> After this, the next goal is a Windows build before adding Phase 4+.
+> whole scene is **driven from a config file**. This is the end of Phase 4.
+> After this, the next goal is a Windows build before adding Phase 5+.
 
-### Phase 4 — Focus mode + per-source fit
+### Phase 5 — Focus mode + per-source fit
+> The per-source-rect **mechanism** is built in the Phase-3 GPU path; this phase is the
+> **feature** — the UX, transitions, fit shaders, presets. On the GPU path, fit is shader
+> sampling and **zoom becomes a texture-coordinate crop** (cheap), retiring the `videocrop`
+> question in the notes below — which now applies only to the compositor fallback tier.
 - **Deliverable:** focus layout (one large tile, others arranged around it); switch
   between equal split and focus at runtime. **Per-source fit mode**: each source can be
   set to *letterbox* (current default — preserve aspect, bars fill the leftover space),
@@ -154,7 +196,7 @@ Each phase has a deliverable and an exit criterion. Don't start N+1 until N exit
     returns to equal split. The runtime sink-pad geometry control above is what lets this switch
     happen without restarting sources. (The broader layout-editing surface is a later phase.)
 
-### Phase 5 — Manual audio sync (prerecorded)
+### Phase 6 — Manual audio sync (prerecorded)
 - **Deliverable:** visible per-source waveform; drag to align a source against the others;
   "play all" honors it. There are **two distinct alignment tools here, not one** **[build-out]** — keep
   them separate:
@@ -184,7 +226,7 @@ click-and-drag a source to reorder it within the grid; an "add column" / "add ro
 the grid at runtime. Named layouts saved and restored through the existing scene system
 (ADR-0010) — extend scene persistence from a single layout to a library. Ship a set of **default
 layouts and their focused variants** (equal split, focus-with-thumbnails, etc.) as presets.
-Double-click-to-focus (Phase 4) is the per-source trigger; this is the editing and preset surface
+Double-click-to-focus (Phase 5) is the per-source trigger; this is the editing and preset surface
 around it. Fancy UI, post-prototype.
 
 **Cross-machine / distributed deployment.** **[build-out]** Net-clock calibration fails on supervisor-respawned

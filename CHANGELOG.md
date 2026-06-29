@@ -7,12 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`fm-youtube-adapter` Block 2 — URL-expiry re-resolution:** on GStreamer Error or EOS the
+  adapter re-runs `yt-dlp` for a fresh signed URL, sets it on `uridecodebin3`, and restarts
+  the source element in-place — video/audio chains remain in the pipeline and their sink pads
+  are re-linked by the existing `pad-added` callback.  Emits `Reconnecting` before the gap
+  and `StreamsChanged` once pads re-stabilise.  Exponential backoff (1 s → 30 s), capped at
+  8 reconnects.  SIGUSR1 (Linux) forces an immediate re-resolve for deterministic testing.
 - **`fm-youtube-adapter` (Phase 4 Block 1, experimental):** new out-of-process adapter that
   resolves a YouTube watch URL via `yt-dlp` and ingests the stream through GStreamer
   (`uridecodebin3`), emitting RGBA video and S16LE audio over the existing unixfd transport.
-  Follows the same SDK contract as `fm-rtsp-adapter` (ADR-0014, ADR-0022).  VOD playback
-  proven; URL-expiry re-resolution deferred to Block 2.
-- **`scenes/scene-youtube-test.toml`:** three-source test scene (dummy + file + YouTube)
+  Follows the same SDK contract as `fm-rtsp-adapter` (ADR-0014, ADR-0022).
+- **`scenes/scene-youtube-test.toml`:** four-source test scene (dummy + file + RTSP + YouTube)
   targeting the Phase 4 prototype milestone.
 
 ## [0.3.0] - 2026-06-29

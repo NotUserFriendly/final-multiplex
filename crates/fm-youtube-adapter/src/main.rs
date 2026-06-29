@@ -1,19 +1,21 @@
 //! fm-youtube-adapter — YouTube source adapter for Final Multiplex (Phase 4, ADR-0022).
 //!
-//! Resolves a YouTube watch URL to a direct media URL via yt-dlp, then decodes
-//! it through GStreamer (uridecodebin3 → videoconvert/audioconvert chains) and
-//! emits frames over the unixfd transport exactly as fm-rtsp-adapter does.
+//! Resolves a YouTube watch URL to a direct media URL via yt-dlp, decodes it
+//! through GStreamer (uridecodebin3), and emits frames over the unixfd transport.
 //!
-//! Block 1 scope: VOD playback only; URL-expiry re-resolution deferred to Block 2.
+//! Block 2: on stream failure (Error/EOS/SIGUSR1) re-runs yt-dlp for a fresh
+//! URL, restarts uridecodebin3 in-place (chains stay connected), and resumes.
+//! Backoff and MAX_RECONNECTS cap the retry rate (ADR-0013/ADR-0020).
+//! SIGUSR1 (Linux) forces an immediate re-resolve for deterministic testing.
 //!
 //! Launch args: same contract as fm-rtsp-adapter (ADR-0014, ADR-0022).
 //!   --clock-addr   host:port
 //!   --video-shm    path
 //!   --audio-shm    path
 //!   --source-id    id
-//!   --video-width  px   (accepted, not used for scaling — GPU path taps native res)
-//!   --video-height px
-//!   --framerate    fps  (accepted, not used — native rate flows through)
+//!   --video-width  px   (accepted; GPU path taps native res)
+//!   --video-height px   (accepted)
+//!   --framerate    fps  (accepted; native rate flows through)
 //!   --base-time    ns
 //!
 //! stdin:  line-delimited JSON fm_adapter_sdk::contract::Command
@@ -24,13 +26,23 @@ use fm_adapter_sdk::metrics::{IngestState, SourceMetrics, DB_FLOOR};
 use gstreamer::prelude::*;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// After the first decoded pad appears, wait this long before emitting Ready.
 const PAD_STABILITY_SECS: u64 = 3;
+const MAX_RECONNECTS: u32 = 8;
+
+// Set by SIGUSR1 handler; checked each main-loop iteration to trigger
+// a forced re-resolve without waiting for a real stream failure.
+#[cfg(unix)]
+static FORCE_RECONNECT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn sigusr1_handler(_: libc::c_int) {
+    FORCE_RECONNECT.store(true, Ordering::Relaxed);
+}
 
 fn main() {
     let args = parse_args();
@@ -47,6 +59,10 @@ fn main() {
         if libc::getppid() == 1 {
             std::process::exit(1);
         }
+        libc::signal(
+            libc::SIGUSR1,
+            sigusr1_handler as *const () as libc::sighandler_t,
+        );
     }
 
     gstreamer::init().expect("GStreamer init failed");
@@ -70,7 +86,6 @@ fn main() {
         }
     });
 
-    // Wait for Configure — delivers the YouTube watch URL.
     let youtube_url = loop {
         match cmd_rx.recv() {
             Ok(Command::Configure { uri }) => break uri,
@@ -90,11 +105,10 @@ fn main() {
         .unwrap_or_else(|| "youtube".to_string());
     eprintln!("[yt-adapter] source={source_id} url={youtube_url}");
 
-    // Resolve the watch URL to a direct media stream URL.
     let stream_url = match resolve_ytdlp(&youtube_url) {
         Ok(u) => {
             eprintln!(
-                "[yt-adapter] resolved stream URL (truncated): {}…",
+                "[yt-adapter] resolved (truncated): {}…",
                 &u[..u.len().min(80)]
             );
             u
@@ -107,7 +121,6 @@ fn main() {
         }
     };
 
-    // Net clock — same seeded pattern as the RTSP adapter (ADR-0005).
     let clock_addr = args
         .get("clock-addr")
         .map(String::as_str)
@@ -141,14 +154,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    // Pipeline: uridecodebin3 decodes the HTTP/HLS stream; pad-added builds
-    // the video and audio chains exactly as the RTSP adapter does.
     let pipeline = gstreamer::Pipeline::new();
     let uridecodebin = make("uridecodebin3", "uridecodebin");
     uridecodebin.set_property("uri", &stream_url);
 
     pipeline.add(&uridecodebin).unwrap();
-
     pipeline.use_clock(Some(&net_clock));
     pipeline.set_start_time(gstreamer::ClockTime::NONE);
     if base_time_ns > 0 {
@@ -160,12 +170,16 @@ fn main() {
         audio_chain: None,
         first_pad_at: None,
         ready_sent: false,
+        post_reconnect_check_at: None,
         last_reported_caps: None,
     }));
 
+    let reconnect_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let reconnecting: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let source_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let output_frames: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // ── pad-added: first connect and reconnect re-link ────────────────────
     {
         let pipeline_c = pipeline.clone();
         let shared_c = Arc::clone(&shared);
@@ -184,40 +198,71 @@ fn main() {
 
             let mut s = shared_c.lock().unwrap();
 
-            if media.starts_with("video/") && s.video_chain.is_none() {
-                match build_video_chain(
-                    &pipeline_c,
-                    &video_shm_c,
-                    Arc::clone(&source_frames_c),
-                    Arc::clone(&output_frames_c),
-                ) {
-                    Ok(chain) => {
+            // Reset stability timer on each new pad during a post-reconnect window.
+            if s.post_reconnect_check_at.is_some() {
+                s.post_reconnect_check_at = Some(Instant::now());
+            }
+
+            if media.starts_with("video/") {
+                if let Some(ref chain) = s.video_chain {
+                    if !chain.sink.is_linked() {
                         if let Err(e) = pad.link(&chain.sink) {
-                            eprintln!("[yt-adapter] video link: {e}");
+                            eprintln!("[yt-adapter] video re-link: {e}");
                         } else {
-                            eprintln!("[yt-adapter] video chain linked ({media})");
-                            s.video_chain = Some(chain);
-                            if s.first_pad_at.is_none() {
-                                s.first_pad_at = Some(Instant::now());
+                            eprintln!("[yt-adapter] video reconnected");
+                            for elem in &chain.elements {
+                                let _ = elem.sync_state_with_parent();
                             }
                         }
                     }
-                    Err(e) => eprintln!("[yt-adapter] build_video_chain: {e}"),
+                } else {
+                    match build_video_chain(
+                        &pipeline_c,
+                        &video_shm_c,
+                        Arc::clone(&source_frames_c),
+                        Arc::clone(&output_frames_c),
+                    ) {
+                        Ok(chain) => {
+                            if let Err(e) = pad.link(&chain.sink) {
+                                eprintln!("[yt-adapter] video link: {e}");
+                            } else {
+                                eprintln!("[yt-adapter] video chain linked ({media})");
+                                s.video_chain = Some(chain);
+                                if s.first_pad_at.is_none() {
+                                    s.first_pad_at = Some(Instant::now());
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[yt-adapter] build_video_chain: {e}"),
+                    }
                 }
-            } else if media.starts_with("audio/") && s.audio_chain.is_none() {
-                match build_audio_chain(&pipeline_c, &audio_shm_c) {
-                    Ok(chain) => {
+            } else if media.starts_with("audio/") {
+                if let Some(ref chain) = s.audio_chain {
+                    if !chain.sink.is_linked() {
                         if let Err(e) = pad.link(&chain.sink) {
-                            eprintln!("[yt-adapter] audio link: {e}");
+                            eprintln!("[yt-adapter] audio re-link: {e}");
                         } else {
-                            eprintln!("[yt-adapter] audio chain linked ({media})");
-                            s.audio_chain = Some(chain);
-                            if s.first_pad_at.is_none() {
-                                s.first_pad_at = Some(Instant::now());
+                            eprintln!("[yt-adapter] audio reconnected");
+                            for elem in &chain.elements {
+                                let _ = elem.sync_state_with_parent();
                             }
                         }
                     }
-                    Err(e) => eprintln!("[yt-adapter] build_audio_chain: {e}"),
+                } else {
+                    match build_audio_chain(&pipeline_c, &audio_shm_c) {
+                        Ok(chain) => {
+                            if let Err(e) = pad.link(&chain.sink) {
+                                eprintln!("[yt-adapter] audio link: {e}");
+                            } else {
+                                eprintln!("[yt-adapter] audio chain linked ({media})");
+                                s.audio_chain = Some(chain);
+                                if s.first_pad_at.is_none() {
+                                    s.first_pad_at = Some(Instant::now());
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[yt-adapter] build_audio_chain: {e}"),
+                    }
                 }
             }
             None
@@ -240,6 +285,7 @@ fn main() {
     let hard_deadline = Instant::now() + Duration::from_secs(60);
 
     loop {
+        // ── Commands ──────────────────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Command::Configure { .. } => {}
@@ -261,24 +307,84 @@ fn main() {
             }
         }
 
+        // ── SIGUSR1 forced re-resolve (test trigger) ──────────────────────
+        #[cfg(unix)]
+        if FORCE_RECONNECT
+            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            eprintln!("[yt-adapter] SIGUSR1 — forcing re-resolve");
+            trigger_reconnect(
+                &youtube_url,
+                &uridecodebin,
+                &shared,
+                &reconnect_count,
+                &reconnecting,
+                true,
+            );
+        }
+
+        // ── Bus messages ──────────────────────────────────────────────────
         while let Some(msg) = bus.pop() {
             use gstreamer::MessageView;
             match msg.view() {
                 MessageView::Error(e) => {
                     let desc = format!("{} ({})", e.error(), e.debug().unwrap_or_default());
                     eprintln!("[yt-adapter] GStreamer error: {desc}");
-                    emit(AdapterMessage::Error { description: desc });
-                    let _ = pipeline.set_state(gstreamer::State::Null);
-                    return;
+
+                    if reconnecting
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count > MAX_RECONNECTS as u64 {
+                        reconnecting.store(false, Ordering::Release);
+                        emit(AdapterMessage::Error { description: desc });
+                        let _ = pipeline.set_state(gstreamer::State::Null);
+                        return;
+                    }
+
+                    emit(AdapterMessage::Reconnecting {
+                        attempt: count as u32,
+                    });
+                    let delay = reconnect_delay_secs(count as u32);
+                    eprintln!("[yt-adapter] re-resolve #{count}/{MAX_RECONNECTS} in {delay}s");
+
+                    spawn_reconnect_thread(
+                        youtube_url.clone(),
+                        uridecodebin.clone(),
+                        Arc::clone(&shared),
+                        Arc::clone(&reconnecting),
+                        delay,
+                    );
                 }
                 MessageView::Eos(_) => {
-                    // VOD finished naturally. Block 2 will add re-resolution/looping.
-                    eprintln!("[yt-adapter] EOS — stream ended");
-                    emit(AdapterMessage::Error {
-                        description: "stream ended (EOS)".to_string(),
+                    eprintln!("[yt-adapter] EOS — re-resolving for fresh URL");
+
+                    if reconnecting
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit(AdapterMessage::Reconnecting {
+                        attempt: count as u32,
                     });
-                    let _ = pipeline.set_state(gstreamer::State::Null);
-                    return;
+                    let delay = reconnect_delay_secs(count as u32);
+                    eprintln!("[yt-adapter] EOS re-resolve #{count}/{MAX_RECONNECTS} in {delay}s");
+
+                    spawn_reconnect_thread(
+                        youtube_url.clone(),
+                        uridecodebin.clone(),
+                        Arc::clone(&shared),
+                        Arc::clone(&reconnecting),
+                        delay,
+                    );
                 }
                 MessageView::Warning(w) => {
                     eprintln!("[yt-adapter] WARNING: {}", w.error());
@@ -295,7 +401,7 @@ fn main() {
             }
         }
 
-        // Emit Ready once pads are stable.
+        // ── Ready (once, at startup) ───────────────────────────────────────
         let ready_to_emit: Option<(bool, bool)> = {
             let mut s = shared.lock().unwrap();
             if s.ready_sent {
@@ -327,7 +433,34 @@ fn main() {
             });
         }
 
-        // Metrics ~1 Hz.
+        // ── Post-reconnect StreamsChanged ─────────────────────────────────
+        {
+            let mut s = shared.lock().unwrap();
+            if s.ready_sent {
+                if let Some(reconnect_time) = s.post_reconnect_check_at {
+                    if reconnect_time.elapsed() >= Duration::from_secs(PAD_STABILITY_SECS) {
+                        let has_video =
+                            s.video_chain.as_ref().map_or(false, |c| c.sink.is_linked());
+                        let has_audio =
+                            s.audio_chain.as_ref().map_or(false, |c| c.sink.is_linked());
+                        let current = (has_video, has_audio);
+                        if Some(current) != s.last_reported_caps {
+                            eprintln!(
+                                "[yt-adapter] StreamsChanged (video={has_video} audio={has_audio})"
+                            );
+                            emit(AdapterMessage::StreamsChanged {
+                                has_video,
+                                has_audio,
+                            });
+                            s.last_reported_caps = Some(current);
+                        }
+                        s.post_reconnect_check_at = None;
+                    }
+                }
+            }
+        }
+
+        // ── Metrics ~1 Hz ─────────────────────────────────────────────────
         if last_metrics.elapsed() >= Duration::from_secs(1) {
             let elapsed = last_metrics.elapsed().as_secs_f64();
             last_metrics = Instant::now();
@@ -341,6 +474,7 @@ fn main() {
 
             let fps_in = src_delta as f64 / elapsed;
             let dropped = src_delta.saturating_sub(out_delta);
+            let rc = reconnect_count.load(Ordering::Relaxed) as u32;
 
             emit(AdapterMessage::Metrics(SourceMetrics {
                 source_id: source_id.clone(),
@@ -350,7 +484,7 @@ fn main() {
                 bad_frames: 0,
                 offset_vs_master_ms: 0,
                 state: ingest_state.clone(),
-                reconnect_count: 0,
+                reconnect_count: rc,
                 audio_rms_db: DB_FLOOR,
                 audio_peak_db: DB_FLOOR,
                 stream_drained: false,
@@ -361,21 +495,118 @@ fn main() {
     }
 }
 
+// ── Re-resolution helpers ─────────────────────────────────────────────────────
+
+/// Immediately gate and fire a reconnect (used by the SIGUSR1 path).
+fn trigger_reconnect(
+    youtube_url: &str,
+    uridecodebin: &gstreamer::Element,
+    shared: &Arc<Mutex<Shared>>,
+    reconnect_count: &Arc<AtomicU64>,
+    reconnecting: &Arc<AtomicBool>,
+    forced: bool,
+) {
+    if reconnecting
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        eprintln!("[yt-adapter] re-resolve already in progress — skipping");
+        return;
+    }
+    let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > MAX_RECONNECTS as u64 {
+        reconnecting.store(false, Ordering::Release);
+        eprintln!("[yt-adapter] MAX_RECONNECTS reached — giving up");
+        emit(AdapterMessage::Error {
+            description: "max reconnects reached".to_string(),
+        });
+        return;
+    }
+    let label = if forced { "forced" } else { "auto" };
+    eprintln!("[yt-adapter] {label} re-resolve #{count}/{MAX_RECONNECTS} — immediate");
+    emit(AdapterMessage::Reconnecting {
+        attempt: count as u32,
+    });
+    spawn_reconnect_thread(
+        youtube_url.to_string(),
+        uridecodebin.clone(),
+        Arc::clone(shared),
+        Arc::clone(reconnecting),
+        0,
+    );
+}
+
+/// Spawn the background re-resolve thread.  Waits `delay_secs`, tears down
+/// uridecodebin3, re-runs yt-dlp for a fresh URL, then restarts the element
+/// in-place.  The video/audio chains remain in the pipeline; their sink pads
+/// are re-linked by the `pad-added` callback.
+fn spawn_reconnect_thread(
+    youtube_url: String,
+    uridecodebin: gstreamer::Element,
+    shared: Arc<Mutex<Shared>>,
+    reconnecting: Arc<AtomicBool>,
+    delay_secs: u64,
+) {
+    std::thread::spawn(move || {
+        if delay_secs > 0 {
+            std::thread::sleep(Duration::from_secs(delay_secs));
+        }
+
+        // Tear down the source element — this unlinks its dynamic pads so
+        // chain.sink.is_linked() becomes false, readying the re-link path.
+        let _ = uridecodebin.set_state(gstreamer::State::Null);
+
+        // Notify the core that streams are gone while we re-resolve.
+        let should_notify = {
+            let mut s = shared.lock().unwrap();
+            if s.ready_sent && s.last_reported_caps != Some((false, false)) {
+                s.last_reported_caps = Some((false, false));
+                true
+            } else {
+                false
+            }
+        };
+        if should_notify {
+            emit(AdapterMessage::StreamsChanged {
+                has_video: false,
+                has_audio: false,
+            });
+        }
+
+        // Re-resolve: get a fresh signed URL from yt-dlp.
+        match resolve_ytdlp(&youtube_url) {
+            Ok(new_url) => {
+                eprintln!(
+                    "[yt-adapter] fresh URL (truncated): {}…",
+                    &new_url[..new_url.len().min(80)]
+                );
+                uridecodebin.set_property("uri", &new_url);
+            }
+            Err(e) => {
+                eprintln!("[yt-adapter] re-resolve failed: {e} — retrying with same URL");
+                // Leave the existing URI; the element will re-attempt on restart.
+            }
+        }
+
+        // Restart the source; pad-added re-links the chains.
+        let _ = uridecodebin.sync_state_with_parent();
+        shared.lock().unwrap().post_reconnect_check_at = Some(Instant::now());
+        reconnecting.store(false, Ordering::Release);
+    });
+}
+
 // ── yt-dlp resolution ─────────────────────────────────────────────────────────
 
-/// Shell out to yt-dlp to turn a YouTube watch URL into a direct stream URL.
+/// Resolve a YouTube watch URL to a direct stream URL via yt-dlp.
 ///
-/// Format preference: YouTube format 18 (360p mp4, muxed) or 22 (720p mp4,
-/// muxed), then any muxed format, then absolute best.  Forces a single URL
-/// so GStreamer receives one playable URI.  Block 2 will add format policy
-/// and URL-expiry re-resolution.
+/// Prefers YouTube format 18 (360p mp4, muxed) or 22 (720p mp4, muxed), then
+/// any muxed format, then absolute best.  Takes only the first output line so
+/// GStreamer receives a single URI regardless of format split.
 fn resolve_ytdlp(youtube_url: &str) -> Result<String, String> {
     let output = std::process::Command::new("yt-dlp")
         .args([
             "--no-playlist",
             "-f",
-            // 18 = 360p mp4 muxed; 22 = 720p mp4 muxed; fallback to any muxed,
-            // then absolute best.  All of these produce a single URL.
             "18/22/best[vcodec!=none][acodec!=none]/best",
             "-g",
             "--no-warnings",
@@ -390,9 +621,6 @@ fn resolve_ytdlp(youtube_url: &str) -> Result<String, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Take only the first line; a two-URL result (separate video+audio streams)
-    // means the chosen format was split — the first line is the video stream.
-    // Audio-only case handled gracefully in the pipeline via no audio pad.
     let url = stdout
         .lines()
         .next()
@@ -413,6 +641,9 @@ struct Shared {
     audio_chain: Option<Chain>,
     first_pad_at: Option<Instant>,
     ready_sent: bool,
+    /// Set when a reconnect completes; starts the post-reconnect stability
+    /// window for StreamsChanged.  Reset by pad-added (extends window on pads).
+    post_reconnect_check_at: Option<Instant>,
     last_reported_caps: Option<(bool, bool)>,
 }
 
@@ -505,6 +736,11 @@ fn build_audio_chain(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn reconnect_delay_secs(attempt: u32) -> u64 {
+    const DELAYS: &[u64] = &[1, 2, 4, 8, 16, 30];
+    DELAYS[(attempt as usize).saturating_sub(1).min(DELAYS.len() - 1)]
+}
 
 fn emit(msg: AdapterMessage) {
     let mut line = serde_json::to_string(&msg).expect("serialisable");

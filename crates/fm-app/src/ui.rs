@@ -58,8 +58,6 @@ pub struct App {
     config_persist: Option<fm_core::persist::ConfigPersist>,
     /// Set on every committed offset change; cleared after a 500 ms idle flush.
     last_offset_change: Option<Instant>,
-    /// Tick counter for supervisor polling (poll every ~500 ms at 60 Hz ticks).
-    tick_count: u64,
     /// IDs of external sources — used to query chain state for delivery watchdog.
     external_source_ids: Vec<String>,
     /// GPU presentation path (ADR-0024, Phase 3 Block 2).
@@ -71,7 +69,11 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Tick,
+    /// Fired on each display vsync via `iced::window::frames()`.
+    /// Drives frame selection, GPU scheduler, and compositor bridge update.
+    Frame,
+    /// Fired every 500 ms.  Drives supervisor poll, ratchet, and persist flush.
+    Poll,
     /// Window close button clicked or SIGTERM received — run graceful teardown.
     Exit,
     TogglePlay,
@@ -134,7 +136,7 @@ impl App {
                     supervisor: None,
                     config_persist: None,
                     last_offset_change: None,
-                    tick_count: 0,
+
                     external_source_ids: Vec::new(),
                     gpu_stores: HashMap::new(),
                     current_gpu_frames: HashMap::new(),
@@ -152,22 +154,16 @@ impl App {
                 return iced::exit();
             }
 
-            Message::Tick => {
-                #[cfg(unix)]
-                if crate::SIGTERM_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(mut sup) = self.supervisor.take() {
-                        sup.shutdown_all();
-                    }
-                    return iced::exit();
-                }
-
-                self.tick_count = self.tick_count.wrapping_add(1);
-
+            // ── Vsync-driven render tick ───────────────────────────────────
+            // Fired by iced::window::frames() in phase with the display
+            // refresh.  Frame selection happens once per present — no beat
+            // against vsync from a mismatched wall-clock timer.
+            Message::Frame => {
                 if let Some(frame) = bridge::latest_frame(&self.frame_store, &mut self.frame_gen) {
                     self.current_frame = Some(frame);
                 }
-                // GPU-path scheduler (ADR-0024): for each probed source select
-                // the frame whose PTS is closest to (running_time − offset_ns).
+                // GPU-path scheduler (ADR-0024): select the frame whose PTS
+                // is closest to (running_time − offset_ns) at each vsync.
                 if let Some(t) = &self.transport {
                     if let Some(running_ns) = t.pipeline_running_time_ns() {
                         for (src_id, store) in &self.gpu_stores {
@@ -192,43 +188,51 @@ impl App {
                         .collect();
                 }
                 // Update per-source display state for tile overlays.
-                {
-                    let status_snap = self
-                        .supervisor
-                        .as_ref()
-                        .map(|sup| sup.status_handle().lock().unwrap().clone());
-                    for (i, src) in self.sources.iter_mut().enumerate() {
-                        if src.is_external {
-                            let adapter = status_snap.as_ref().and_then(|s| s.get(&src.id));
-                            src.signal_lost = adapter
+                let status_snap = self
+                    .supervisor
+                    .as_ref()
+                    .map(|sup| sup.status_handle().lock().unwrap().clone());
+                for (i, src) in self.sources.iter_mut().enumerate() {
+                    if src.is_external {
+                        let adapter = status_snap.as_ref().and_then(|s| s.get(&src.id));
+                        src.signal_lost = adapter
+                            .map(|a| {
+                                a.state != fm_core::supervisor::AdapterState::Running
+                                    || a.is_reconnecting
+                            })
+                            .unwrap_or(false);
+                        if src.transitioning {
+                            src.transitioning = adapter
                                 .map(|a| {
-                                    a.state != fm_core::supervisor::AdapterState::Running
-                                        || a.is_reconnecting
+                                    a.state == fm_core::supervisor::AdapterState::Starting
+                                        || a.state == fm_core::supervisor::AdapterState::Restarting
                                 })
                                 .unwrap_or(false);
-                            // Clear transitioning once adapter reaches a stable state.
-                            if src.transitioning {
-                                src.transitioning = adapter
-                                    .map(|a| {
-                                        a.state == fm_core::supervisor::AdapterState::Starting
-                                            || a.state
-                                                == fm_core::supervisor::AdapterState::Restarting
-                                    })
-                                    .unwrap_or(false);
-                            }
-                            // Expire kill cooldown.
-                            if matches!(src.kill_cooldown_until, Some(t) if Instant::now() >= t) {
-                                src.kill_cooldown_until = None;
-                            }
-                        } else {
-                            let fps_in =
-                                self.source_metrics.get(i).map(|m| m.fps_in).unwrap_or(0.0);
-                            if fps_in > 0.0 {
-                                src.has_ever_had_frames = true;
-                            }
+                        }
+                        if matches!(src.kill_cooldown_until, Some(t) if Instant::now() >= t) {
+                            src.kill_cooldown_until = None;
+                        }
+                    } else {
+                        let fps_in = self.source_metrics.get(i).map(|m| m.fps_in).unwrap_or(0.0);
+                        if fps_in > 0.0 {
+                            src.has_ever_had_frames = true;
                         }
                     }
                 }
+            }
+
+            // ── 500 ms housekeeping tick ───────────────────────────────────
+            // Supervisor poll, ratchet, and persist flush.  Decoupled from
+            // the render path so the vsync loop carries zero extra work.
+            Message::Poll => {
+                #[cfg(unix)]
+                if crate::SIGTERM_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(mut sup) = self.supervisor.take() {
+                        sup.shutdown_all();
+                    }
+                    return iced::exit();
+                }
+
                 // Debounced persist: flush 500 ms after the last committed offset change.
                 if self
                     .last_offset_change
@@ -239,67 +243,55 @@ impl App {
                     }
                     self.last_offset_change = None;
                 }
-                // Poll adapter supervisor ~every 500 ms (every 30 ticks at 60 Hz).
-                if self.tick_count % 30 == 0 {
-                    if let Some(sup) = &mut self.supervisor {
-                        sup.poll();
-                        // Reset shmsrc elements for any adapters that restarted
-                        // so they reconnect to the new adapter sockets.
-                        for id in sup.take_restarted() {
-                            if let Some(t) = &self.transport {
-                                t.restart_external_source(&id);
-                            }
+
+                if let Some(sup) = &mut self.supervisor {
+                    sup.poll();
+                    for id in sup.take_restarted() {
+                        if let Some(t) = &self.transport {
+                            t.restart_external_source(&id);
                         }
-                        // Apply live topology changes from StreamsChanged messages.
-                        for (id, has_video, has_audio) in sup.take_streams_changed() {
-                            if let Some(t) = &mut self.transport {
-                                let fps = sup
-                                    .status_handle()
-                                    .lock()
-                                    .unwrap()
+                    }
+                    for (id, has_video, has_audio) in sup.take_streams_changed() {
+                        if let Some(t) = &mut self.transport {
+                            let fps = sup
+                                .status_handle()
+                                .lock()
+                                .unwrap()
+                                .get(&id)
+                                .and_then(|s| s.latest_metrics.as_ref())
+                                .map(|m| m.fps_in)
+                                .unwrap_or(0.0);
+                            t.apply_streams_changed(&id, has_video, has_audio, fps);
+                            if let Some(m) = &self.metrics {
+                                m.attach_source(&id, t.pipeline());
+                            }
+                            if let Some(store) = self.gpu_stores.get(&id) {
+                                if let Some(pad) = t
+                                    .pipeline()
+                                    .source_pads()
                                     .get(&id)
-                                    .and_then(|s| s.latest_metrics.as_ref())
-                                    .map(|m| m.fps_in)
-                                    .unwrap_or(0.0);
-                                t.apply_streams_changed(&id, has_video, has_audio, fps);
-                                // Reinstall fps_in probe on the new pad so metrics
-                                // survive adapter reconnect / reboot.
-                                if let Some(m) = &self.metrics {
-                                    m.attach_source(&id, t.pipeline());
-                                }
-                                // apply_streams_changed replaces the entire chain
-                                // (remove_video_chain + add_video_chain), so
-                                // the probe installed at try_init is now on a dead
-                                // element.  Reinstall on the new pre-scale pad.
-                                if let Some(store) = self.gpu_stores.get(&id) {
-                                    if let Some(pad) = t
-                                        .pipeline()
-                                        .source_pads()
-                                        .get(&id)
-                                        .and_then(|p| p.pre_scale_video_src.as_ref())
-                                    {
-                                        gpu_path::install_probe(pad, store.clone());
-                                        eprintln!("[gpu-path] native-res probe reinstalled on vdeint_{id}");
-                                    }
+                                    .and_then(|p| p.pre_scale_video_src.as_ref())
+                                {
+                                    gpu_path::install_probe(pad, store.clone());
+                                    eprintln!(
+                                        "[gpu-path] native-res probe reinstalled on vdeint_{id}"
+                                    );
                                 }
                             }
                         }
-                        // Update chain state for the delivery watchdog (ADR-0020).
-                        for id in &self.external_source_ids {
-                            let has_chain = self
-                                .transport
-                                .as_ref()
-                                .map_or(false, |t| t.pipeline().source_has_chain(id));
-                            sup.update_chain_state(id, has_chain);
-                        }
                     }
-                    // Output framerate ratchet (ADR-0023): poll every ~500 ms.
-                    // Ratchets up to the max observed input rate across all sources.
-                    // Excludes synthetic floors (not in self.sources).
-                    if let (Some(t), Some(m)) = (&mut self.transport, &self.metrics) {
-                        let ids: Vec<String> = self.sources.iter().map(|s| s.id.clone()).collect();
-                        t.check_and_ratchet(&ids, m);
+                    for id in &self.external_source_ids {
+                        let has_chain = self
+                            .transport
+                            .as_ref()
+                            .map_or(false, |t| t.pipeline().source_has_chain(id));
+                        sup.update_chain_state(id, has_chain);
                     }
+                }
+                // Output framerate ratchet (ADR-0023).
+                if let (Some(t), Some(m)) = (&mut self.transport, &self.metrics) {
+                    let ids: Vec<String> = self.sources.iter().map(|s| s.id.clone()).collect();
+                    t.check_and_ratchet(&ids, m);
                 }
             }
 
@@ -555,7 +547,8 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
+            iced::window::frames().map(|_| Message::Frame),
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Poll),
             iced::event::listen_with(on_window_event),
         ])
     }
@@ -1101,7 +1094,6 @@ fn try_init(
         error: None,
         config_persist,
         last_offset_change: None,
-        tick_count: 0,
         external_source_ids: external_ids,
         gpu_stores,
         current_gpu_frames: HashMap::new(),

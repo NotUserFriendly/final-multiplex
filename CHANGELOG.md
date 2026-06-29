@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **GPU present-timing beat eliminated (vsync-driven scheduler):** the GPU path
+  previously selected and presented frames on a `time::every(16 ms)` wall-clock timer
+  (~62.5 Hz), which beat against the ~60 Hz display refresh producing a periodic ~2 Hz
+  hitch independent of content or capture resolution. The timer is replaced with
+  `iced::window::frames()` so frame selection fires once per actual vsync, in phase
+  with present — no beat possible. Supervisor poll, ratchet check, and persist flush
+  are decoupled to a separate `time::every(500 ms)` subscription so the render path
+  carries zero housekeeping work. `tick_count` removed from `App`.
+
 ### Added
 - **GPU presentation path — native resolution (Phase 3 B2, experimental, additive):**
   the GPU path now captures frames at **native input resolution** instead of tile-res:

@@ -2,7 +2,7 @@ use crate::bridge::{self, FrameData};
 use crate::gpu_path::{self, GpuFrameStore, TimedFrame};
 use crate::video::{GpuRectProg, VideoProg};
 use fm_adapter_sdk::metrics::SourceMetrics;
-use gstreamer::prelude::{ElementExt, ObjectExt as GstObjectExt};
+use gstreamer::prelude::{ElementExt, GstBinExt, ObjectExt as GstObjectExt, PipelineExt};
 use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
 #[cfg(target_os = "linux")]
@@ -1269,27 +1269,48 @@ fn try_init(
         );
     }
 
-    // Switch the net-time provider to the audio hardware clock (ADR-0027).
-    // pulsesink provides the pipeline clock (audio sinks rank highest in GStreamer
-    // clock selection); re-binding the NetTimeProvider to that clock means adapters'
-    // NetClientClock now tracks the sound card instead of the system clock,
-    // eliminating the rate-difference that caused the burst/silence pattern.
-    // Fallback: if no pipeline clock is available (headless / no audio device),
-    // the system-clock provider created in NetClock::new() was already dropped
-    // at this point — the new provider is created on the same port.
+    // Establish the audio hardware clock as pipeline master (ADR-0027).
+    //
+    // GStreamer's auto-clock selection ranks GstSystemClock (REALTIME) above
+    // GstAudioClock (OTHER), so the system clock always wins.  pulsesink's
+    // provided clock is only synced after PLAYING (the ring buffer isn't running
+    // in PAUSED), which means we must force it explicitly here.
+    //
+    // Steps:
+    //   1. Look up the audio sink by name and call provide_clock() to get its
+    //      hardware clock (GstAudioClock backed by PulseAudio timing).
+    //   2. Force it on the pipeline with use_clock() — this sets
+    //      GST_PIPELINE_FLAG_FIXED_CLOCK so auto-selection can't override it.
+    //      The switch is safe: on one machine audio_clock ≈ system_clock within
+    //      microseconds, so running_time continuity is preserved within the
+    //      audiomixer's 50 ms jitter budget.
+    //   3. Switch the NetTimeProvider to the same clock so adapters' NetClientClock
+    //      now tracks the sound card instead of the system clock.
+    //
+    // Fallback (no audio device / headless): provide_clock() returns None;
+    // we keep the system-clock provider and live with slaving artifacts.
     if let Some(ref mut net) = net_clock {
-        match transport.pipeline().inner().clock() {
+        let gst_pipeline = transport.pipeline().inner();
+        let audio_clock = gst_pipeline
+            .by_name("autoaudiosink")
+            .and_then(|sink| sink.provide_clock());
+
+        match audio_clock {
             Some(clock) => {
                 eprintln!(
-                    "[net-clock] pipeline clock type after PLAYING: {}",
+                    "[net-clock] pulsesink clock: {} — forcing as pipeline master",
                     clock.type_().name()
                 );
+                gst_pipeline.use_clock(Some(&clock));
                 if let Err(e) = net.switch_to_clock(&clock) {
-                    eprintln!("[net-clock] WARNING: clock switch failed: {e}; adapters on system clock extrapolation");
+                    eprintln!("[net-clock] WARNING: provider switch failed: {e}");
                 }
             }
             None => {
-                eprintln!("[net-clock] no pipeline clock after PLAYING; adapters keep system clock extrapolation");
+                eprintln!(
+                    "[net-clock] pulsesink returned no clock (headless?); \
+                     keeping system clock"
+                );
             }
         }
     }

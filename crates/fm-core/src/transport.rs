@@ -18,12 +18,19 @@ const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 /// real rate changes.
 const RATCHET_MIN_DELTA: i32 = 5;
 
-/// Maximum plausible native source fps accepted by the ratchet.  HTTP streaming
-/// sources (YouTube/Twitch) decode their initial buffer faster than real-time
-/// (measured at the vcaps:src probe), producing burst readings far above any real
-/// video framerate.  Readings above this cap are noise — skip them.  240 fps
-/// covers any real camera or broadcast source with comfortable headroom.
-const MAX_RATCHET_SOURCE_FPS: i32 = 240;
+/// Maximum plausible native source fps accepted by the ratchet.  Two burst
+/// scenarios produce false-high readings at the vcaps:src probe:
+///
+/// * HTTP streaming (YouTube/Twitch): `uridecodebin3` decodes buffered MP4
+///   content 10–13× faster than real-time → 300–500 fps burst readings.
+/// * File-source loop: on EOS the bus loop seeks to position 0; all frames
+///   from PTS=0 to the current pipeline running time are decoded as fast as
+///   the CPU allows → 100–250 fps burst readings.
+///
+/// Both types land well above any real camera or streaming rate.  65 fps covers
+/// standard cameras (typically 30 fps) and streaming content (YouTube max 60 fps)
+/// with a 5 fps jitter margin.  Raise if genuine ≥120 fps sources are added.
+const MAX_RATCHET_SOURCE_FPS: i32 = 65;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -254,7 +261,7 @@ impl Transport {
                 }
                 let candidate = measured.round() as i32;
                 if candidate > MAX_RATCHET_SOURCE_FPS {
-                    eprintln!("[ratchet] '{id}' fps_in={candidate} exceeds cap ({MAX_RATCHET_SOURCE_FPS}) — skipped (HTTP burst?)");
+                    eprintln!("[ratchet] '{id}' fps_in={candidate} exceeds cap ({MAX_RATCHET_SOURCE_FPS}) — skipped (burst)");
                     continue;
                 }
                 if candidate > max_fps {

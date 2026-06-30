@@ -7,12 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **Ratchet runaway on HTTP streaming sources (YouTube):** `uridecodebin3` decodes
-  YouTube content faster than real-time, flooding the `vcaps:src` probe with burst fps
-  readings (300–420 fps) that exhausted the 3-second settle window and locked the
-  compositor to an impossibly high rate.  Added `MAX_RATCHET_SOURCE_FPS = 240` cap in
-  `check_and_ratchet()` (`fm-core/src/transport.rs`): readings above 240 fps are logged
-  and skipped, capping the ratchet contribution to any plausible native source rate.
+- **Ratchet runaway on burst sources (YouTube HTTP + file loop):** two independent burst
+  paths drove the output ratchet above any real source rate.  (1) `uridecodebin3` decodes
+  YouTube progressive MP4s 10–13× faster than real-time, producing 300–500 fps readings at
+  the `vcaps:src` probe.  (2) When a local-file source loops (EOS → seek to 0), all frames
+  from PTS=0 to the current pipeline running time are decoded as fast as the CPU allows,
+  producing 100–250 fps burst readings.  Both burst types slipped through the original
+  `MAX_RATCHET_SOURCE_FPS = 240` cap (a reading at exactly 235 or 240 fps is not `> 240`).
+  The cap is lowered to 65 fps in `check_and_ratchet()` (`fm-core/src/transport.rs`):
+  burst readings are blocked while legitimate ≤60 fps sources (YouTube, typical cameras)
+  are unaffected.
+- **YouTube reconnect tile goes black after SIGUSR1 re-resolve:** after a URL-expiry
+  reconnect (or a SIGUSR1-forced re-resolve), the compositor rendered the YouTube tile
+  black instead of showing video.  Root cause: `uridecodebin3` had burst-decoded 94 min of
+  buffered content (format 18/22 HTTP MP4) during an 8-min session; calling
+  `set_state(Null)` + new URI did not rewind the demuxer to byte 0 — frames after
+  reconnect had PTS ≈ 5 675 s while the compositor running time was ≈ 480 s.  All frames
+  were in the compositor's future; it rendered black for the tile.  Fix: issue
+  `uridecodebin.seek_simple(FLUSH | KEY_UNIT, ClockTime::ZERO)` immediately before
+  emitting `StreamsChanged(true)` in the post-reconnect gate (`fm-youtube-adapter/src/main.rs`).
+  Confirmed: `first_pts` after reconnect changed from `1:34:35` to `0:00:02`; tile
+  plays video immediately after re-resolve.
 
 ### Added
 - **`fm-youtube-adapter` Block 2 — URL-expiry re-resolution:** on GStreamer Error or EOS the

@@ -171,9 +171,63 @@ a source that's already at position 0.
 `queue2` buffer — this signal does not fire for `uridecodebin3`'s internal elements (it is not
 a standard GstBin in this respect).  `uridecodebin3` exposes only `source-setup` as a signal.
 
-**Not yet attempted:** seek to position 0 after reconnect (above).
+**Fix implemented (2026-06-29):** `seek_simple(FLUSH | KEY_UNIT, ClockTime::ZERO)` issued on
+`uridecodebin` immediately before `emit(StreamsChanged(true, true))` in the
+`post_reconnect_check_at` gate (`fm-youtube-adapter/src/main.rs`, ~line 469).
 
-**Status:** Bug confirmed by maintainer visual 2026-06-29.  Fix designed, not yet implemented.
+**Confirmed by CC, 2026-06-29 (PID 212385):**
+`first_pts` after SIGUSR1 re-resolve changed from `1:34:35.574658689` to `0:00:02.002063327`
+(pipeline running time 1:06); YouTube tile displayed video immediately after reconnect.
+Visual confirmation by maintainer pending (see milestone checkpoint).
+
+---
+
+---
+
+## Bug: File-loop burst + RTSP EOS drove ratchet to 235→240 fps (2026-06-29)
+
+**Symptom:** After the SIGUSR1 re-resolve (seek fix confirmed working), the file source
+(`fnaf2`) appeared to play at very low framerate.  Log showed:
+```
+[pipeline] output fps ratcheted → 235
+[pipeline] output fps ratcheted → 240
+```
+Both commits happened while `yt-map` was fully above-cap (300–500 fps, blocked).
+The output compositor was running at 240 fps, starving and destabilizing the tile display.
+
+**Root cause:**  Two independent burst paths both slipped through the cap.
+
+1. **File loop burst (~line 691, ~4 min after SIGUSR1):** `fnaf2` reached EOS → bus loop
+   `seek_simple(FLUSH | KEY_UNIT, 0)` → file restarts from PTS=0 while pipeline running
+   time is ~5 min.  All 5 min × 30 fps = 9 000 past frames were decoded as fast as
+   possible (~235 fps).  This cleared the ratchet settle timer (fps_in→0 briefly) and
+   restarted it; 3 s later the burst readings (235 fps) committed since `235 > 240` is
+   FALSE with the old cap of 240.
+
+2. **Second file loop burst (~line 1691, ~10 min):** same mechanism; second loop produced
+   readings at 240 fps exactly; `240 > 240` is FALSE so it also committed.
+
+**Fix:** `MAX_RATCHET_SOURCE_FPS` lowered from 240 to 65 in `transport.rs`.  65 fps covers
+standard cameras (30 fps) and YouTube content (max 60 fps) with a 5 fps jitter margin.
+Burst readings from file loops (100–250 fps) and HTTP streaming (300–500 fps) are now
+blocked by the cap.  Log message updated from "HTTP burst?" to "burst".
+
+**Status:** Fixed in `transport.rs` (2026-06-29).  Dead `deep-element-added` signal
+connection also removed from `fm-youtube-adapter/src/main.rs` — `uridecodebin3` does not
+emit this signal for its internal elements (confirmed via `gst-inspect-1.0 uridecodebin3`;
+only `source-setup` is exposed).
+
+**Confirmed by CC, 2026-06-29 (PID 226290):**
+Full four-source session (dummy + fnaf2 + cam-27 + yt-map).  After SIGUSR1 re-resolve at
+1:50 session time:
+- Only one ratchet commit in the full session: `output fps ratcheted → 35` (legitimate,
+  from fnaf2 settling).  No commits at 235/240 fps.
+- `reconnect-pts 'yt-map' first_pts=Some(0:00:00.000000000) pipeline_running=Some(0:01:50)`.
+  Post-seek burst (300–400 fps) entirely blocked by the new 65 fps cap.
+- File source continued at normal framerate throughout; no tile disturbance observed.
+  Visual confirmation by maintainer: all four tiles playing simultaneously, YouTube tile
+  froze briefly during re-resolve then recovered (video, not black), file source at normal
+  framerate throughout — confirmed 2026-06-29.
 
 ---
 
@@ -195,24 +249,23 @@ a sustained run, offsets settable per source.
 - Offsets settable per source across the mix.
 - YouTube tile survives at least one forced re-resolve (SIGUSR1) without disturbing the others.
 
-**Log-confirmed (CC, 2026-06-29, PID 153263):**
+**Log-confirmed (CC, 2026-06-29, PID 226290):**
 - All four adapters reached `Ready` and their chains were built (`gpu-path` probe installed for
   each: dummy, fnaf2, cam-27, yt-map).
-- Output ratchet settled at 35 fps; compositor ran at ~53 fps present (GPU Fifo path).
-- SIGUSR1 → full YouTube re-resolve cycle → chain rebuilt; dummy/fnaf2/cam-27 unaffected.
-- No errors on any source over 5+ minutes of sustained run.
+- Output ratchet settled at 35 fps; single commit for the entire session.  No spurious commits
+  from YouTube burst (300–420 fps, all blocked by 65 fps cap) or file-loop burst.
+- SIGUSR1 → full YouTube re-resolve cycle → chain rebuilt; `first_pts=0:00:00.000000000` at
+  `pipeline_running=1:50`; tile recovered to video immediately.  dummy/fnaf2/cam-27 unaffected.
 
-**Known issue (deferred) — YouTube HTTP burst:**
-`uridecodebin3` decodes YouTube MP4 content 10–13× faster than real-time (HTTP CDN delivery
-speed).  The burst floods the core pipeline's `vcaps:src` probe at 300–420 fps.  The
-`MAX_RATCHET_SOURCE_FPS = 240` cap in `transport.rs` prevents the ratchet from committing a
-false high-fps lock.  On a 32-core/RTX 3090 Ti machine the CPU overhead (~800% = ~25% of
-capacity) is acceptable for the milestone; proper rate-limiting (e.g. limiting `uridecodebin3`
-buffer depth) is deferred.  See BUGS.md when filed.
+**Note — YouTube HTTP burst (CPU overhead):**
+`uridecodebin3` still delivers 300–420 fps to the core probe; all are blocked by the ratchet
+cap.  CPU overhead (~800% on RTX 3090 Ti, ~25% of capacity) is acceptable for the milestone.
+Proper rate-limiting (e.g. `uridecodebin3` buffer depth via `source-setup` signal) is deferred.
 
-**Status — pending maintainer visual confirmation:**
-- [ ] All four tiles visible and playing correct content simultaneously.
-- [ ] YouTube tile froze during SIGUSR1 re-resolve, recovered (other tiles continuous).
-- [ ] GPU overlay is correctly composited (no torn or frozen tiles).
+**Milestone criteria — confirmed by maintainer 2026-06-29 (PID 226290):**
+- [x] All four tiles visible and playing correct content simultaneously.
+- [x] YouTube tile froze during SIGUSR1 re-resolve, recovered (other tiles continuous).
+- [x] File source at normal framerate throughout (ratchet held at 35 fps, no spurious commits).
+- [x] GPU overlay correctly composited (no torn or frozen tiles).
 
 ---

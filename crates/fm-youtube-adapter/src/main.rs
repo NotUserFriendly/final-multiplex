@@ -158,27 +158,6 @@ fn main() {
     let uridecodebin = make("uridecodebin3", "uridecodebin");
     uridecodebin.set_property("uri", &stream_url);
 
-    // Limit the internal HTTP download buffer so the CDN doesn't race ahead
-    // of real-time.  Without a cap, format 18/22 progressive MP4s are decoded
-    // 10–13× faster than playback speed, producing burst fps readings at the
-    // core probe and leaving the demuxer far into the future after a reconnect.
-    // "deep-element-added" fires for every element created inside the bin;
-    // we catch the queue2 that buffers the HTTP byte stream and cap it at ~5 s.
-    uridecodebin.connect("deep-element-added", false, |args| {
-        let elem = match args.get(2).and_then(|v| v.get::<gstreamer::Element>().ok()) {
-            Some(e) => e,
-            None => return None,
-        };
-        if elem.factory().map_or(false, |f| f.name() == "queue2") {
-            // 5 s in nanoseconds; zero out the byte and buffer caps so only
-            // the time cap applies.
-            elem.set_property("max-size-time", 5_000_000_000u64);
-            elem.set_property("max-size-bytes", 0u32);
-            elem.set_property("max-size-buffers", 0u32);
-        }
-        None
-    });
-
     pipeline.add(&uridecodebin).unwrap();
     pipeline.use_clock(Some(&net_clock));
     pipeline.set_start_time(gstreamer::ClockTime::NONE);
@@ -466,6 +445,16 @@ fn main() {
                             s.audio_chain.as_ref().map_or(false, |c| c.sink.is_linked());
                         let current = (has_video, has_audio);
                         if Some(current) != s.last_reported_caps {
+                            // Seek to position 0 before notifying the core so that
+                            // when the core rebuilds its chain, frames start at PTS=0.
+                            // Without this, the HTTP burst leaves the demuxer at the
+                            // burst offset (e.g. 1:34:35 after 8 min of session);
+                            // those frames have PTS >> compositor running_time and
+                            // the compositor renders the tile black.
+                            let _ = uridecodebin.seek_simple(
+                                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+                                gstreamer::ClockTime::ZERO,
+                            );
                             eprintln!(
                                 "[yt-adapter] StreamsChanged (video={has_video} audio={has_audio})"
                             );

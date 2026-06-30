@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **YouTube video reconnect-PTS: build-time correction, remove late probe:**
+  The prior one-shot probe on `voff_src` (output of `voff_q` delay buffer) fired too late —
+  by the time the first frame exited `voff_q`, all subsequent frames from the new stream epoch
+  were already queued in `voff_q` with PTS≈0 and no correction.  All 20 canary samples saw the
+  full ~285 000 ms skew despite the correction log line appearing.  Fix: in `add_video_chain`,
+  query `pipeline.current_running_time()` at build time, compute `correction = running_time` (≥
+  500 ms threshold gates the reconnect case), and apply `vcaps_src.set_offset(user_offset +
+  correction)` before any frame enters `voff_q`.  At initial startup both values are near zero
+  so the threshold is not crossed.  The canary's expected offset is updated to include the
+  correction so it remains accurate.
+- **Audio reconnect-PTS: diagnostic probe on abuffersplit.src added:**
+  `aunixfdsrc` uses `do-timestamp=true` which already stamps each audio buffer with pipeline
+  `running_time` at read time, so no numeric pad-offset correction is needed for audio.
+  Added a `[reconnect-pts-audio]` log at chain-build time to confirm reconnect detection, and
+  a permanent `[abs-probe]` probe on `abuffersplit.src` that logs PTS and wall-clock interval
+  for any buffer outside the [10, 100] ms window — making the crunch cause observable in the
+  session log.
+
+### Added
 - **YouTube audio burst/silence — root cause: net-clock ≠ audio hardware clock (ADR-0027):**
   `audiobuffersplit` made the GStreamer chain through `audiomixer.src` gap-free, localising the
   burst to the audio sink's clock-slave layer.  A `slave-method` sweep (`skew`, `resample`,

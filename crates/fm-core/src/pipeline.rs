@@ -1119,7 +1119,32 @@ impl Pipeline {
         comp_sink.set_property("repeat-after-eos", true);
 
         let vcaps_src = vcaps.static_pad("src").ok_or("vcaps: no src")?;
-        vcaps_src.set_offset(layout.offset_ns);
+        // Apply PTS correction at build time, before any frame enters voff_q.
+        // At initial start running_time ≈ 0, so correction stays below threshold.
+        // At URL-expiry reconnect, running_time is minutes ahead while the new
+        // stream's source PTS resets to ≈ 0 (do-timestamp=false passes the
+        // adapter PTS unmodified).  Correcting here means every frame queued in
+        // voff_q already carries the right effective running_time; the old
+        // one-shot voff_src probe fired after voff_q and missed frames already
+        // in the buffer.
+        let pts_correction_ns = self
+            .inner
+            .current_running_time()
+            .map(|rt| rt.nseconds() as i64)
+            .unwrap_or(0);
+        let correction_ns = if pts_correction_ns > 500_000_000 {
+            pts_correction_ns
+        } else {
+            0
+        };
+        vcaps_src.set_offset(layout.offset_ns + correction_ns);
+        if correction_ns != 0 {
+            eprintln!(
+                "[reconnect-pts] '{}' PTS correction {:+.3}s applied at build time",
+                source_id,
+                correction_ns as f64 / 1e9,
+            );
+        }
 
         let ceiling_ms = self.ceiling_ms as u64;
         let ceiling_ns = ceiling_ms * 1_000_000;
@@ -1137,52 +1162,10 @@ impl Pipeline {
         let voff_src = voff_q.static_pad("src").ok_or("voff_q: no src")?;
         voff_src.link(&comp_sink)?;
 
-        // One-shot probe: correct PTS skew after URL-expiry reconnects.
-        // YouTube re-resolves start a new segment at source_pts≈0 while the
-        // pipeline's running time has already advanced by minutes.  The probe
-        // detects that gap and resets vcaps_src's offset so the video resumes
-        // at the current pipeline position.  At initial startup both pts and
-        // running_time are near zero so the correction is below the threshold
-        // and is skipped.
-        {
-            let pipeline_weak = self.inner.downgrade();
-            let sid = source_id.to_string();
-            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let vcaps_src_clone = vcaps_src.clone();
-            let initial_offset = layout.offset_ns;
-            voff_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
-                if !done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data {
-                        if let Some(p) = pipeline_weak.upgrade() {
-                            let running = p.current_running_time();
-                            eprintln!(
-                                "[reconnect-pts] '{}' first_pts={:?} pipeline_running={:?}",
-                                sid,
-                                buf.pts(),
-                                running
-                            );
-                            if let (Some(run), Some(pts)) = (running, buf.pts()) {
-                                let correction = run.nseconds() as i64 - pts.nseconds() as i64;
-                                // > 500 ms in either direction = real reconnect skew
-                                if correction.abs() > 500_000_000 {
-                                    vcaps_src_clone.set_offset(initial_offset + correction);
-                                    eprintln!(
-                                        "[reconnect-pts] '{}' PTS correction {:+.3}s applied",
-                                        sid,
-                                        correction as f64 / 1e9,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                gstreamer::PadProbeReturn::Ok
-            });
-        }
         add_offset_canary(
             &voff_src,
             source_id,
-            layout.offset_ns,
+            layout.offset_ns + correction_ns,
             self.ceiling_ms as u64,
             self.inner.downgrade(),
             source_fps,
@@ -1329,10 +1312,63 @@ impl Pipeline {
         let abs_src = abuffersplit
             .static_pad("src")
             .ok_or("abuffersplit: no src")?;
+        // Audio uses do-timestamp=true on aunixfdsrc, which stamps each buffer
+        // with the pipeline running_time at read time.  The source PTS is
+        // therefore already ≈ running_time after a reconnect; applying
+        // running_time as an additional pad offset would double it.  Only the
+        // user-configured offset is applied here.
         abs_src.set_offset(layout.offset_ns);
+        if let Some(rt) = self.inner.current_running_time() {
+            if rt.nseconds() > 500_000_000 {
+                eprintln!(
+                    "[reconnect-pts-audio] '{}' reconnect at {:.3}s; \
+                     do-timestamp=true provides correct PTS",
+                    source_id,
+                    rt.nseconds() as f64 / 1e9,
+                );
+            }
+        }
         abs_src.link(&mix_sink)?;
         mix_sink.set_property("volume", layout.volume);
         mix_sink.set_property("mute", layout.muted);
+
+        // Diagnostic: log PTS and wall-clock intervals at abuffersplit.src.
+        // Warns on intervals outside [10, 100] ms — outside that band indicates
+        // a burst (crunch) or a gap (silence).  Remove once the crunch cause is
+        // confirmed and fixed.
+        {
+            let sid = source_id.to_string();
+            let last_wall = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+            let last_pts_ns = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+            abs_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+                let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data else {
+                    return gstreamer::PadProbeReturn::Ok;
+                };
+                let Some(pts) = buf.pts() else {
+                    return gstreamer::PadProbeReturn::Ok;
+                };
+                let pts_ns = pts.nseconds() as i64;
+                let now = std::time::Instant::now();
+                let wall_ms = {
+                    let mut g = last_wall.lock().unwrap();
+                    let ms = g.elapsed().as_millis() as i64;
+                    *g = now;
+                    ms
+                };
+                let prev = last_pts_ns.swap(pts_ns, std::sync::atomic::Ordering::Relaxed);
+                if prev >= 0 && (wall_ms < 10 || wall_ms > 100) {
+                    let pts_interval_ms = (pts_ns - prev) / 1_000_000;
+                    eprintln!(
+                        "[abs-probe] '{}' pts={:.3}s pts_delta={:+}ms wall_interval={}ms",
+                        sid,
+                        pts_ns as f64 / 1e9,
+                        pts_interval_ms,
+                        wall_ms,
+                    );
+                }
+                gstreamer::PadProbeReturn::Ok
+            });
+        }
 
         for elem in [
             &aunixfdsrc,

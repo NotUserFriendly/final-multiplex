@@ -362,8 +362,8 @@ which briefly disturbed the other pads. Session continued normally afterwards.
 **Video bug found:** After each URL-expiry reconnect, `first_pts=0` while pipeline
 running time was 569 s (first reconnect) and 854 s (second reconnect). The
 `reconnect-pts` probe only logged this; `vcaps_src.set_offset()` was never updated.
-yt-fc video frames arrived 9–14 minutes in the past and were displayed at wrong time or
-dropped. Fix: probe now applies `set_offset(initial_offset + skew)` when
+yt-fc video frames arrived with a PTS 9–14 min in the past and were displayed at wrong
+time or dropped. Fix: probe now applies `set_offset(initial_offset + skew)` when
 `|skew| > 500 ms` (commit below).
 
 **Second reconnect:** yt-fc reconnected again at pipeline time 14:14 (URL expiry
@@ -374,10 +374,21 @@ repeating every ~5 min). Same video offset bug. Both reconnects showed 60 total
 `vcaps_src.set_offset(initial_offset + correction)` so video resumes at current
 pipeline position after any reconnect.
 
-**Next validation needed (maintainer):** Kill session, rebuild, start again. After the
-YouTube adapter reconnects (wait ~10 min), confirm the yt-fc tile continues displaying
-video (no freeze/blank tile). Log should show
-`[reconnect-pts] 'yt-fc' PTS correction +Xs applied`. Audio clean for the full session.
+**yt-fc audio crunchiness (session 117487):** "yt-fc ran for a bit, got really
+crunchy, then died."  Crunch occurred at the URL-expiry EOS reconnect (~2.5 min
+into session).  Root cause: socket backlog → `ashm_q` skipping → ≈22× audio speed →
+crunchy → mix position overshoots PTS → silence.  Fix: 300 ms DROP probe on
+`aunixfdsrc.src` added to `add_audio_chain()`.
+
+**yt-nature never produced sound (session 117487):** Likely overshadowed by yt-fc
+crunchiness occurring at the same time.  Same fix applies to yt-nature's chain at
+startup.
+
+**Next validation needed (maintainer):** Kill and relaunch.  Expect:
+- Both YouTube sources produce clean audio starting ≈300 ms after startup.
+- At URL-expiry reconnect (~10 min): ≈300 ms of silence from yt-fc, then clean
+  audio resumes.  Log shows `[reconnect-pts] 'yt-fc' PTS correction +Xs applied`
+  and yt-fc video tile continues (no freeze).
 
 ---
 

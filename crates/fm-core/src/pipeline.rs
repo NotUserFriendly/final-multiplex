@@ -138,12 +138,6 @@ fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
 /// passes through unmodified rather than being overwritten with arrival time.
 /// Adding a new platform means adding a new `cfg` branch here and in
 /// `fm-adapter-sdk/src/transport.rs`.
-///
-/// Audio transport uses `do-timestamp=true` (see `make_audio_transport_src`):
-/// YouTube/file sources produce buffers starting at PTS≈0 which map to
-/// running_time=0 in the core and get dropped as late by audiomixer.
-/// Re-stamping with arrival time makes any real-time-throttled audio stream
-/// appear on-time regardless of its internal PTS origin.
 #[cfg(target_os = "linux")]
 fn make_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Element> {
     let src = make("unixfdsrc", name)?;
@@ -152,12 +146,60 @@ fn make_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Elemen
     Ok(src)
 }
 
+/// Audio transport: `do-timestamp=true` + sequential PTS correction.
+///
+/// `do-timestamp=true` stamps the FIRST buffer with the pipeline's current
+/// running_time.  A pad probe (attached via `attach_sequential_audio_pts`)
+/// then re-stamps every subsequent buffer with `first_pts + N × dur` and
+/// sets `buf.duration` from the buffer byte-count.  Together these give the
+/// audiomixer per-pad queues correctly-advancing PTSes with a known duration,
+/// so GstAggregator's `has_space` check counts queued time correctly and the
+/// chain doesn't block prematurely.
 #[cfg(target_os = "linux")]
 fn make_audio_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Element> {
     let src = make("unixfdsrc", name)?;
     src.set_property_from_str("socket-path", socket_path);
     src.set_property("do-timestamp", true);
     Ok(src)
+}
+
+/// Add a pad probe to `aunixfdsrc.src` that rewrites buffer PTSes to be
+/// perfectly sequential starting from the first buffer's do-timestamp PTS,
+/// and sets `buffer.duration` from byte-count.
+///
+/// This prevents the audiomixer per-pad queue from seeing burst-reads as
+/// "all the same instant" (which would make `queued_duration` appear zero
+/// and let the chain push unlimited buffers before blocking).
+#[cfg(target_os = "linux")]
+fn attach_sequential_audio_pts(src: &gstreamer::Element) {
+    let Some(src_pad) = src.static_pad("src") else {
+        return;
+    };
+    let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let start_pts: std::sync::Arc<std::sync::Mutex<Option<gstreamer::ClockTime>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        let Some(gstreamer::PadProbeData::Buffer(ref mut buf)) = info.data else {
+            return gstreamer::PadProbeReturn::Ok;
+        };
+        let buf = buf.make_mut();
+        // S16LE 48 kHz stereo → 4 bytes per sample-frame, 48000 frames/s
+        let dur_ns = buf.size() as u64 * 1_000_000_000 / 192_000;
+        buf.set_duration(gstreamer::ClockTime::from_nseconds(dur_ns));
+        let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut sp = start_pts.lock().unwrap();
+        if sp.is_none() {
+            if let Some(pts) = buf.pts() {
+                *sp = Some(pts);
+            }
+        }
+        if let Some(start) = *sp {
+            buf.set_pts(gstreamer::ClockTime::from_nseconds(
+                start.nseconds() + n * dur_ns,
+            ));
+        }
+        gstreamer::PadProbeReturn::Ok
+    });
 }
 
 /// Source-side pad references for a single source.
@@ -350,6 +392,14 @@ impl Pipeline {
         let audiomixer: gstreamer::Element = gstreamer::ElementFactory::make("audiomixer")
             .name("audiomixer")
             .build()?;
+        // 50 ms latency: with sequential PTSes at ~current_time, the audiomixer
+        // output window is current_time - 50 ms, so each source's per-pad queue
+        // holds only ~3 buffers (50 ms / 22 ms) before has_space blocks the chain.
+        // 200 ms caused the per-pad queue to fill to 9 buffers (the full 200 ms
+        // threshold), permanently blocking chains and overflowing the aqueue.
+        // 50 ms absorbs OS scheduling jitter (typically < 5 ms) while staying
+        // small enough that the mismatch self-corrects and the chain never stalls.
+        audiomixer.set_property("latency", 50_000_000u64);
         let aconv_out: gstreamer::Element = gstreamer::ElementFactory::make("audioconvert")
             .name("aconv_out")
             .build()?;
@@ -429,6 +479,33 @@ impl Pipeline {
         compositor.link(&comp_capsfilter)?;
         comp_capsfilter.link(&appsink)?;
         gstreamer::Element::link_many([&audiomixer, &aconv_out, &aresamp_out, &autoaudiosink])?;
+
+        // Diagnostic: measure audiomixer output rate to distinguish mixer-side
+        // burst from downstream (PulseAudio) burst.
+        {
+            let last_mix_out =
+                std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+            let mix_buf_seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            if let Some(mix_src) = audiomixer.static_pad("src") {
+                mix_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+                    let (gap, n) = {
+                        let mut last = last_mix_out.lock().unwrap();
+                        let elapsed = last.elapsed();
+                        let seq = mix_buf_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        *last = std::time::Instant::now();
+                        (elapsed, seq)
+                    };
+                    if n == 0 || gap > std::time::Duration::from_millis(50) {
+                        eprintln!(
+                            "[mix-out] buf#{n} gap={:?}{}",
+                            gap,
+                            if n == 0 { " (first)" } else { " ← MIX GAP" }
+                        );
+                    }
+                    gstreamer::PadProbeReturn::Ok
+                });
+            }
+        }
 
         // Wire audio floor: silence_src → silence_caps → audiomixer(volume=0)
         gstreamer::Element::link_many([&silence_src, &silence_caps])?;
@@ -790,13 +867,23 @@ impl Pipeline {
                         let aqueue: gstreamer::Element = gstreamer::ElementFactory::make("queue")
                             .name(format!("ashm_q_{}", source.id))
                             .build()?;
-                        aqueue.set_property("max-size-buffers", 4u32);
+                        aqueue.set_property("max-size-buffers", 20u32);
                         aqueue.set_property("max-size-bytes", 0u32);
                         aqueue.set_property("max-size-time", 0u64);
                         aqueue.set_property_from_str("leaky", "downstream");
+                        {
+                            let sid = source.id.clone();
+                            let over = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            aqueue.connect("overrun", false, move |_| {
+                                let n = over.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                eprintln!("[aqueue-overrun] {} total drops for {}", n + 1, sid);
+                                None
+                            });
+                        }
 
                         pipeline.add_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
                         gstreamer::Element::link_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
+                        attach_sequential_audio_pts(&aunixfdsrc);
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
                             aqueue
                                 .static_pad("src")
@@ -1235,10 +1322,19 @@ impl Pipeline {
         );
 
         let aqueue = make("queue", &format!("ashm_q_{source_id}"))?;
-        aqueue.set_property("max-size-buffers", 4u32);
+        aqueue.set_property("max-size-buffers", 20u32);
         aqueue.set_property("max-size-bytes", 0u32);
         aqueue.set_property("max-size-time", 0u64);
         aqueue.set_property_from_str("leaky", "downstream");
+        {
+            let sid = source_id.to_string();
+            let over = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            aqueue.connect("overrun", false, move |_| {
+                let n = over.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[aqueue-overrun] {} total drops for {}", n + 1, sid);
+                None
+            });
+        }
 
         let aconv = make("audioconvert", &format!("aconv_{source_id}"))?;
         let aresamp = make("audioresample", &format!("aresamp_{source_id}"))?;
@@ -1283,6 +1379,32 @@ impl Pipeline {
         mix_sink.set_property("volume", layout.volume);
         mix_sink.set_property("mute", layout.muted);
 
+        // Sequential PTS probe on aunixfdsrc.src: assigns start_pts + N×dur and
+        // sets buf.duration so GstAggregator has_space counts queued time correctly.
+        attach_sequential_audio_pts(&aunixfdsrc);
+        {
+            let sid = source_id.to_string();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Some(caps_src) = ashmcaps.static_pad("src") {
+                caps_src.add_probe(
+                    gstreamer::PadProbeType::BUFFER | gstreamer::PadProbeType::EVENT_DOWNSTREAM,
+                    move |_, info| {
+                        if !done.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            let summary = info
+                                .data
+                                .as_ref()
+                                .map(|d| format!("{d:?}").chars().take(40).collect::<String>());
+                            eprintln!(
+                                "[audio-caps-src] '{}' first data past ashmcaps: {:?}",
+                                sid, summary
+                            );
+                        }
+                        gstreamer::PadProbeReturn::Ok
+                    },
+                );
+            }
+        }
+
         for elem in [
             &aunixfdsrc,
             &ashmcaps,
@@ -1292,7 +1414,13 @@ impl Pipeline {
             &alevel,
             &acaps,
         ] {
-            let _ = elem.sync_state_with_parent();
+            let state_result = elem.sync_state_with_parent();
+            eprintln!(
+                "[audio-sync] '{}' {:?} → {:?}",
+                source_id,
+                elem.name(),
+                state_result
+            );
         }
 
         eprintln!("[pipeline] added audio chain for '{source_id}'");

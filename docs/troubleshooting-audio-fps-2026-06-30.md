@@ -124,6 +124,219 @@ current output window has closed (which latency=0 does not tolerate).
 
 ---
 
+## Attempt 4 — Adapter PTS rewrite + audiomixer latency=200ms (2026-06-30)
+
+**Root cause confirmed:** Segment events do NOT cross the unixfd process boundary.
+The YouTube adapter's `uridecodebin3` starts with `segment.base=0`. Audio buffers
+begin at `PTS=0`. In the core, `aunixfdsrc` creates its own segment (`base=0`,
+`start=0`), so `running_time = PTS = 0`. The audiomixer (previously `latency=0`) at
+`running_time = T_current` (several minutes in) drops PTS=0 buffers as late.
+
+**Fix applied (two parts):**
+
+(a) **`fm-youtube-adapter/src/main.rs` — adapter probe PTS rewrite:** Added
+`buf.make_mut().set_pts(rt)` inside the throttle probe on `aunixfdsink.sink`, where
+`rt = pipeline.current_running_time()`. Because adapter and core share the same master
+clock and `--base-time`, `adapter_running_time == core_running_time` at any instant.
+This bypasses the unreliable segment-event path across the process boundary and gives
+audiomixer correctly-timed buffers.
+
+(b) **`fm-core/src/pipeline.rs` — audiomixer latency=200ms:** Set
+`audiomixer.set_property("latency", 200_000_000u64)`. Gives 200ms of slack for OS
+scheduling jitter (±10–50ms arrival variance) so buffers that arrive slightly "late"
+due to jitter are still accepted.
+
+**Diagnostic probe results (session PID 61977, 2026-06-30):**
+
+- `[yt-audio-probe]` in adapter: first buffer `size=4316 pts=Some(0:00:00.000000000)`
+  confirms buffer arrives at adapter's `aunixfdsink.sink`. PTS is 0 (before rewrite).
+- `[audio-pts] probe fired: pts=None running=Some(0:04:43.064787258) data=Some("Event...")`:
+  first push on `aunixfdsrc.src` in core is a CAPS event — socket IS delivering data,
+  caps negotiation successful. Buffers follow silently (probe's `done` flag already set).
+- `[audio-caps-src]`: CAPS event passes `ashmcaps` — caps match S16LE 48kHz 2ch interleaved.
+- `[audio-sync]`: all elements report `Ok(())` from `sync_state_with_parent()`.
+
+**Initial chain note:** The constructor-built initial chain (before first EOS) does NOT
+go through `add_audio_chain` and has no core-side probe. The adapter probe still
+rewrites PTS on the initial chain's data, and audiomixer latency=200ms applies to all
+sources. Both paths should produce correct audio.
+
+**Maintainer result:** Audio present but in short bursts — "half second of sound,
+followed by a second or so of silence" — confirmed 2026-06-30.
+
+---
+
+## Attempt 5 — do-timestamp=true on aunixfdsrc (7be6b03, re-applied with latency=200ms)
+
+**Symptom from Attempt 4:** Adapter PTS rewrite produced *some* audio, but with a
+0.5s-on / 1s-off burst/silence pattern. The adapter's PTS rewrite uses
+`pipeline.current_running_time()` which is derived from the GstNetClientClock sync
+between adapter and core processes.
+
+**Fix:** `make_audio_transport_src` sets `do-timestamp=true`. GstBaseSrc re-stamps
+each buffer with the core pipeline clock at the moment `create()` returns. Local
+clock, no cross-process dependency.
+
+**Maintainer result (PID 37075, 2026-06-30):** Audio still bursting.
+
+---
+
+## Diagnostic session — aqueue overrun + mix-out gap probes (2026-06-30)
+
+**Added probes:**
+
+- Adapter: inter-buffer elapsed time on `aunixfdsink.sink`; logs any gap > 50ms as
+  `[yt-audio-probe] ← SOURCE GAP`. **Result: zero source gaps.** The adapter delivers
+  continuously; root cause is in the core.
+- Core: inter-buffer elapsed time on `audiomixer.src`; logs > 50ms as
+  `[mix-out] ← MIX GAP`. **Result: confirmed — the audiomixer itself is bursty.**
+- Core: `queue::overrun` signal handler on every `aqueue` element (all per-adapter
+  audio queues) to count buffer drops.
+
+**Key finding — mute is the trigger (PID 37075):** With yt-fc and yt-nature muted,
+the mix-out probe ran **10,789 consecutive clean buffers (3.8 minutes) with zero
+gaps**. Gaps began the instant yt-fc/yt-nature were unmuted. The audiomixer is
+healthy when those two sources are excluded from its wait set.
+
+**Overrun counts (PID 37075, after unmuting):**
+
+| Source | Drops |
+|---|---|
+| dummy | 6,738 |
+| yt-fc | 6,182 |
+| yt-nature | 6,179 |
+| cam-77 | 1,717 |
+
+Overruns start immediately after unmuting and run continuously. The aqueues are
+constantly full. Every adapter-backed source is affected equally, pointing to the
+audiomixer's **downstream** (pulsesink chain) as the bottleneck, not any single
+source.
+
+---
+
+## Root cause analysis — PTS / latency mismatch (2026-06-30)
+
+**do-timestamp stamps buffers with `current_time`.** The audiomixer with
+`latency=L` runs its output window L milliseconds *behind* the wall clock:
+`W_output = clock − L`. So every buffer stamped with `clock` arrives at the per-pad
+queue as a buffer **L ms in the future** relative to the current output window.
+
+**GstAggregator `has_space` fills the per-pad queue to `ceil(L / buf_dur)`
+buffers before blocking the chain.** With L=200ms and buf_dur=22ms: 9 buffers
+(200ms) fill the per-pad queue; the chain blocks. The aqueue fills at 45.5 buf/s
+(adapter production rate) and overflows since drain rate < production rate.
+
+**Consequence:** The per-pad queue holds 200ms of "future" yt-fc data. The
+audiomixer outputs 9 windows from those buffers (192ms of audio), then the per-pad
+queue is empty and waits for the next fill cycle — producing the burst/silence
+pattern. The ratio improves as the system partially converges but never cleans up
+because the mismatch is structural.
+
+**Why do-timestamp buffers have no duration set?** `do-timestamp` (in GstBaseSrc)
+only rewrites PTS; it leaves `GstBuffer.duration = GST_CLOCK_TIME_NONE`. With
+duration=None, GstAggregator's `has_space` cannot compute `queued_duration`
+correctly. In GStreamer 1.28 this means `has_space` returns TRUE until the per-pad
+queue reaches its byte or buffer count limit, allowing unlimited future buffers to
+accumulate.
+
+---
+
+## Attempt 6 — Sequential PTS probe + duration on aunixfdsrc.src (2026-06-30)
+
+**Hypothesis:** Fix the two problems simultaneously:
+
+1. Assign **monotonically sequential PTSes** anchored to the first buffer's
+   do-timestamp PTS: `PTS_N = start_pts + N × dur`. This eliminates burst-read
+   clock jitter (multiple rapid socket reads get PTSes spaced apart, not all at
+   the same instant).
+2. Set **`buf.duration`** from byte count (`size × 1e9 / 192_000`) so
+   `has_space` correctly counts queued time and blocks the chain at the intended
+   threshold.
+
+**Code:** Added `attach_sequential_audio_pts(src: &Element)` in
+`fm-core/src/pipeline.rs`, called at both the constructor-path and
+`add_audio_chain()` call sites.
+
+**Result (PID 39218, 2026-06-30):** Improvement — sound:silence ratio increased
+(roughly 50 % sound vs 33 % before). But still bursting. Mix-out gap pattern
+changed:
+
+- Clean audio for **4.37 minutes** (12,326 buffers) while yt-fc/yt-nature were
+  muted — confirming the probe doesn't hurt normal operation.
+- At unmute (buf#12328): gaps start at 69–90ms, **grow** to a peak of ~720ms
+  (buf#17582), then **decrease** over ~3 minutes toward 7ms. This convergence
+  pattern confirms the mismatch is structural, not random jitter.
+
+**Why still broken:** With duration set correctly, `has_space` now blocks the chain
+after `ceil(200ms / 22ms) = 9` buffers. The per-pad queue is still 200ms full of
+future data. The cycle is the same as before; the correct duration just makes the
+ceiling more precise. Setting L=200ms with do-timestamp PTSes is inherently self-
+defeating: the latency that was meant to absorb jitter is exactly the offset that
+keeps the per-pad queue permanently full.
+
+**During muting (GstAggregator behaviour confirmed):** Muted pads are NOT consumed.
+The per-pad queue fills to threshold and the chain blocks permanently. The aqueue
+overflows for the full muted period. This is expected; the overruns are harmless
+while muted. At unmute, the audiomixer discards the 9 stale per-pad buffers and
+the newest aqueue buffers resume — the catch-up takes < 1ms.
+
+---
+
+## Attempt 7 — audiomixer latency reduced to 50ms (2026-06-30)
+
+**Hypothesis:** Reducing L from 200ms to 50ms shrinks the PTS mismatch. Per-pad
+queue ceiling drops from 9 to `ceil(50/22) = 3` buffers. The chain cycles faster;
+the aqueue drains faster; the burst/silence cycle should shorten toward
+imperceptibility.
+
+**Result (PID 40739, 2026-06-30):** Still bursting. Regular 140–210ms gaps every
+~3 seconds (vs 665ms every 1.5s before). Mix-out gap count: 221 gaps in the session.
+Overrun counts similar (yt-fc 5,755; dummy 24,352 over longer run). Sound:silence
+ratio better but user still perceives bursting.
+
+**Why still broken:** The same structural mismatch exists at 50ms scale. The
+per-pad queue fills to 3 buffers (50ms), the chain cycles, and the accumulated
+buffer-duration drift (22.479ms per yt-fc buf vs 21.333ms per audiomixer chunk =
+1.146ms/buf drift) causes periodic stalls as the queued data gets out of phase with
+the output window. Reducing L makes the gaps shorter and less frequent, but doesn't
+eliminate them.
+
+---
+
+## What needs to happen next
+
+**The structural problem:** `do-timestamp` assigns PTS = `clock_now`. The
+audiomixer's output window is `clock_now − L`. These two will never be aligned as
+long as L > 0, because every buffer arrives L ms ahead of the window that needs it.
+
+**Next candidate fix — offset start_pts by −L:**
+
+In `attach_sequential_audio_pts`, subtract the audiomixer latency from the anchor:
+
+```rust
+if sp.is_none() {
+    if let Some(pts) = buf.pts() {
+        // Shift back by audiomixer latency so PTSes match the output window.
+        *sp = Some(ClockTime::from_nseconds(
+            pts.nseconds().saturating_sub(50_000_000), // 50 ms
+        ));
+    }
+}
+```
+
+With this: `PTS_N = (clock_now − 50ms) + N × 22ms ≈ clock_now − 50ms = W_output`.
+Buffer PTSes match the audiomixer's current output window directly. The per-pad
+queue should stay at 0–1 (consumed immediately), the chain never blocks, the aqueue
+stays empty, and audio should be continuous with no burst pattern.
+
+At unmuting: the aqueue holds 20 newest buffers with PTSes ≈ `T_unmute − 50ms`.
+Exactly the current output window. The 3 stale per-pad buffers are discarded in
+< 1ms and audio resumes immediately from the correct position.
+
+**This is the next thing to try.**
+
+---
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)
 
 ```
@@ -145,39 +358,9 @@ and iced render all share the same process.
 
 ---
 
-## Next step (for review chat)
+## Next step
 
-**Suspected root cause:** `audiomixer` with `latency=0` drops any buffer whose
-`running_time` falls before its current output window. Even if `do-timestamp=true`
-stamps buffers with `T_arrival`, OS scheduling jitter (1–50ms) may cause a buffer
-to arrive after the audiomixer has already closed and output the window covering
-`T_arrival`. With `latency=0` there is no tolerance for this.
-
-**Proposed fix A — audiomixer latency:**
-Set `audiomixer.set_property("latency", 200_000_000u64)` (200ms). This makes the
-aggregator wait 200ms past a window's nominal end before declaring it closed and
-moving on. A buffer that arrives 10–50ms "late" (due to OS jitter) would be
-included. Downside: 200ms of output latency for all audio (acceptable for security
-camera monitoring).
-
-**Proposed fix B — `is-live=true` on `aunixfdsrc`:**
-`unixfdsrc` is not declared live (`is-live=false` by default). GStreamer's
-`do-timestamp` behaviour may not apply the clock correctly when the source is
-non-live. Setting `is-live=true` makes the element declare itself live to the
-pipeline, which ensures the clock is properly applied and the element participates
-in latency queries. May interact with `audiomixer`'s aggregation differently. Should
-be tried alongside or independently of fix A.
-
-**Proposed fix C — audio PTS probe in core for diagnostic:**
-Add a one-shot `BUFFER` probe on `aunixfdsrc_{id}.src` (analogous to
-`reconnect-pts` on video) to log `first_pts` and `pipeline_running` after a YouTube
-audio chain is built or rebuilt. This would confirm whether `do-timestamp=true` is
-actually modifying the PTS or silently failing. If `first_pts ≈ 0`, the property
-is not working; if `first_pts ≈ pipeline_running`, it is working and the problem
-is audiomixer latency.
-
-**Proposed fix D — root-cause fnaf2/all-sources slow fps:**
-963% main-app CPU on a debug binary with 6 sources is likely the ceiling. If the
-compositor thread is starved, output fps drops below the configured 30fps. This
-is a build-mode symptom — a release build (`cargo build --release`) should be
-measured before attributing it to a code defect.
+See "What needs to happen next" above — try the `start_pts − 50ms` offset in
+`attach_sequential_audio_pts` so buffer PTSes align with the audiomixer's actual
+output window. All other scaffolding (sequential probe, duration setting, 50ms
+latency, leaky aqueue) can stay in place.

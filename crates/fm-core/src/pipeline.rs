@@ -148,17 +148,24 @@ fn make_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Elemen
 
 /// Audio transport: live source with `do-timestamp=true`.
 ///
-/// `is-live=true` makes this element participate in the pipeline latency query
-/// so GstBaseSrc applies live timestamping (`running_time` at capture, not bare
-/// wall-clock) and the audiomixer's aggregation treats it as clock-synced input.
-/// `do-timestamp=true` stamps each buffer with the pipeline running_time at
-/// the moment `create()` returns in `gst_base_src_loop`.
+/// `set_live(true)` (via `gst_base_src_set_live`) makes this element participate
+/// in the pipeline latency query so GstBaseSrc applies live timestamping
+/// (`running_time` at capture, not bare wall-clock) and the audiomixer's
+/// aggregation treats it as clock-synced input.  `do-timestamp=true` stamps each
+/// buffer with the pipeline running_time at the moment `create()` returns.
+///
+/// Note: `unixfdsrc` does not expose `is-live` as a GObject property, so the
+/// `BaseSrcExtManual::set_live()` API is used instead.
 #[cfg(target_os = "linux")]
 fn make_audio_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Element> {
+    use gstreamer_base::prelude::BaseSrcExt;
     let src = make("unixfdsrc", name)?;
     src.set_property_from_str("socket-path", socket_path);
-    src.set_property("is-live", true);
     src.set_property("do-timestamp", true);
+    // unixfdsrc doesn't expose is-live as a GObject property; use the C API.
+    if let Some(base_src) = src.dynamic_cast_ref::<gstreamer_base::BaseSrc>() {
+        base_src.set_live(true);
+    }
     Ok(src)
 }
 

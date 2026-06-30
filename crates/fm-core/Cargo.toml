@@ -10,6 +10,7 @@ fm-adapter-sdk.workspace  = true
 gstreamer.workspace         = true
 gstreamer-app.workspace     = true
 gstreamer-audio.workspace   = true
+gstreamer-base.workspace    = true
 gstreamer-video.workspace   = true
 gstreamer-pbutils.workspace = true
 gstreamer-net.workspace     = true

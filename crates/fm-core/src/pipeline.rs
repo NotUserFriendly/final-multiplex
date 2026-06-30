@@ -126,6 +126,12 @@ fn probe_streams(uri: &str) -> (bool, bool) {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+// Must match the `audiomixer.latency` property and the offset subtracted in
+// attach_audio_sequential_pts.  Buffer PTSes are anchored to
+// first_do_timestamp_pts − AUDIOMIXER_LATENCY_NS so they land on the
+// audiomixer's output window (running_time − latency) exactly.
+const AUDIOMIXER_LATENCY_NS: u64 = 50_000_000; // 50 ms
+
 fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
     gstreamer::ElementFactory::make(factory)
         .name(name)
@@ -169,17 +175,30 @@ fn make_audio_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::
     Ok(src)
 }
 
-/// Add a pad probe to `aunixfdsrc.src` that sets `buffer.duration` from
-/// byte-count so GstAggregator's `has_space` counts queued time correctly.
-/// Also logs the first buffer's PTS vs pipeline running_time once per chain.
+/// Sequential PTS + duration probe for `aunixfdsrc.src`.
+///
+/// `do-timestamp` gives every buffer PTS = `running_time_at_read`.  With
+/// `audiomixer.latency = L`, the audiomixer's output window sits at
+/// `running_time − L`, so a buffer stamped at `running_time` is always L ms
+/// *ahead* of the window — filling the per-pad queue until `has_space` blocks
+/// the chain and causing the burst/silence cycle.
+///
+/// Fix: anchor `start_pts = first_do_ts_pts − L` and advance sequentially:
+/// `PTS_N = start_pts + N × dur`.  Each buffer arrives exactly at the
+/// audiomixer's current output window.  `buf.duration` is also set from
+/// byte-count so `has_space` counts queued time correctly.
+///
+/// `latency_offset_ns` must equal the `audiomixer.latency` property value.
 #[cfg(target_os = "linux")]
-fn attach_audio_duration_probe(src: &gstreamer::Element, source_id: &str) {
+fn attach_audio_sequential_pts(src: &gstreamer::Element, source_id: &str, latency_offset_ns: u64) {
     let Some(src_pad) = src.static_pad("src") else {
         return;
     };
     let sid = source_id.to_string();
-    let logged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |pad, info| {
+    let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let start_pts: std::sync::Arc<std::sync::Mutex<Option<u64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
         let Some(gstreamer::PadProbeData::Buffer(ref mut buf)) = info.data else {
             return gstreamer::PadProbeReturn::Ok;
         };
@@ -187,18 +206,23 @@ fn attach_audio_duration_probe(src: &gstreamer::Element, source_id: &str) {
         // S16LE 48 kHz stereo → 4 bytes/frame, 192000 bytes/s
         let dur_ns = buf.size() as u64 * 1_000_000_000 / 192_000;
         buf.set_duration(gstreamer::ClockTime::from_nseconds(dur_ns));
-        if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let pts_ms = buf.pts().map(|t| t.nseconds() / 1_000_000);
-            let run_ms = pad.parent_element().and_then(|e| {
-                let clk = e.clock()?;
-                let base = e.base_time()?;
-                let now = clk.time();
-                Some(now.nseconds().saturating_sub(base.nseconds()) / 1_000_000)
-            });
-            eprintln!(
-                "[audio-pts] '{}' first buf: pts={:?}ms running={:?}ms",
-                sid, pts_ms, run_ms
-            );
+        let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut sp = start_pts.lock().unwrap();
+        if sp.is_none() {
+            if let Some(pts) = buf.pts() {
+                let anchor = pts.nseconds().saturating_sub(latency_offset_ns);
+                eprintln!(
+                    "[audio-pts] '{}' anchor: do_ts={}ms offset={}ms start={}ms",
+                    sid,
+                    pts.nseconds() / 1_000_000,
+                    latency_offset_ns / 1_000_000,
+                    anchor / 1_000_000,
+                );
+                *sp = Some(anchor);
+            }
+        }
+        if let Some(start) = *sp {
+            buf.set_pts(gstreamer::ClockTime::from_nseconds(start + n * dur_ns));
         }
         gstreamer::PadProbeReturn::Ok
     });
@@ -394,6 +418,11 @@ impl Pipeline {
         let audiomixer: gstreamer::Element = gstreamer::ElementFactory::make("audiomixer")
             .name("audiomixer")
             .build()?;
+        // 50 ms latency so GstAggregator waits up to 50 ms for each live input.
+        // attach_audio_sequential_pts subtracts this same 50 ms from start_pts so
+        // buffer PTSes land exactly on the audiomixer's output window (running_time − 50 ms),
+        // preventing the per-pad queue from filling up and blocking the chain.
+        audiomixer.set_property("latency", AUDIOMIXER_LATENCY_NS);
         let aconv_out: gstreamer::Element = gstreamer::ElementFactory::make("audioconvert")
             .name("aconv_out")
             .build()?;
@@ -841,7 +870,7 @@ impl Pipeline {
 
                         pipeline.add_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
                         gstreamer::Element::link_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
-                        attach_audio_duration_probe(&aunixfdsrc, &source.id);
+                        attach_audio_sequential_pts(&aunixfdsrc, &source.id, AUDIOMIXER_LATENCY_NS);
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
                             aqueue
                                 .static_pad("src")
@@ -1328,7 +1357,7 @@ impl Pipeline {
         mix_sink.set_property("volume", layout.volume);
         mix_sink.set_property("mute", layout.muted);
 
-        attach_audio_duration_probe(&aunixfdsrc, source_id);
+        attach_audio_sequential_pts(&aunixfdsrc, source_id, AUDIOMIXER_LATENCY_NS);
 
         for elem in [
             &aunixfdsrc,

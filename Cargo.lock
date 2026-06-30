@@ -1047,6 +1047,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-audio",
+ "gstreamer-base",
  "gstreamer-net",
  "gstreamer-pbutils",
  "gstreamer-video",

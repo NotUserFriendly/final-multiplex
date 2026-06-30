@@ -358,9 +358,132 @@ and iced render all share the same process.
 
 ---
 
-## Next step
+---
 
-See "What needs to happen next" above — try the `start_pts − 50ms` offset in
-`attach_sequential_audio_pts` so buffer PTSes align with the audiomixer's actual
-output window. All other scaffolding (sequential probe, duration setting, 50ms
-latency, leaky aqueue) can stay in place.
+## Attempt 8 — Live-source model: is-live=true + do-timestamp + latency from query (2026-06-30)
+
+**Hypothesis (TaskBlock-audio-livesource-fix.md, Steps 1-3):** The manual sequential
+anchor and hand-picked latency constant are fighting each other. Replace with one
+coherent model: declare `aunixfdsrc` a proper live source so GstAggregator handles
+timing via the standard latency-query path.
+
+**Fix:**
+- `is-live=true` on `aunixfdsrc` via `BaseSrcExt::set_live()` (GObject property not
+  exposed on `GstUnixFdSrc`; must use the C API through `gstreamer-base` crate).
+- `do-timestamp=true` kept — now on a declared-live source, GstBaseSrc stamps buffers
+  with `running_time` at capture, which is what the audiomixer expects.
+- `audiomixer.latency` removed — let it come from the latency query.
+- `attach_sequential_audio_pts` replaced with `attach_audio_duration_probe` (duration
+  setting only; no PTS rewrite).
+
+**Core probe result (`[audio-pts]` on first buffer, PID 65862, 2026-06-30):**
+
+```
+[audio-pts] 'yt-fc'     first buf: pts=Some(9)ms  running=Some(9)ms
+[audio-pts] 'yt-nature' first buf: pts=Some(12)ms running=Some(12)ms
+[audio-pts] 'cam-77'    first buf: pts=Some(10)ms running=Some(13)ms
+```
+
+`pts ≈ running_time` — live timestamping is working correctly.
+
+**Maintainer result (PID 65862, 2026-06-30):** Still bursting. Sources were unmuted
+from the start (scene config `muted = false`); no mute/unmute transition occurred.
+The live-source model with correct PTSes did not fix the burst.
+
+---
+
+## Attempt 9 — Sequential PTS anchored at do_ts − 50ms (2026-06-30)
+
+**Hypothesis:** With `audiomixer.latency=50ms`, the audiomixer's output window sits at
+`running_time − 50ms`. Buffers stamped at `running_time` (from `do-timestamp`) are
+always 50ms *ahead* of the window, filling the per-pad queue to `has_space` threshold
+and oscillating. Fix: anchor `start_pts = first_do_ts_pts − 50ms` so `PTS_N = start +
+N × dur` lands exactly on the audiomixer's current window.
+
+**Fix:**
+- `attach_audio_sequential_pts(src, id, AUDIOMIXER_LATENCY_NS)` — same per-buffer
+  duration + sequential PTS as Attempt 6, but anchored to `do_ts − 50ms`.
+- `AUDIOMIXER_LATENCY_NS = 50_000_000` constant shared between the audiomixer property
+  and the probe offset, ensuring they stay in sync.
+- `is-live=true` retained from Attempt 8.
+
+**Core probe result (`[audio-pts]` on first buffer, PID 71515, 2026-06-30):**
+
+```
+[audio-pts] 'yt-nature' anchor: do_ts=9ms  offset=50ms start=0ms
+[audio-pts] 'yt-fc'     anchor: do_ts=15ms offset=50ms start=0ms
+[audio-pts] 'cam-77'    anchor: do_ts=51ms offset=50ms start=1ms
+[audio-pts] 'dummy'     anchor: do_ts=2122ms offset=50ms start=2072ms
+```
+
+Note: yt-fc and yt-nature do_ts < 50ms at startup → `saturating_sub` clamps anchor
+to 0ms instead of −50ms. The intended offset had no effect for those two sources at
+startup (anchor = 0ms, not −(50ms - do_ts)).
+
+**Maintainer result (PID 71515, 2026-06-30):** Still bursting. Sources unmuted from
+start. Confirmed burst is not a mute-transition artifact.
+
+---
+
+## Diagnostic — mute/unmute not the cause (2026-06-30)
+
+Earlier sessions (PID 37075) suggested mute was the trigger: the mix-out probe showed
+10,789 clean buffers while yt-fc/yt-nature were muted, then gaps started the instant
+they were unmuted.
+
+Hypothesis: the mute/unmute transition itself was causing a chain flush or per-pad
+queue dump that set off the oscillation.
+
+**Test:** Run with `yt-fc` and `yt-nature` `muted = false` from launch (no UI toggle).
+**Result (PID 71515):** Burst begins immediately with no mute transition. The mute
+hypothesis is wrong. The burst is structural and present from the first audio output.
+
+The earlier correlation was a coincidence: unmuting was when the user first listened,
+not the cause of the burst.
+
+---
+
+## Current state and open questions for review chat
+
+**What has been exhausted:**
+- Adapter-side PTS rewrite (Attempt 4)
+- Core do-timestamp with various latency values (50ms, 200ms, from query)
+- Sequential PTS with and without latency offset
+- `is-live=true` on aunixfdsrc
+- All combinations of the above
+
+**What is still unknown:**
+1. **Is the audiomixer output gapping, or is the burst in PulseAudio?** The mix-out
+   probe was removed before Attempts 8-9. It confirmed gapping at the audiomixer in
+   earlier sessions, but has not been re-run with the current `is-live=true` setup.
+   Re-adding it would confirm whether the fix should target the upstream chain or the
+   downstream sink.
+
+2. **Buffer-size mismatch:** The adapter produces 4316-byte buffers (22.479ms at
+   S16LE 48kHz stereo). The audiomixer's aggregate window is 1024 samples = 21.333ms.
+   These rates drift by 1.146ms/buffer, causing the audiomixer to periodically ask for
+   a buffer that hasn't arrived yet. This is a structural rate mismatch that no PTS
+   offset can fully correct. `audiobuffersplit` downstream of `aresamp` (configured to
+   output 1024-sample chunks) would normalise the buffer size and eliminate the drift.
+
+3. **PulseAudio isolation:** Has not been tested. Replacing `autoaudiosink` with
+   `fakesink` (or an explicit `alsasink`) would determine if the burst is in the
+   GStreamer chain or in PulseAudio's ring buffer management.
+
+**Recommended next steps (for review chat):**
+
+A. **Re-add mix-out probe** to confirm audiomixer output is gapping under the
+   current `is-live=true` + sequential PTS setup. One session, read the log.
+   If gapping: the fix is in the chain (see B). If clean: the fix is in the sink (see C).
+
+B. **If audiomixer is gapping — try `audiobuffersplit`:** Add
+   `audiobuffersplit output-buffer-duration=21333333` (21.333ms = 1024 samples) to
+   the audio chain between `aresamp` and `alevel`. This re-chunks every source's
+   audio into exactly-1024-sample buffers, eliminating the 22.479ms vs 21.333ms
+   drift. Should be tried with `audiomixer.latency` removed (let the query decide).
+
+C. **If audiomixer output is clean — isolate PulseAudio:** Replace `autoaudiosink`
+   with `pulsesink` set to explicit `buffer-time` and `latency-time`, or try `alsasink`
+   directly, to rule out PulseAudio AGC / underrun-recovery behaviour as the burst cause.
+
+## Performance snapshot (session PID 31442, measured ~20 min in)

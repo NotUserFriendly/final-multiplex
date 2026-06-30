@@ -769,6 +769,38 @@ fn build_audio_chain(
 
     let sink = aconv.static_pad("sink").ok_or("aconv: no sink pad")?;
 
+    // Rate-limit audio delivery to real-time pace.  Without this, uridecodebin3
+    // decodes the HTTP audio stream faster than real-time, filling the Unix
+    // socket buffer with a burst.  The core's do-timestamp=true then stamps all
+    // burst buffers with ≈ the same running_time; audiomixer discards most of
+    // them → silence, then the next burst repeats — and worsens over time as the
+    // socket buffer grows.
+    //
+    // Probe is AFTER acaps (format forced to S16LE 48 kHz 2ch), so duration is
+    // exact from size without calling buf.duration() (avdec_aac leaves it unset).
+    // S16LE 48 kHz 2ch: 2 bytes × 2 channels × 48 000 Hz = 192 000 bytes/s.
+    {
+        let last = Arc::new(Mutex::new(Instant::now()));
+        let last_c = Arc::clone(&last);
+        let aunixfdsink_sink = aunixfdsink
+            .static_pad("sink")
+            .ok_or("aunixfdsink: no sink pad")?;
+        aunixfdsink_sink.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data {
+                let dur = Duration::from_nanos(buf.size() as u64 * 1_000_000_000 / 192_000);
+                let remaining = {
+                    let guard = last_c.lock().unwrap();
+                    dur.saturating_sub(guard.elapsed())
+                };
+                if !remaining.is_zero() {
+                    std::thread::sleep(remaining);
+                }
+                *last_c.lock().unwrap() = Instant::now();
+            }
+            gstreamer::PadProbeReturn::Ok
+        });
+    }
+
     eprintln!("[yt-adapter] audio chain ready → {shm_path}");
     Ok(Chain {
         sink,

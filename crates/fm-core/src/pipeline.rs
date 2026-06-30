@@ -376,10 +376,14 @@ impl Pipeline {
         let autoaudiosink: gstreamer::Element = gstreamer::ElementFactory::make("pulsesink")
             .name("autoaudiosink")
             .build()?;
-        // 200 ms ring buffer so PulseAudio can absorb scheduling jitter without
-        // triggering underrun-recovery.  buffer-time is in microseconds.
+        // 200 ms ring buffer for jitter headroom; buffer-time in microseconds.
         autoaudiosink.set_property("buffer-time", 200_000i64);
         autoaudiosink.set_property("latency-time", 10_000i64);
+        // slave-method=none: disable GStreamer clock-slave correction entirely.
+        // PulseAudio manages its own hardware clock; GStreamer pushes at the
+        // pipeline's natural delivery rate without trying to rate-correct against
+        // the net clock, avoiding the burst artifacts from skew/resample.
+        autoaudiosink.set_property_from_str("slave-method", "none");
 
         // ── Synthetic floor inputs (ADR-0018) ─────────────────────────────
         // A permanent silent audiotestsrc gives the audiomixer a heartbeat so

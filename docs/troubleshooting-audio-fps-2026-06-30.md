@@ -492,31 +492,60 @@ ring buffer to absorb jitter before triggering underrun recovery.
 
 ---
 
-## Diagnosis: burst is inside PulseAudio / pulsesink sync (2026-06-30)
+## Attempts 12-14 — clock-slave method sweep (2026-06-30)
 
-**What has been confirmed:**
-- Every element from `aunixfdsrc` through `audiomixer.src` is gapless (mix-out probe,
-  PID 78994).
-- 200ms PulseAudio ring buffer does not fix the burst.
-- The remaining suspect is the pulsesink → PulseAudio path.
+All three have `audiobuffersplit` in place. The GStreamer chain through `audiomixer.src`
+is confirmed gapless in all cases. The burst is entirely in the sink clock-slave layer.
 
-**Leading hypothesis — clock-rate mismatch:** pulsesink in `sync=true` mode
-presents each buffer at `running_time = PTS`. The pipeline clock is a
-`GstNetClientClock` (shared across all adapter processes for multi-process sync).
-PulseAudio uses the system audio hardware clock. If these two clocks run at slightly
-different rates (even 100 ppm = 0.01%), after ~60 seconds the offset is ~6ms; after a
-few minutes it reaches tens of ms. pulsesink periodically stalls or drops samples to
-re-align, which manifests as the burst/silence pattern.
+**Mechanism (confirmed):** The pipeline clock is `GstNetClientClock` (ADR-0005). The
+audio sink runs on the hardware clock. Every slave method produces a different
+artifact because none of them remove the root tension: the net clock that adapters
+sync to does not track the audio hardware clock.
 
-**Next step:** Set `sync=false` on pulsesink. Disables timestamp-based presentation;
-pulsesink plays audio at the rate the chain delivers it, ignoring buffer timestamps.
-Since the chain is confirmed gapless, this should produce sustained clean audio if
-clock-rate mismatch is the cause.
+| Attempt | Sink | slave-method | Maintainer result |
+|---|---|---|---|
+| 12 | pulsesink | resample | Still bursting — different cadence than skew (PID 82759, 2026-06-30) |
+| 13 | alsasink | resample | Mostly silent; single burst after several minutes (PID 84675, 2026-06-30) |
+| 14 | pulsesink | none | Burst:short silence:burst:long silence pattern (PID 87810, 2026-06-30) |
 
-If `sync=false` fixes the burst: the fix is a proper clock arrangement (e.g. let
-pulsesink provide the pipeline clock, or decouple audio timing from the net-clock).
+`resample` changed the burst cadence (confirmed clock-slave is the mechanism).
+`resample` on alsasink was near-silent — the initial net-clock vs ALSA-hardware-clock
+offset is large enough that the resample correction throttles playback almost to zero.
+`none` removes GStreamer-level correction but exposes PulseAudio's own buffer cycle
+directly, producing yet another burst cadence.
 
-If `sync=false` still bursts: the gap is inside PulseAudio itself (ring buffer
-management, PA AGC, module interference) and `alsasink` is the next isolation step.
+---
+
+## Root cause and recommended architectural fix (for review chat)
+
+The drift-free arrangement is to **make the audio hardware clock the pipeline master**:
+the core uses the sink's provided clock as the pipeline clock and serves *that* as
+the net time to adapters, instead of slaving the audio sink to a net clock that
+doesn't track the sound card. This is an ADR-0005 change.
+
+**Current arrangement (broken for audio):**
+```
+GstNetClientClock → pipeline clock
+                  → adapters sync to this
+                  → pulsesink slaved to this   ← TENSION: sound card ≠ net clock
+```
+
+**Drift-free arrangement:**
+```
+pulsesink.provide-clock=true → pipeline clock = sound-card clock
+GstNetTimeProvider serves sound-card clock to adapters
+pulsesink is its own master: no slave correction needed
+```
+
+**Caution:** Adapters run as separate OS processes and sync to the net clock for
+frame-accurate video compositor alignment. Switching the clock source to the
+sound card means adapters track the sound card instead. On one machine this is the
+same hardware clock; on a future multi-machine setup it needs careful design.
+Flag this for a new ADR before implementing — it supersedes part of ADR-0005.
+
+**Current code state:** `pulsesink slave-method=none buffer-time=200ms` with
+`audiobuffersplit` in the per-source chain and the `[mix-out]` diagnostic probe
+on `audiomixer.src`. The chain is correct; only the sink clock arrangement needs
+the architectural fix. Remove diagnostic probes before shipping.
 
 ## Performance snapshot (session PID 31442, measured ~20 min in)

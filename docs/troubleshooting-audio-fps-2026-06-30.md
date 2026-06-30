@@ -375,20 +375,79 @@ repeating every ~5 min). Same video offset bug. Both reconnects showed 60 total
 pipeline position after any reconnect.
 
 **yt-fc audio crunchiness (session 117487):** "yt-fc ran for a bit, got really
-crunchy, then died."  Crunch occurred at the URL-expiry EOS reconnect (~2.5 min
-into session).  Root cause: socket backlog → `ashm_q` skipping → ≈22× audio speed →
-crunchy → mix position overshoots PTS → silence.  Fix: 300 ms DROP probe on
-`aunixfdsrc.src` added to `add_audio_chain()`.
+crunchy, then died."  Crunch at the URL-expiry reconnect (~2.5 min).  Root cause at
+the time was believed to be socket backlog accumulation.  A 300 ms DROP probe on
+`aunixfdsrc.src` was added to `add_audio_chain()` to drain the backlog — session 122324
+showed this made things worse (see below).
 
 **yt-nature never produced sound (session 117487):** Likely overshadowed by yt-fc
-crunchiness occurring at the same time.  Same fix applies to yt-nature's chain at
-startup.
+crunchiness.
 
 **Next validation needed (maintainer):** Kill and relaunch.  Expect:
 - Both YouTube sources produce clean audio starting ≈300 ms after startup.
 - At URL-expiry reconnect (~10 min): ≈300 ms of silence from yt-fc, then clean
   audio resumes.  Log shows `[reconnect-pts] 'yt-fc' PTS correction +Xs applied`
   and yt-fc video tile continues (no freeze).
+
+---
+
+## Session 122324 — drop probe findings (2026-06-30)
+
+**Maintainer report:** "Crunch, to good audio, to crunch, to stutter, to silence.
+All inside of a minute."
+
+**Session log:** URL expiry EOS at pipeline time 4:43.  Log confirms clean video
+and `GstAudioClock` as pipeline master throughout.  After the reconnect:
+```
+[reconnect-pts] 'yt-fc' first_pts=0ns  pipeline_running=0:04:43.102140685
+[reconnect-pts] 'yt-fc' PTS correction +283.102s applied
+[offset-canary] WARN 'yt-fc' expected 0ms got 285624ms (deviation 285624ms)
+... 19 more WARN lines all showing ~285 000 ms ...
+```
+
+**Finding 1 — Drop probe is useless at reconnect.**  `spawn_reconnect_thread()`
+tears down `uridecodebin` (`set_state(Null)`) which unlinks its dynamic audio pad
+from `aconv`.  The `aunixfdsink` chain (`aconv → aresamp → acaps → aunixfdsink`) is
+REUSED — same elements, same socket path, rate-limit probe intact.  No data flows to
+the socket during re-resolve because the audio pad is unlinked.  yt-dlp resolution
+takes 1–3 s, well past the 300 ms drain window.  The probe always expires before the
+first fresh buffer arrives.  Zero buffers are ever dropped at reconnect by the probe.
+
+**Finding 2 — Drop probe causes simultaneous onset of ALL sources at startup.**
+All 5 audio chains go through `add_audio_chain()` and get the 300 ms probe.  With
+RTSP and file sources that have no backlog, the probe just adds 300 ms of unnecessary
+silence.  All sources then start simultaneously at T+300 ms (vs. natural staggered
+onset without the probe), which may produce a worse audible artifact.
+
+**Finding 3 — reconnect-pts correction is not taking effect.**  The canary shows
+≈285 000 ms skew on ALL 20 samples even though `+283 s` was applied to
+`vcaps_src`.  `voff_q` is a delay buffer (`max-size-time = ceiling_ns`, up to 30 s for
+YouTube sources).  In the time between the first frame ENTERING voff_q (where `vcaps_src`
+writes it with offset=0) and the first frame EXITING voff_q (where the reconnect-pts
+probe fires and applies the correction), many additional source_PTS≈0 frames have
+already entered voff_q — all with the wrong (uncorrected) PTS.  These 20+ frames
+constitute all 20 canary samples.  The correct fix: apply the skew correction
+**at chain-build time**, before any frame enters voff_q.  At build time,
+`self.inner.current_running_time()` gives the pipeline clock (source_PTS at reconnect
+is always ≈ 0), so the correction can be pre-computed directly.
+
+**Finding 4 — Socket backlog theory is wrong.**  The adapter writes NO audio during
+re-resolve (pad unlinked).  There is no significant socket backlog at reconnect.
+The crunchiness source is still unconfirmed.
+
+**Action taken:** Reverted the drop probe.  Committed.
+
+**Proposed next steps:**
+
+1. Fix `reconnect-pts` to apply correction at **chain-build time** (query
+   `current_running_time()` in `add_video_chain()` and call `vcaps_src.set_offset()`
+   immediately, before `voff_q` starts accumulating frames).  Remove the one-shot
+   probe on `voff_src` — it fires too late.
+
+2. Add PTS-interval diagnostic probe on `abuffersplit.src` to log actual audiomixer
+   input timing.  Log: per-buffer PTS, inter-buffer wall-clock interval (should be
+   ≈21 ms), and a WARN on intervals < 10 ms or > 100 ms.  This will show whether the
+   crunchiness is rapid-burst PTSes, gaps, or something else entirely.
 
 ---
 

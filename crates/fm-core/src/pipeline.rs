@@ -1268,35 +1268,6 @@ impl Pipeline {
 
         let aunixfdsrc = make_audio_transport_src(&format!("aunixfdsrc_{source_id}"), &audio_sock)?;
 
-        // Drop the first 300 ms of output from aunixfdsrc.
-        //
-        // At reconnect the adapter keeps writing audio while the core has no
-        // reader, saturating the socket buffer with stale data.  When the new
-        // chain starts, aunixfdsrc reads the entire backlog in a few
-        // milliseconds.  do-timestamp stamps every buffer with clock.time()≈now,
-        // so 100+ buffers get PTS values spread over only ~100 ms.  ashm_q
-        // (max=20, leaky=downstream) then skips through the backlog delivering
-        // one buffer out of every ~22, giving audiobuffersplit chunks whose
-        // content jumps 460 ms per 21 ms of wall-clock = ≈22× crunch.
-        //
-        // The adapter writes at 21 ms/buffer; the drop reads at ~0.05 ms/buffer,
-        // so the socket drains in < 15 ms.  The remaining 285 ms of the window
-        // drops the stale writes the adapter made while the drain was happening.
-        // After the probe removes itself only fresh buffers enter the chain.
-        {
-            let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
-            aunixfdsrc
-                .static_pad("src")
-                .ok_or("aunixfdsrc: no src pad")?
-                .add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
-                    if std::time::Instant::now() < drain_until {
-                        gstreamer::PadProbeReturn::Drop
-                    } else {
-                        gstreamer::PadProbeReturn::Remove
-                    }
-                });
-        }
-
         let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
         ashmcaps.set_property(
             "caps",

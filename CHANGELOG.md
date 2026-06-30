@@ -52,20 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fm-youtube-adapter` audio silence — segment timing and burst (prior attempt, superseded):**
   Previous entry described the throttle probe and seek approach; the above entry is the
   definitive fix.
-- **YouTube audio crunchiness after URL-expiry reconnect:** At reconnect the
-  adapter keeps writing rate-limited audio while the core has no reader, saturating
-  the socket buffer with stale data.  When the new chain starts, `aunixfdsrc` reads
-  the entire backlog in milliseconds; `do-timestamp` stamps every buffer with
-  `clock.time()≈now`, so 100+ backlog buffers span only ~100 ms of PTS.  `ashm_q`
-  (max=20, leaky=downstream) then skips through the backlog — handing `audiobuffersplit`
-  one buffer out of every ~22 — producing audio chunks whose content jumps 460 ms per
-  21 ms of wall-clock (≈22× speed) → crunch, then silence when the mix position
-  overshoots real-time PTS.  Fix: a one-shot 300 ms DROP probe on `aunixfdsrc.src`
-  drains the socket in < 15 ms (adapter writes at 21 ms/buffer, drop reads at
-  0.05 ms/buffer) and then discards the stale writes the adapter queued during the
-  drain.  After the probe removes itself only fresh buffers enter the chain.  Applies
-  on every `add_audio_chain()` call (initial build and reconnect); the 300 ms
-  silence from a YouTube source is imperceptible when other sources remain active.
 - **YouTube source video freeze after URL expiry reconnect:** When a YouTube live-stream URL
   expires, the adapter re-resolves and reconnects; the new segment starts at `source_pts≈0`
   while the pipeline's running time has already advanced by minutes.  `vcaps_src.set_offset()`

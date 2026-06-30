@@ -337,6 +337,50 @@ Exactly the current output window. The 3 stale per-pad buffers are discarded in
 
 ---
 
+## Attempt 15 — session PID 107629 observations (2026-06-30)
+
+**Session uptime:** 73+ min at time of analysis.
+
+**Audio result:** Initial burst at startup, then long period of clean audio — major
+improvement over all prior attempts. Clock switch confirmed in log:
+`[net-clock] pulsesink clock: GstAudioClock — forcing as pipeline master`.
+
+**yt-fc audio silence:** At pipeline time 9:27, the YouTube URL expired.
+`[yt-adapter] EOS — re-resolving for fresh URL` triggered. Audio was silent for the
+re-resolve duration (~2–10 s), then resumed. Maintainer reported "yt-fc audio
+completely died" — this was the URL-expiry silence, not an audio pipeline bug.
+After reconnect, `do-timestamp=true` ensures audio PTS ≈ current running_time → audio
+resumes correctly.
+
+**yt-nature crackling after mute/unmute:** Maintainer muted then unmuted yt-nature
+around the same time as the yt-fc reconnect. The mute→unmute amplitude step produces
+an audible click (instant level change from 0 → live audio); this is expected GStreamer
+behaviour with `set_property("mute", …)`. The subsequent silence was most likely the
+transient disruption from the yt-fc audiomixer pad release+add during the reconnect,
+which briefly disturbed the other pads. Session continued normally afterwards.
+
+**Video bug found:** After each URL-expiry reconnect, `first_pts=0` while pipeline
+running time was 569 s (first reconnect) and 854 s (second reconnect). The
+`reconnect-pts` probe only logged this; `vcaps_src.set_offset()` was never updated.
+yt-fc video frames arrived 9–14 minutes in the past and were displayed at wrong time or
+dropped. Fix: probe now applies `set_offset(initial_offset + skew)` when
+`|skew| > 500 ms` (commit below).
+
+**Second reconnect:** yt-fc reconnected again at pipeline time 14:14 (URL expiry
+repeating every ~5 min). Same video offset bug. Both reconnects showed 60 total
+`[offset-canary] WARN` lines (20 samples × 3 reconnects).
+
+**Fix committed:** `reconnect-pts` probe updated to call
+`vcaps_src.set_offset(initial_offset + correction)` so video resumes at current
+pipeline position after any reconnect.
+
+**Next validation needed (maintainer):** Kill session, rebuild, start again. After the
+YouTube adapter reconnects (wait ~10 min), confirm the yt-fc tile continues displaying
+video (no freeze/blank tile). Log should show
+`[reconnect-pts] 'yt-fc' PTS correction +Xs applied`. Audio clean for the full session.
+
+---
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)
 
 ```

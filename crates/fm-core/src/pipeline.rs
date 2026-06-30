@@ -1137,12 +1137,19 @@ impl Pipeline {
         let voff_src = voff_q.static_pad("src").ok_or("voff_q: no src")?;
         voff_src.link(&comp_sink)?;
 
-        // One-shot probe: log first PTS vs pipeline running time so PTS gaps at
-        // reconnect are visible in the session log.
+        // One-shot probe: correct PTS skew after URL-expiry reconnects.
+        // YouTube re-resolves start a new segment at source_pts≈0 while the
+        // pipeline's running time has already advanced by minutes.  The probe
+        // detects that gap and resets vcaps_src's offset so the video resumes
+        // at the current pipeline position.  At initial startup both pts and
+        // running_time are near zero so the correction is below the threshold
+        // and is skipped.
         {
             let pipeline_weak = self.inner.downgrade();
             let sid = source_id.to_string();
             let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let vcaps_src_clone = vcaps_src.clone();
+            let initial_offset = layout.offset_ns;
             voff_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
                 if !done.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     if let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data {
@@ -1154,6 +1161,18 @@ impl Pipeline {
                                 buf.pts(),
                                 running
                             );
+                            if let (Some(run), Some(pts)) = (running, buf.pts()) {
+                                let correction = run.nseconds() as i64 - pts.nseconds() as i64;
+                                // > 500 ms in either direction = real reconnect skew
+                                if correction.abs() > 500_000_000 {
+                                    vcaps_src_clone.set_offset(initial_offset + correction);
+                                    eprintln!(
+                                        "[reconnect-pts] '{}' PTS correction {:+.3}s applied",
+                                        sid,
+                                        correction as f64 / 1e9,
+                                    );
+                                }
+                            }
                         }
                     }
                 }

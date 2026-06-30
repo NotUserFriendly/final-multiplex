@@ -52,6 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fm-youtube-adapter` audio silence — segment timing and burst (prior attempt, superseded):**
   Previous entry described the throttle probe and seek approach; the above entry is the
   definitive fix.
+- **YouTube source video freeze after URL expiry reconnect:** When a YouTube live-stream URL
+  expires, the adapter re-resolves and reconnects; the new segment starts at `source_pts≈0`
+  while the pipeline's running time has already advanced by minutes.  `vcaps_src.set_offset()`
+  was set only at chain-build time (the configured user offset) and never updated on reconnect.
+  Fix: the `reconnect-pts` one-shot probe (on `voff_src`) now detects when
+  `|pipeline_running_time − first_pts| > 500 ms`, computes the skew, and updates
+  `vcaps_src.set_offset(initial_offset + skew)` so all subsequent frames land at the correct
+  pipeline position.  The fix applies to positive and negative skew (handles the general case
+  where the new stream resumes at a non-zero PTS too).
 - **`fm-youtube-adapter` HTTP burst — wall-clock throttle probe on `vconv.sink`:**
   `uridecodebin3` decodes HTTP progressive MP4 streams 10–21× faster than real-time,
   burning 300fps+ of CPU per YouTube source and starving other compositor sources (observed:

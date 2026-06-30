@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`fm-youtube-adapter` HTTP burst — wall-clock throttle probe on `vconv.sink`:**
+  `uridecodebin3` decodes HTTP progressive MP4 streams 10–21× faster than real-time,
+  burning 300fps+ of CPU per YouTube source and starving other compositor sources (observed:
+  file source tanks to 14fps at 24fps expected with two YouTube sources running at burst).
+  `identity sync=true` cannot fix this: non-live GStreamer pipelines never anchor
+  `segment.base` to the pipeline running_time, so identity releases all frames instantly.
+  Fix: install a `BUFFER` pad probe on `vconv.sink` that sleeps in the GStreamer streaming
+  thread using `std::thread::sleep`, tracking wall-clock time since the last frame with an
+  `Arc<Mutex<Instant>>`.  Sleeping in the streaming thread creates direct backpressure: the
+  decoder and HTTP download cannot advance until the probe returns.  Frame interval is
+  `1000 / configured_fps` ms, passed via the existing `--framerate` supervisor argument.
+  Works for short (4:38) and long (3h+) sources; the `uridecodebin3` seek-to-zero on
+  reconnect (black-tile fix, kept) resets demuxer position for clean loops.
+- **`fm-youtube-adapter` EOS handler missing MAX_RECONNECTS guard:** the GStreamer Error
+  handler correctly exits after `MAX_RECONNECTS` attempts, but the EOS handler had no such
+  check — it reconnected indefinitely (logged as `#9/8`, `#10/8`…).  A short video decoded
+  at burst speed (e.g. 4:38 video consumed in ~13 s) would EOS-cycle continuously, stressing
+  the pipeline and causing visible frame-rate instability across all compositor sources.
+  EOS handler now mirrors the Error handler: emits `Error` and exits on `count > MAX_RECONNECTS`.
 - **Ratchet runaway on burst sources (YouTube HTTP + file loop):** two independent burst
   paths drove the output ratchet above any real source rate.  (1) `uridecodebin3` decodes
   YouTube progressive MP4s 10–13× faster than real-time, producing 300–500 fps readings at

@@ -153,6 +153,11 @@ fn main() {
         .get("base-time")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let configured_fps: u64 = args
+        .get("framerate")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+        .max(1);
 
     let pipeline = gstreamer::Pipeline::new();
     let uridecodebin = make("uridecodebin3", "uridecodebin");
@@ -187,6 +192,7 @@ fn main() {
         let audio_shm_c = audio_shm.clone();
         let source_frames_c = Arc::clone(&source_frames);
         let output_frames_c = Arc::clone(&output_frames);
+        let configured_fps_c = configured_fps;
 
         uridecodebin.connect("pad-added", false, move |args| {
             let pad = args[1].get::<gstreamer::Pad>().unwrap();
@@ -221,6 +227,7 @@ fn main() {
                         &video_shm_c,
                         Arc::clone(&source_frames_c),
                         Arc::clone(&output_frames_c),
+                        configured_fps_c,
                     ) {
                         Ok(chain) => {
                             if let Err(e) = pad.link(&chain.sink) {
@@ -372,6 +379,14 @@ fn main() {
                     }
 
                     let count = reconnect_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count > MAX_RECONNECTS as u64 {
+                        reconnecting.store(false, Ordering::Release);
+                        let desc = "max reconnects reached (EOS)".to_string();
+                        eprintln!("[yt-adapter] {desc}");
+                        emit(AdapterMessage::Error { description: desc });
+                        let _ = pipeline.set_state(gstreamer::State::Null);
+                        return;
+                    }
                     emit(AdapterMessage::Reconnecting {
                         attempt: count as u32,
                     });
@@ -445,12 +460,10 @@ fn main() {
                             s.audio_chain.as_ref().map_or(false, |c| c.sink.is_linked());
                         let current = (has_video, has_audio);
                         if Some(current) != s.last_reported_caps {
-                            // Seek to position 0 before notifying the core so that
-                            // when the core rebuilds its chain, frames start at PTS=0.
-                            // Without this, the HTTP burst leaves the demuxer at the
-                            // burst offset (e.g. 1:34:35 after 8 min of session);
-                            // those frames have PTS >> compositor running_time and
-                            // the compositor renders the tile black.
+                            // Seek to byte 0 before notifying the core.  HTTP burst
+                            // leaves the demuxer at the burst offset (e.g. 1:34:35
+                            // after 8 min); frames after reconnect would have
+                            // PTS >> compositor running_time → black tile.
                             let _ = uridecodebin.seek_simple(
                                 gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
                                 gstreamer::ClockTime::ZERO,
@@ -669,6 +682,7 @@ fn build_video_chain(
     shm_path: &str,
     source_counter: Arc<AtomicU64>,
     output_counter: Arc<AtomicU64>,
+    configured_fps: u64,
 ) -> Result<Chain, Box<dyn std::error::Error + Send + Sync>> {
     let vconv = make("videoconvert", "vconv");
     let vdeint = make("deinterlace", "vdeint");
@@ -692,8 +706,32 @@ fn build_video_chain(
     }
 
     let sink_pad = vconv.static_pad("sink").ok_or("vconv: no sink pad")?;
+
+    // Throttle HTTP burst by sleeping in the GStreamer streaming-thread probe.
+    // uridecodebin3 decodes progressive MP4 at 10-21× real-time; sleeping here
+    // blocks the streaming thread, creating backpressure that propagates upstream
+    // through the decoder to the HTTP download and limits throughput to ~fps.
+    // GStreamer's identity(sync=true) cannot do this for HTTP sources because
+    // non-live pipelines never anchor segment.base to the pipeline running_time,
+    // so all frame running_times are "in the past" and identity releases them
+    // instantly regardless of the clock.
+    let frame_interval = Duration::from_millis(1000 / configured_fps);
+    let last_frame = std::sync::Arc::new(std::sync::Mutex::new(
+        Instant::now()
+            .checked_sub(frame_interval)
+            .unwrap_or_else(Instant::now),
+    ));
+    let last_frame_c = std::sync::Arc::clone(&last_frame);
     sink_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
         source_counter.fetch_add(1, Ordering::Relaxed);
+        let remaining = {
+            let last = last_frame_c.lock().unwrap();
+            frame_interval.saturating_sub(last.elapsed())
+        };
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
+        *last_frame_c.lock().unwrap() = Instant::now();
         gstreamer::PadProbeReturn::Ok
     });
 

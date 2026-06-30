@@ -554,24 +554,36 @@ over 15 min) was event-loop pressure and thermal, not a memory-backed leak.
 ## YouTube audio silence + file source slow (6-source scene, 2026-06-29)
 
 **Symptom:** yt-fc and yt-nature produce no audio even when unmuted.  fnaf2 (H.264 1920×960
-24fps) runs slowly (14fps observed) instead of its native rate.
+24fps) runs slowly (14–16fps observed) instead of its native rate.
 
-**Root cause — audio burst (same mechanism as video burst):**
-`uridecodebin3` decodes the audio track at full speed just like video.  The entire audio
-track (4:38 for yt-fc) arrives at the core in seconds.  The core's `aqueue`
-(`max-size-buffers=4, leaky=downstream`) drops almost all of it, keeping only the 4 most
-recent chunks.  The audiomixer receives audio from near the end of the clip and waits the
-full playback duration for its presentation time → silence.  Audio burst also loaded the
-core's `aconv`/`aresamp`/`alevel` chain, contributing to CPU contention alongside the
-video burst.
+**Root cause — three cooperating failures:**
 
-**Video burst root cause (same pattern):** same streaming-thread sleep approach used for
-video throttle, but applied to `aconv.sink` with per-buffer duration rather than fixed fps.
+1. **Audio probe not sleeping:** First fix placed the probe on `aconv.sink` and used
+   `buffer.duration()` to compute the sleep.  `avdec_aac` leaves that field unset
+   (`GST_CLOCK_TIME_NONE`), so every probe call returned `None` and skipped the sleep
+   entirely.  Audio still burst at full speed.  Confirmed by maintainer:
+   "Both items aren't working" (audio still silent, fnaf2 still ~16fps).
 
-**Fix (CC, 2026-06-29):** added a `BUFFER` pad probe on `aconv.sink` in
-`build_audio_chain` that reads `buffer.duration()` and sleeps that long.  Audio now flows
-at real-time.  Side effect: with both video and audio throttled, ratchet stays at 30fps
-(configured grid fps) instead of locking at ~36fps.
+2. **Segment timing mismatch at startup:** Even with correct throttling, `uridecodebin3`
+   starts a segment with `base=0`, so PTS=0 frames from the adapter arrive at the core
+   with `running_time=0`.  By the time the core starts playing the pipeline is already
+   at `T_startup` (several seconds in).  The audiomixer sees running_time=0 as late
+   and drops the entire clip → silence.  The compositor tolerates this (it doesn't drop
+   late video frames; it just displays them when they arrive), which is why video works
+   but audio doesn't.
 
-**Awaiting maintainer validation:** audio audible when unmuted; fnaf2 at ~24fps with
-6-source scene running.
+3. **Reconnect seek gated on caps change:** The seek that re-anchors `segment.base` after
+   EOS only fired when caps changed.  yt-fc loops with identical video+audio caps every
+   4:38, so no seek → audio goes silent again after the first loop.
+
+**Final fix (CC, 2026-06-29 — commit 96ce048):**
+- Probe moved to `aunixfdsink.sink` where format is fixed S16LE 48 kHz 2ch.
+  Duration computed as `buf.size() / 192000` (exact; no metadata dependency).
+- `Command::Play` handler issues `seek_simple(FLUSH|KEY_UNIT, 0)` on the first Play
+  only (`play_seek_done` flag prevents firing on Pause→Play cycles).  This sets
+  `segment.base = T_play`, mapping PTS=0 to `running_time ≈ T_play`.
+- Reconnect seek in `post_reconnect_check_at` made unconditional; `StreamsChanged`
+  still only emitted on caps change.
+
+**Awaiting maintainer validation:** audio audible when unmuted from both YouTube sources;
+fnaf2 approaching ~24fps with 6-source scene running.

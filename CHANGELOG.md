@@ -7,16 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **`fm-youtube-adapter` audio silence and audio-burst CPU load:** YouTube audio decoded
-  at full speed (same `uridecodebin3` HTTP burst as video); the entire audio track arrived
-  at the core in seconds.  The core's `aqueue` (`max-size-buffers=4, leaky=downstream`)
-  dropped most of it, leaving the audiomixer with only audio near the end of the clip →
-  silence for the whole playback.  Audio burst also loaded the core's `aconv`/`aresamp`/
-  `alevel` chain at burst rate, stealing CPU from the file source.  Fix: add a `BUFFER` pad
-  probe on `aconv.sink` in `build_audio_chain` that reads each buffer's duration and sleeps
-  that long, throttling the audio streaming thread to real-time.  Side effect: with both
-  audio and video throttled to 30fps, the ratchet now stays at the configured grid fps
-  (30fps) instead of locking at ~36fps from video-only throttle overhead.
+- **`fm-youtube-adapter` audio silence — segment timing and burst (revised):** Previous fix
+  used `b.duration()` to throttle audio, but `avdec_aac` leaves that field unset
+  (`GST_CLOCK_TIME_NONE`), so every probe call skipped the sleep and audio still burst.
+  Two additional root causes identified: (1) even with throttling, PTS=0 audio frames arrive
+  at the core at `running_time=0` while the pipeline is already at `T_startup` — the
+  audiomixer drops them as late for the entire clip; (2) the reconnect seek that re-anchors
+  `segment.base` only fired on caps changes, so yt-fc (same caps each EOS loop) went silent
+  again after the first 4:38.  Fixes: (a) probe moved to `aunixfdsink.sink` where format is
+  guaranteed S16LE 48 kHz 2ch; duration computed from `buf.size() / 192000` (exact, no
+  metadata needed); (b) startup seek issued on first `Command::Play` to set
+  `segment.base = T_play`, mapping PTS=0 to `running_time ≈ T_play`; (c) reconnect seek
+  now unconditional — fires on every EOS loop regardless of caps change.
 - **`fm-youtube-adapter` HTTP burst — wall-clock throttle probe on `vconv.sink`:**
   `uridecodebin3` decodes HTTP progressive MP4 streams 10–21× faster than real-time,
   burning 300fps+ of CPU per YouTube source and starving other compositor sources (observed:

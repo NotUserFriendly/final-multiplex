@@ -177,6 +177,7 @@ fn main() {
         ready_sent: false,
         post_reconnect_check_at: None,
         last_reported_caps: None,
+        play_seek_done: false,
     }));
 
     let reconnect_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -299,6 +300,29 @@ fn main() {
                 Command::Play => {
                     eprintln!("[yt-adapter] Play");
                     let _ = pipeline.set_state(gstreamer::State::Playing);
+                    // On the very first Play (startup), seek to position 0 so the
+                    // new segment carries base = current_running_time.  This maps
+                    // PTS=0 frames to running_time ≈ T_play, making them "on time"
+                    // at the core's audiomixer (which otherwise sees running_time=0
+                    // as late and drops all audio for the whole clip).
+                    // Skipped on subsequent Play calls (Pause → Play cycles) so the
+                    // user doesn't jump back to the start when unpausing.
+                    let should_seek = {
+                        let mut s = shared.lock().unwrap();
+                        if !s.play_seek_done {
+                            s.play_seek_done = true;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_seek {
+                        let _ = uridecodebin.seek_simple(
+                            gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+                            gstreamer::ClockTime::ZERO,
+                        );
+                        eprintln!("[yt-adapter] startup seek: anchored segment.base to T_play");
+                    }
                     ingest_state = IngestState::Running;
                 }
                 Command::Pause => {
@@ -459,15 +483,15 @@ fn main() {
                         let has_audio =
                             s.audio_chain.as_ref().map_or(false, |c| c.sink.is_linked());
                         let current = (has_video, has_audio);
+                        // Always seek on reconnect: anchors segment.base to the
+                        // current running_time so PTS=0 audio arrives at the core
+                        // as "on time" after every EOS loop, not just on caps changes.
+                        // Also resets the demuxer position after HTTP burst (black tile fix).
+                        let _ = uridecodebin.seek_simple(
+                            gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+                            gstreamer::ClockTime::ZERO,
+                        );
                         if Some(current) != s.last_reported_caps {
-                            // Seek to byte 0 before notifying the core.  HTTP burst
-                            // leaves the demuxer at the burst offset (e.g. 1:34:35
-                            // after 8 min); frames after reconnect would have
-                            // PTS >> compositor running_time → black tile.
-                            let _ = uridecodebin.seek_simple(
-                                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
-                                gstreamer::ClockTime::ZERO,
-                            );
                             eprintln!(
                                 "[yt-adapter] StreamsChanged (video={has_video} audio={has_audio})"
                             );
@@ -668,6 +692,9 @@ struct Shared {
     /// window for StreamsChanged.  Reset by pad-added (extends window on pads).
     post_reconnect_check_at: Option<Instant>,
     last_reported_caps: Option<(bool, bool)>,
+    /// True after the first Command::Play seek has been issued.  Prevents the
+    /// startup seek from firing again on Pause → Play cycles.
+    play_seek_done: bool,
 }
 
 struct Chain {
@@ -777,19 +804,20 @@ fn build_audio_chain(
 
     let sink = aconv.static_pad("sink").ok_or("aconv: no sink pad")?;
 
-    // Throttle audio burst using the same streaming-thread sleep strategy as video.
-    // Each audio buffer carries its own duration; sleep that long so the audio
-    // streaming thread advances at real-time pace and keeps audio/video in sync.
-    // Without this, the entire audio track bursts to the core in seconds; the
-    // core's leaky aqueue drops most buffers and the audiomixer renders silence.
-    let last_audio = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
-    let last_audio_c = std::sync::Arc::clone(&last_audio);
-    sink.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
-        let buf_dur = info
-            .buffer()
-            .and_then(|b| b.duration())
-            .map(|d| Duration::from_nanos(d.nseconds()));
-        if let Some(dur) = buf_dur {
+    // Throttle audio burst: sleep in the streaming-thread probe on aunixfdsink.sink.
+    // The probe is placed AFTER acaps (which forces S16LE 48 kHz 2ch), so the format
+    // is known and duration can be derived exactly from buffer size without calling
+    // b.duration() — avdec_aac leaves that field unset (GST_CLOCK_TIME_NONE), which
+    // would silently skip the sleep and let the entire clip burst in seconds.
+    // S16LE 48 kHz 2ch: 2 bytes × 2 channels × 48 000 Hz = 192 000 bytes/s.
+    let last_audio = Arc::new(Mutex::new(Instant::now()));
+    let last_audio_c = Arc::clone(&last_audio);
+    let aunixfdsink_sink = aunixfdsink
+        .static_pad("sink")
+        .ok_or("aunixfdsink: no sink pad")?;
+    aunixfdsink_sink.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        if let Some(buf) = info.buffer() {
+            let dur = Duration::from_nanos(buf.size() as u64 * 1_000_000_000 / 192_000);
             let remaining = {
                 let last = last_audio_c.lock().unwrap();
                 dur.saturating_sub(last.elapsed())
@@ -797,8 +825,8 @@ fn build_audio_chain(
             if !remaining.is_zero() {
                 std::thread::sleep(remaining);
             }
+            *last_audio_c.lock().unwrap() = Instant::now();
         }
-        *last_audio_c.lock().unwrap() = Instant::now();
         gstreamer::PadProbeReturn::Ok
     });
 

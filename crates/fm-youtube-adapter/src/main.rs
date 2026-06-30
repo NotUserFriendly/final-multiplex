@@ -776,6 +776,32 @@ fn build_audio_chain(
     }
 
     let sink = aconv.static_pad("sink").ok_or("aconv: no sink pad")?;
+
+    // Throttle audio burst using the same streaming-thread sleep strategy as video.
+    // Each audio buffer carries its own duration; sleep that long so the audio
+    // streaming thread advances at real-time pace and keeps audio/video in sync.
+    // Without this, the entire audio track bursts to the core in seconds; the
+    // core's leaky aqueue drops most buffers and the audiomixer renders silence.
+    let last_audio = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+    let last_audio_c = std::sync::Arc::clone(&last_audio);
+    sink.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+        let buf_dur = info
+            .buffer()
+            .and_then(|b| b.duration())
+            .map(|d| Duration::from_nanos(d.nseconds()));
+        if let Some(dur) = buf_dur {
+            let remaining = {
+                let last = last_audio_c.lock().unwrap();
+                dur.saturating_sub(last.elapsed())
+            };
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
+        }
+        *last_audio_c.lock().unwrap() = Instant::now();
+        gstreamer::PadProbeReturn::Ok
+    });
+
     eprintln!("[yt-adapter] audio chain ready → {shm_path}");
     Ok(Chain {
         sink,

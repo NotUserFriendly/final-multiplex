@@ -550,3 +550,28 @@ RSS is flat and non-monotone (oscillates ±95 MB around ~8 410 MB).  No climb.
 over 15 min) was event-loop pressure and thermal, not a memory-backed leak.
 
 ---
+
+## YouTube audio silence + file source slow (6-source scene, 2026-06-29)
+
+**Symptom:** yt-fc and yt-nature produce no audio even when unmuted.  fnaf2 (H.264 1920×960
+24fps) runs slowly (14fps observed) instead of its native rate.
+
+**Root cause — audio burst (same mechanism as video burst):**
+`uridecodebin3` decodes the audio track at full speed just like video.  The entire audio
+track (4:38 for yt-fc) arrives at the core in seconds.  The core's `aqueue`
+(`max-size-buffers=4, leaky=downstream`) drops almost all of it, keeping only the 4 most
+recent chunks.  The audiomixer receives audio from near the end of the clip and waits the
+full playback duration for its presentation time → silence.  Audio burst also loaded the
+core's `aconv`/`aresamp`/`alevel` chain, contributing to CPU contention alongside the
+video burst.
+
+**Video burst root cause (same pattern):** same streaming-thread sleep approach used for
+video throttle, but applied to `aconv.sink` with per-buffer duration rather than fixed fps.
+
+**Fix (CC, 2026-06-29):** added a `BUFFER` pad probe on `aconv.sink` in
+`build_audio_chain` that reads `buffer.duration()` and sleeps that long.  Audio now flows
+at real-time.  Side effect: with both video and audio throttled, ratchet stays at 30fps
+(configured grid fps) instead of locking at ~36fps.
+
+**Awaiting maintainer validation:** audio audible when unmuted; fnaf2 at ~24fps with
+6-source scene running.

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`fm-youtube-adapter` audio silence and audio-burst CPU load:** YouTube audio decoded
+  at full speed (same `uridecodebin3` HTTP burst as video); the entire audio track arrived
+  at the core in seconds.  The core's `aqueue` (`max-size-buffers=4, leaky=downstream`)
+  dropped most of it, leaving the audiomixer with only audio near the end of the clip →
+  silence for the whole playback.  Audio burst also loaded the core's `aconv`/`aresamp`/
+  `alevel` chain at burst rate, stealing CPU from the file source.  Fix: add a `BUFFER` pad
+  probe on `aconv.sink` in `build_audio_chain` that reads each buffer's duration and sleeps
+  that long, throttling the audio streaming thread to real-time.  Side effect: with both
+  audio and video throttled to 30fps, the ratchet now stays at the configured grid fps
+  (30fps) instead of locking at ~36fps from video-only throttle overhead.
 - **`fm-youtube-adapter` HTTP burst — wall-clock throttle probe on `vconv.sink`:**
   `uridecodebin3` decodes HTTP progressive MP4 streams 10–21× faster than real-time,
   burning 300fps+ of CPU per YouTube source and starving other compositor sources (observed:

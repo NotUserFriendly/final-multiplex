@@ -126,10 +126,9 @@ fn probe_streams(uri: &str) -> (bool, bool) {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-// Must match the `audiomixer.latency` property and the offset subtracted in
-// attach_audio_sequential_pts.  Buffer PTSes are anchored to
-// first_do_timestamp_pts − AUDIOMIXER_LATENCY_NS so they land on the
-// audiomixer's output window (running_time − latency) exactly.
+// 50 ms arrival-jitter budget for the audiomixer.  audiobuffersplit normalises
+// buffer sizes so the per-pad queue fills uniformly; this value does not need
+// to match any PTS anchor computation.
 const AUDIOMIXER_LATENCY_NS: u64 = 50_000_000; // 50 ms
 
 fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
@@ -175,59 +174,6 @@ fn make_audio_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::
     Ok(src)
 }
 
-/// Sequential PTS + duration probe for `aunixfdsrc.src`.
-///
-/// `do-timestamp` gives every buffer PTS = `running_time_at_read`.  With
-/// `audiomixer.latency = L`, the audiomixer's output window sits at
-/// `running_time − L`, so a buffer stamped at `running_time` is always L ms
-/// *ahead* of the window — filling the per-pad queue until `has_space` blocks
-/// the chain and causing the burst/silence cycle.
-///
-/// Fix: anchor `start_pts = first_do_ts_pts − L` and advance sequentially:
-/// `PTS_N = start_pts + N × dur`.  Each buffer arrives exactly at the
-/// audiomixer's current output window.  `buf.duration` is also set from
-/// byte-count so `has_space` counts queued time correctly.
-///
-/// `latency_offset_ns` must equal the `audiomixer.latency` property value.
-#[cfg(target_os = "linux")]
-fn attach_audio_sequential_pts(src: &gstreamer::Element, source_id: &str, latency_offset_ns: u64) {
-    let Some(src_pad) = src.static_pad("src") else {
-        return;
-    };
-    let sid = source_id.to_string();
-    let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let start_pts: std::sync::Arc<std::sync::Mutex<Option<u64>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
-        let Some(gstreamer::PadProbeData::Buffer(ref mut buf)) = info.data else {
-            return gstreamer::PadProbeReturn::Ok;
-        };
-        let buf = buf.make_mut();
-        // S16LE 48 kHz stereo → 4 bytes/frame, 192000 bytes/s
-        let dur_ns = buf.size() as u64 * 1_000_000_000 / 192_000;
-        buf.set_duration(gstreamer::ClockTime::from_nseconds(dur_ns));
-        let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut sp = start_pts.lock().unwrap();
-        if sp.is_none() {
-            if let Some(pts) = buf.pts() {
-                let anchor = pts.nseconds().saturating_sub(latency_offset_ns);
-                eprintln!(
-                    "[audio-pts] '{}' anchor: do_ts={}ms offset={}ms start={}ms",
-                    sid,
-                    pts.nseconds() / 1_000_000,
-                    latency_offset_ns / 1_000_000,
-                    anchor / 1_000_000,
-                );
-                *sp = Some(anchor);
-            }
-        }
-        if let Some(start) = *sp {
-            buf.set_pts(gstreamer::ClockTime::from_nseconds(start + n * dur_ns));
-        }
-        gstreamer::PadProbeReturn::Ok
-    });
-}
-
 /// Source-side pad references for a single source.
 ///
 /// `gst_pad_set_offset` only works reliably on **source** pads, so we store
@@ -243,7 +189,7 @@ pub struct SourcePads {
     /// quality without the tile-res crop imposed by ADR-0012.
     /// None when the source has no video stream.
     pub pre_scale_video_src: Option<gstreamer::Pad>,
-    /// `acaps_{id}:src` — the source pad feeding `audiomixer:sink_N`.
+    /// `abuffersplit_{id}:src` — the source pad feeding `audiomixer:sink_N`.
     /// None when the source has no audio stream.
     pub audio_src: Option<gstreamer::Pad>,
 }
@@ -418,10 +364,8 @@ impl Pipeline {
         let audiomixer: gstreamer::Element = gstreamer::ElementFactory::make("audiomixer")
             .name("audiomixer")
             .build()?;
-        // 50 ms latency so GstAggregator waits up to 50 ms for each live input.
-        // attach_audio_sequential_pts subtracts this same 50 ms from start_pts so
-        // buffer PTSes land exactly on the audiomixer's output window (running_time − 50 ms),
-        // preventing the per-pad queue from filling up and blocking the chain.
+        // 50 ms arrival-jitter budget; audiobuffersplit normalises buffer sizes
+        // so the per-pad queue fills smoothly without needing a matching PTS offset.
         audiomixer.set_property("latency", AUDIOMIXER_LATENCY_NS);
         let aconv_out: gstreamer::Element = gstreamer::ElementFactory::make("audioconvert")
             .name("aconv_out")
@@ -429,9 +373,13 @@ impl Pipeline {
         let aresamp_out: gstreamer::Element = gstreamer::ElementFactory::make("audioresample")
             .name("aresamp_out")
             .build()?;
-        let autoaudiosink: gstreamer::Element = gstreamer::ElementFactory::make("autoaudiosink")
+        let autoaudiosink: gstreamer::Element = gstreamer::ElementFactory::make("pulsesink")
             .name("autoaudiosink")
             .build()?;
+        // 200 ms ring buffer so PulseAudio can absorb scheduling jitter without
+        // triggering underrun-recovery.  buffer-time is in microseconds.
+        autoaudiosink.set_property("buffer-time", 200_000i64);
+        autoaudiosink.set_property("latency-time", 10_000i64);
 
         // ── Synthetic floor inputs (ADR-0018) ─────────────────────────────
         // A permanent silent audiotestsrc gives the audiomixer a heartbeat so
@@ -502,6 +450,47 @@ impl Pipeline {
         compositor.link(&comp_capsfilter)?;
         comp_capsfilter.link(&appsink)?;
         gstreamer::Element::link_many([&audiomixer, &aconv_out, &aresamp_out, &autoaudiosink])?;
+
+        // [mix-out] gap probe: logs when audiomixer output has a gap > 50 ms.
+        // Confirms whether burst is upstream (audiomixer gapping) or downstream (PulseAudio).
+        // Remove before shipping.
+        {
+            let src_pad = audiomixer
+                .static_pad("src")
+                .ok_or("audiomixer: no src pad")?;
+            let last_pts: std::sync::Arc<std::sync::Mutex<Option<u64>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+                let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data else {
+                    return gstreamer::PadProbeReturn::Ok;
+                };
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(pts) = buf.pts() else {
+                    return gstreamer::PadProbeReturn::Ok;
+                };
+                let pts_ns = pts.nseconds();
+                let mut last = last_pts.lock().unwrap();
+                if let Some(prev) = *last {
+                    let dur = buf.duration().map(|d| d.nseconds()).unwrap_or(0);
+                    let expected = prev + dur;
+                    let gap_ns = pts_ns.saturating_sub(expected);
+                    if gap_ns > 50_000_000 {
+                        eprintln!(
+                            "[mix-out] buf#{n} GAP {}ms (pts={}ms prev={}ms dur={}ms)",
+                            gap_ns / 1_000_000,
+                            pts_ns / 1_000_000,
+                            prev / 1_000_000,
+                            dur / 1_000_000
+                        );
+                    } else if n % 500 == 0 {
+                        eprintln!("[mix-out] buf#{n} ok pts={}ms", pts_ns / 1_000_000);
+                    }
+                }
+                *last = Some(pts_ns);
+                gstreamer::PadProbeReturn::Ok
+            });
+        }
 
         // Wire audio floor: silence_src → silence_caps → audiomixer(volume=0)
         gstreamer::Element::link_many([&silence_src, &silence_caps])?;
@@ -729,22 +718,31 @@ impl Pipeline {
                         .build(),
                 );
 
-                pipeline.add_many([&aconv, &aresamp, &alevel, &acaps])?;
-                gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
+                let abuffersplit: gstreamer::Element =
+                    gstreamer::ElementFactory::make("audiobuffersplit")
+                        .name(format!("abuffersplit_{}", source.id))
+                        .build()?;
+                // 1024 samples × 4 bytes (S16LE stereo) = 4096 bytes per output buffer.
+                abuffersplit.set_property("output-buffer-size", 4096u32);
+
+                pipeline.add_many([&aconv, &aresamp, &alevel, &acaps, &abuffersplit])?;
+                gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps, &abuffersplit])?;
 
                 let mix_sink = audiomixer
                     .request_pad_simple("sink_%u")
                     .ok_or("could not request audiomixer sink pad")?;
 
-                let as_ = acaps.static_pad("src").ok_or("acaps: no src pad")?;
-                as_.set_offset(offset_ns);
-                as_.link(&mix_sink)?;
+                let abs_src = abuffersplit
+                    .static_pad("src")
+                    .ok_or("abuffersplit: no src pad")?;
+                abs_src.set_offset(offset_ns);
+                abs_src.link(&mix_sink)?;
                 mix_sink.set_property("volume", source.volume);
                 mix_sink.set_property("mute", source.muted);
                 mixer_sink_pads.insert(source.id.clone(), mix_sink);
 
                 aconv_sink_for_cb = Some(aconv.static_pad("sink").ok_or("aconv: no sink pad")?);
-                acaps_src = Some(as_);
+                acaps_src = Some(abs_src);
             }
 
             source_pads.insert(
@@ -870,7 +868,6 @@ impl Pipeline {
 
                         pipeline.add_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
                         gstreamer::Element::link_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
-                        attach_audio_sequential_pts(&aunixfdsrc, &source.id, AUDIOMIXER_LATENCY_NS);
                         if let Some(ref aconv_sink) = aconv_sink_for_cb {
                             aqueue
                                 .static_pad("src")
@@ -1326,6 +1323,9 @@ impl Pipeline {
                 .field("channels", 2i32)
                 .build(),
         );
+        let abuffersplit = make("audiobuffersplit", &format!("abuffersplit_{source_id}"))?;
+        // 1024 samples × 4 bytes (S16LE stereo) = 4096 bytes per output buffer.
+        abuffersplit.set_property("output-buffer-size", 4096u32);
 
         self.inner.add_many([
             &aunixfdsrc,
@@ -1335,9 +1335,10 @@ impl Pipeline {
             &aresamp,
             &alevel,
             &acaps,
+            &abuffersplit,
         ])?;
         gstreamer::Element::link_many([&aunixfdsrc, &ashmcaps, &aqueue])?;
-        gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps])?;
+        gstreamer::Element::link_many([&aconv, &aresamp, &alevel, &acaps, &abuffersplit])?;
         aqueue
             .static_pad("src")
             .ok_or("ashm_q: no src")?
@@ -1351,13 +1352,13 @@ impl Pipeline {
             .request_pad_simple("sink_%u")
             .ok_or("audiomixer: no sink pad")?;
 
-        let acaps_src = acaps.static_pad("src").ok_or("acaps: no src")?;
-        acaps_src.set_offset(layout.offset_ns);
-        acaps_src.link(&mix_sink)?;
+        let abs_src = abuffersplit
+            .static_pad("src")
+            .ok_or("abuffersplit: no src")?;
+        abs_src.set_offset(layout.offset_ns);
+        abs_src.link(&mix_sink)?;
         mix_sink.set_property("volume", layout.volume);
         mix_sink.set_property("mute", layout.muted);
-
-        attach_audio_sequential_pts(&aunixfdsrc, source_id, AUDIOMIXER_LATENCY_NS);
 
         for elem in [
             &aunixfdsrc,
@@ -1367,6 +1368,7 @@ impl Pipeline {
             &aresamp,
             &alevel,
             &acaps,
+            &abuffersplit,
         ] {
             let state_result = elem.sync_state_with_parent();
             eprintln!(
@@ -1386,7 +1388,7 @@ impl Pipeline {
                 pre_scale_video_src: None,
                 audio_src: None,
             })
-            .audio_src = Some(acaps_src);
+            .audio_src = Some(abs_src);
         Ok(())
     }
 
@@ -1417,6 +1419,7 @@ impl Pipeline {
             format!("aresamp_{source_id}"),
             format!("alevel_{source_id}"),
             format!("acaps_{source_id}"),
+            format!("abuffersplit_{source_id}"),
         ] {
             if let Some(elem) = self.inner.by_name(&name) {
                 let _ = elem.set_state(gstreamer::State::Null);

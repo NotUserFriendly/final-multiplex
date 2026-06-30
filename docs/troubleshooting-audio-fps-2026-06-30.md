@@ -443,47 +443,80 @@ not the cause of the burst.
 
 ---
 
-## Current state and open questions for review chat
+---
 
-**What has been exhausted:**
-- Adapter-side PTS rewrite (Attempt 4)
-- Core do-timestamp with various latency values (50ms, 200ms, from query)
-- Sequential PTS with and without latency offset
-- `is-live=true` on aunixfdsrc
-- All combinations of the above
+## Attempt 10 — audiobuffersplit: re-chunk to 1024-sample buffers (2026-06-30)
 
-**What is still unknown:**
-1. **Is the audiomixer output gapping, or is the burst in PulseAudio?** The mix-out
-   probe was removed before Attempts 8-9. It confirmed gapping at the audiomixer in
-   earlier sessions, but has not been re-run with the current `is-live=true` setup.
-   Re-adding it would confirm whether the fix should target the upstream chain or the
-   downstream sink.
+**Root cause from TaskBlock-audio-buffersplit-fix.md:** `attach_audio_sequential_pts`
+computed `PTS_N = start + N × dur_N` using *this buffer's* duration. For variable-size
+buffers (post-AAC-decode resample yields non-uniform chunks, not always 1024 samples),
+each buffer's PTS is placed at `N × dur_N` rather than `Σ(dur_0…dur_{N-1})`. Error
+accumulates per buffer, placing windows at wrong offsets → audiomixer sees timeline
+gaps → burst/silence.
 
-2. **Buffer-size mismatch:** The adapter produces 4316-byte buffers (22.479ms at
-   S16LE 48kHz stereo). The audiomixer's aggregate window is 1024 samples = 21.333ms.
-   These rates drift by 1.146ms/buffer, causing the audiomixer to periodically ask for
-   a buffer that hasn't arrived yet. This is a structural rate mismatch that no PTS
-   offset can fully correct. `audiobuffersplit` downstream of `aresamp` (configured to
-   output 1024-sample chunks) would normalise the buffer size and eliminate the drift.
+**Fix:** Insert `audiobuffersplit output-buffer-size=4096` (1024 samples × 4 bytes
+S16LE stereo) after `acaps` in every per-source audio chain. Removes sequential probe
+entirely. `audiobuffersplit` accumulates exact sample counts and outputs uniform
+1024-sample chunks with correctly accumulated PTSes.
 
-3. **PulseAudio isolation:** Has not been tested. Replacing `autoaudiosink` with
-   `fakesink` (or an explicit `alsasink`) would determine if the burst is in the
-   GStreamer chain or in PulseAudio's ring buffer management.
+**Property discovery note:** `GstAudioBufferSplit` (GStreamer 1.28.2) exposes
+`output-buffer-duration` (GstFraction) and `output-buffer-size` (bytes). There is
+**no** `output-buffer-samples` property — using it panics at runtime.
+`output-buffer-size = 4096` is the correct approach for S16LE stereo.
 
-**Recommended next steps (for review chat):**
+**Mix-out probe result (PID 78994, 2026-06-30):**
 
-A. **Re-add mix-out probe** to confirm audiomixer output is gapping under the
-   current `is-live=true` + sequential PTS setup. One session, read the log.
-   If gapping: the fix is in the chain (see B). If clean: the fix is in the sink (see C).
+```
+[mix-out] buf#500  ok pts=5000ms
+[mix-out] buf#1000 ok pts=10000ms
+```
 
-B. **If audiomixer is gapping — try `audiobuffersplit`:** Add
-   `audiobuffersplit output-buffer-duration=21333333` (21.333ms = 1024 samples) to
-   the audio chain between `aresamp` and `alevel`. This re-chunks every source's
-   audio into exactly-1024-sample buffers, eliminating the 22.479ms vs 21.333ms
-   drift. Should be tried with `audiomixer.latency` removed (let the query decide).
+**Zero gap lines across 10+ seconds of playback.** The audiomixer output is completely
+clean. audiobuffersplit solved the upstream chain issue.
 
-C. **If audiomixer output is clean — isolate PulseAudio:** Replace `autoaudiosink`
-   with `pulsesink` set to explicit `buffer-time` and `latency-time`, or try `alsasink`
-   directly, to rule out PulseAudio AGC / underrun-recovery behaviour as the burst cause.
+**Maintainer result (PID 78994, 2026-06-30):** Still bursting. The GStreamer chain
+through the audiomixer is gapless; the burst is downstream, inside PulseAudio.
+
+---
+
+## Attempt 11 — pulsesink with explicit buffer-time=200ms (2026-06-30)
+
+**Hypothesis:** `autoaudiosink` lets PulseAudio choose its own ring-buffer geometry,
+which may be undersized for this pipeline's scheduling jitter. An explicit `pulsesink`
+with `buffer-time=200000` (200ms) and `latency-time=10000` gives PulseAudio 200ms of
+ring buffer to absorb jitter before triggering underrun recovery.
+
+**Fix:** Replace `autoaudiosink` with `pulsesink buffer-time=200000 latency-time=10000`.
+
+**Maintainer result (PID 80134, 2026-06-30):** Still bursting.
+
+---
+
+## Diagnosis: burst is inside PulseAudio / pulsesink sync (2026-06-30)
+
+**What has been confirmed:**
+- Every element from `aunixfdsrc` through `audiomixer.src` is gapless (mix-out probe,
+  PID 78994).
+- 200ms PulseAudio ring buffer does not fix the burst.
+- The remaining suspect is the pulsesink → PulseAudio path.
+
+**Leading hypothesis — clock-rate mismatch:** pulsesink in `sync=true` mode
+presents each buffer at `running_time = PTS`. The pipeline clock is a
+`GstNetClientClock` (shared across all adapter processes for multi-process sync).
+PulseAudio uses the system audio hardware clock. If these two clocks run at slightly
+different rates (even 100 ppm = 0.01%), after ~60 seconds the offset is ~6ms; after a
+few minutes it reaches tens of ms. pulsesink periodically stalls or drops samples to
+re-align, which manifests as the burst/silence pattern.
+
+**Next step:** Set `sync=false` on pulsesink. Disables timestamp-based presentation;
+pulsesink plays audio at the rate the chain delivers it, ignoring buffer timestamps.
+Since the chain is confirmed gapless, this should produce sustained clean audio if
+clock-rate mismatch is the cause.
+
+If `sync=false` fixes the burst: the fix is a proper clock arrangement (e.g. let
+pulsesink provide the pipeline clock, or decouple audio timing from the net-clock).
+
+If `sync=false` still bursts: the gap is inside PulseAudio itself (ring buffer
+management, PA AGC, module interference) and `alsasink` is the next isolation step.
 
 ## Performance snapshot (session PID 31442, measured ~20 min in)

@@ -1,6 +1,6 @@
 # 0005. Out-of-process source adapters, synchronized via a network clock
 
-- **Status:** Accepted
+- **Status:** Accepted (pipeline-clock-source choice extended by ADR-0027)
 - **Date:** 2026-06-21
 
 ## Context

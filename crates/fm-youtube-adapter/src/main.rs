@@ -769,59 +769,6 @@ fn build_audio_chain(
 
     let sink = aconv.static_pad("sink").ok_or("aconv: no sink pad")?;
 
-    // Throttle audio burst: sleep in the streaming-thread probe on aunixfdsink.sink.
-    // The probe is placed AFTER acaps (which forces S16LE 48 kHz 2ch), so the format
-    // is known and duration can be derived exactly from buffer size without calling
-    // b.duration() — avdec_aac leaves that field unset (GST_CLOCK_TIME_NONE), which
-    // would silently skip the sleep and let the entire clip burst in seconds.
-    // S16LE 48 kHz 2ch: 2 bytes × 2 channels × 48 000 Hz = 192 000 bytes/s.
-    let last_audio = Arc::new(Mutex::new(Instant::now()));
-    let last_audio_c = Arc::clone(&last_audio);
-    let aunixfdsink_sink = aunixfdsink
-        .static_pad("sink")
-        .ok_or("aunixfdsink: no sink pad")?;
-    let pipeline_c = pipeline.clone();
-    let buf_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let buf_seq_c = Arc::clone(&buf_seq);
-    aunixfdsink_sink.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
-        if let Some(gstreamer::PadProbeData::Buffer(ref mut buf)) = info.data {
-            let dur = Duration::from_nanos(buf.size() as u64 * 1_000_000_000 / 192_000);
-            let (remaining, gap) = {
-                let last = last_audio_c.lock().unwrap();
-                let elapsed = last.elapsed();
-                (dur.saturating_sub(elapsed), elapsed)
-            };
-            // Log any inter-buffer gap > 50 ms (source stall) and the first buffer.
-            let n = buf_seq_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n == 0 || gap > Duration::from_millis(50) {
-                eprintln!(
-                    "[yt-audio-probe] buf#{n} size={} gap={:?}{}",
-                    buf.size(),
-                    gap,
-                    if n == 0 {
-                        " (first)"
-                    } else {
-                        " ← SOURCE GAP"
-                    }
-                );
-            }
-            if !remaining.is_zero() {
-                std::thread::sleep(remaining);
-            }
-            *last_audio_c.lock().unwrap() = Instant::now();
-            // Stamp with adapter's current running_time so the core's audiomixer
-            // sees a correctly-timed buffer.  Adapter and core share the same
-            // master clock and base_time (via --base-time), so adapter
-            // running_time == core running_time at any given instant.
-            // This bypasses the unreliable segment-event path across the
-            // unixfd process boundary.
-            if let Some(rt) = pipeline_c.current_running_time() {
-                buf.make_mut().set_pts(rt);
-            }
-        }
-        gstreamer::PadProbeReturn::Ok
-    });
-
     eprintln!("[yt-adapter] audio chain ready → {shm_path}");
     Ok(Chain {
         sink,

@@ -2,6 +2,7 @@ use crate::bridge::{self, FrameData};
 use crate::gpu_path::{self, GpuFrameStore, TimedFrame};
 use crate::video::{GpuRectProg, VideoProg};
 use fm_adapter_sdk::metrics::SourceMetrics;
+use gstreamer::prelude::{ElementExt, ObjectExt as GstObjectExt};
 use iced::widget::{button, column, container, row, shader, stack, text, text_input};
 use iced::{Background, Color, Element, Length, Subscription, Task};
 #[cfg(target_os = "linux")]
@@ -47,6 +48,11 @@ pub struct App {
     metrics: Option<fm_core::metrics::MetricsCollector>,
     /// Out-of-process adapter supervisor (Phase 2). None if no external sources.
     supervisor: Option<fm_core::supervisor::Supervisor>,
+    /// Net-time provider — kept alive for the session so adapters can re-sync.
+    /// Switched to the audio hardware clock after the pipeline reaches PLAYING
+    /// (ADR-0027).  None if there are no external sources.
+    #[allow(dead_code)]
+    net_clock: Option<fm_core::net_clock::NetClock>,
     frame_store: bridge::FrameStore,
     current_frame: Option<Arc<FrameData>>,
     frame_gen: u64,
@@ -156,6 +162,7 @@ impl App {
                     win_h: 720.0,
                     error: Some(e.to_string()),
                     supervisor: None,
+                    net_clock: None,
                     config_persist: None,
                     last_offset_change: None,
 
@@ -1109,7 +1116,7 @@ fn try_init(
     // Spawn adapters at the full grid resolution (ADR-0012 core-owned resize).
     // The adapter produces at prod_res; the core's vshmcaps → vscale → vcaps
     // chain downscales to tile dimensions inside the compositor pipeline.
-    let (supervisor, external_ids) = if has_external {
+    let (supervisor, external_ids, mut net_clock) = if has_external {
         let net = fm_core::net_clock::NetClock::new()?;
         let mut sup = fm_core::supervisor::Supervisor::new();
         sup.set_delivery_watchdog_ms(scene.grid.delivery_watchdog_ms);
@@ -1167,9 +1174,9 @@ fn try_init(
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        (Some(sup), ids)
+        (Some(sup), ids, Some(net))
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), None)
     };
 
     // Collect has_video/has_audio per external source from the Ready messages
@@ -1262,6 +1269,31 @@ fn try_init(
         );
     }
 
+    // Switch the net-time provider to the audio hardware clock (ADR-0027).
+    // pulsesink provides the pipeline clock (audio sinks rank highest in GStreamer
+    // clock selection); re-binding the NetTimeProvider to that clock means adapters'
+    // NetClientClock now tracks the sound card instead of the system clock,
+    // eliminating the rate-difference that caused the burst/silence pattern.
+    // Fallback: if no pipeline clock is available (headless / no audio device),
+    // the system-clock provider created in NetClock::new() was already dropped
+    // at this point — the new provider is created on the same port.
+    if let Some(ref mut net) = net_clock {
+        match transport.pipeline().inner().clock() {
+            Some(clock) => {
+                eprintln!(
+                    "[net-clock] pipeline clock type after PLAYING: {}",
+                    clock.type_().name()
+                );
+                if let Err(e) = net.switch_to_clock(&clock) {
+                    eprintln!("[net-clock] WARNING: clock switch failed: {e}; adapters on system clock extrapolation");
+                }
+            }
+            None => {
+                eprintln!("[net-clock] no pipeline clock after PLAYING; adapters keep system clock extrapolation");
+            }
+        }
+    }
+
     // Pipeline is confirmed PLAYING; safe to tell adapters to start streaming.
     let supervisor = if let Some(mut sup) = supervisor {
         sup.send_play_all();
@@ -1278,6 +1310,7 @@ fn try_init(
         transport: Some(transport),
         metrics: Some(metrics),
         supervisor,
+        net_clock,
         frame_store,
         current_frame: None,
         frame_gen: 0,

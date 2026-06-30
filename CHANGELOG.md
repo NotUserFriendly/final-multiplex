@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **YouTube audio burst/silence — root cause: net-clock ≠ audio hardware clock (ADR-0027):**
+  `audiobuffersplit` made the GStreamer chain through `audiomixer.src` gap-free, localising the
+  burst to the audio sink's clock-slave layer.  A `slave-method` sweep (`skew`, `resample`,
+  `none`, on both `pulsesink` and `alsasink`) only changed the burst cadence — none fixed it,
+  because no slave method removes the fundamental rate tension between `GstNetClientClock` (the
+  former pipeline master) and the sound-card hardware clock.  Fix: make the audio hardware clock
+  the pipeline master.  After the pipeline reaches PLAYING, `fm-app` reads the pipeline clock
+  (auto-selected by GStreamer from `pulsesink`'s provided clock), switches the
+  `GstNetTimeProvider` to serve that clock, and keeps the provider alive for the session so
+  adapters can continuously re-sync to the sound-card rate.  The sink workarounds (`slave-method`,
+  `buffer-time`, `latency-time`) are removed — `pulsesink` is now clock master, not slave.
+  `audiobuffersplit` in each per-source chain is retained (it is the correct, independent fix for
+  variable-buffer-size timeline errors and is unrelated to the clock arrangement).  Diagnostic
+  probes (`[mix-out]` in `fm-core`, `[yt-audio-probe]` in `fm-youtube-adapter`) removed.
 - **YouTube audio silence — root cause: PTS=0 buffers dropped by audiomixer (third attempt):**
+  Previous fixes (throttle probe, startup seek, reconnect seek) were all in the wrong layer.
+  `unixfdsink`/`unixfdsrc` transfer raw buffer PTS values only — segment events with the
+  adjusted `segment.base` never cross the process boundary.  So PTS=0 audio always arrived
+  at the core with `running_time=0`, which audiomixer (latency=0) drops as late when the
+  pipeline is already at `T_startup`.  `alevel` is upstream of audiomixer, explaining why
+  audio meters showed activity while no sound was heard.  Fix: `aunixfdsrc` elements in
+  `fm-core` for audio chains now use `do-timestamp=true`, replacing the adapter's PTS with
+  the current pipeline clock arrival time.  Since the audio throttle probe ensures delivery
+  at real-time pace, arrival time ≈ current running_time → audiomixer accepts the buffers.
+- **yt-fc audio cycling (add/remove audio chain loop):** The reconnect seek PTS=0 buffers dropped by audiomixer (third attempt):**
   Previous fixes (throttle probe, startup seek, reconnect seek) were all in the wrong layer.
   `unixfdsink`/`unixfdsrc` transfer raw buffer PTS values only — segment events with the
   adjusted `segment.base` never cross the process boundary.  So PTS=0 audio always arrived

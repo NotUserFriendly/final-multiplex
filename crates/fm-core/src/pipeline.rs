@@ -376,14 +376,6 @@ impl Pipeline {
         let autoaudiosink: gstreamer::Element = gstreamer::ElementFactory::make("pulsesink")
             .name("autoaudiosink")
             .build()?;
-        // 200 ms ring buffer for jitter headroom; buffer-time in microseconds.
-        autoaudiosink.set_property("buffer-time", 200_000i64);
-        autoaudiosink.set_property("latency-time", 10_000i64);
-        // slave-method=none: disable GStreamer clock-slave correction entirely.
-        // PulseAudio manages its own hardware clock; GStreamer pushes at the
-        // pipeline's natural delivery rate without trying to rate-correct against
-        // the net clock, avoiding the burst artifacts from skew/resample.
-        autoaudiosink.set_property_from_str("slave-method", "none");
 
         // ── Synthetic floor inputs (ADR-0018) ─────────────────────────────
         // A permanent silent audiotestsrc gives the audiomixer a heartbeat so
@@ -454,47 +446,6 @@ impl Pipeline {
         compositor.link(&comp_capsfilter)?;
         comp_capsfilter.link(&appsink)?;
         gstreamer::Element::link_many([&audiomixer, &aconv_out, &aresamp_out, &autoaudiosink])?;
-
-        // [mix-out] gap probe: logs when audiomixer output has a gap > 50 ms.
-        // Confirms whether burst is upstream (audiomixer gapping) or downstream (PulseAudio).
-        // Remove before shipping.
-        {
-            let src_pad = audiomixer
-                .static_pad("src")
-                .ok_or("audiomixer: no src pad")?;
-            let last_pts: std::sync::Arc<std::sync::Mutex<Option<u64>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
-            let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            src_pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
-                let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data else {
-                    return gstreamer::PadProbeReturn::Ok;
-                };
-                let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(pts) = buf.pts() else {
-                    return gstreamer::PadProbeReturn::Ok;
-                };
-                let pts_ns = pts.nseconds();
-                let mut last = last_pts.lock().unwrap();
-                if let Some(prev) = *last {
-                    let dur = buf.duration().map(|d| d.nseconds()).unwrap_or(0);
-                    let expected = prev + dur;
-                    let gap_ns = pts_ns.saturating_sub(expected);
-                    if gap_ns > 50_000_000 {
-                        eprintln!(
-                            "[mix-out] buf#{n} GAP {}ms (pts={}ms prev={}ms dur={}ms)",
-                            gap_ns / 1_000_000,
-                            pts_ns / 1_000_000,
-                            prev / 1_000_000,
-                            dur / 1_000_000
-                        );
-                    } else if n % 500 == 0 {
-                        eprintln!("[mix-out] buf#{n} ok pts={}ms", pts_ns / 1_000_000);
-                    }
-                }
-                *last = Some(pts_ns);
-                gstreamer::PadProbeReturn::Ok
-            });
-        }
 
         // Wire audio floor: silence_src → silence_caps → audiomixer(volume=0)
         gstreamer::Element::link_many([&silence_src, &silence_caps])?;

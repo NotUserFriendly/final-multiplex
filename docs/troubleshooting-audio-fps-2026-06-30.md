@@ -543,9 +543,32 @@ sound card means adapters track the sound card instead. On one machine this is t
 same hardware clock; on a future multi-machine setup it needs careful design.
 Flag this for a new ADR before implementing — it supersedes part of ADR-0005.
 
-**Current code state:** `pulsesink slave-method=none buffer-time=200ms` with
-`audiobuffersplit` in the per-source chain and the `[mix-out]` diagnostic probe
-on `audiomixer.src`. The chain is correct; only the sink clock arrangement needs
-the architectural fix. Remove diagnostic probes before shipping.
+**ADR-0027 authored 2026-06-30.** Implementation below (Attempt 15).
+
+---
+
+## Attempt 15 — audio hardware clock as pipeline master (ADR-0027, 2026-06-30)
+
+**Implementation:**
+- `NetClock::switch_to_clock()` added: after pipeline reaches PLAYING, `fm-app` reads
+  `transport.pipeline().inner().clock()` (the auto-selected GStreamer pipeline clock —
+  pulsesink's provided clock when audio is present) and re-binds the `GstNetTimeProvider`
+  to that clock on the same UDP port. Provider is kept alive in `App.net_clock` for
+  continuous adapter re-sync.
+- `pulsesink` restored to clean defaults: `slave-method`, `buffer-time`, `latency-time`
+  overrides removed. Sink is now clock master — no slave correction needed.
+- `audiobuffersplit` retained in all per-source chains (correct, independent fix).
+- Diagnostic probes removed: `[mix-out]` from `pipeline.rs`, `[yt-audio-probe]` from
+  `fm-youtube-adapter/src/main.rs`.
+- ADR-0005 status line updated with one-line forward pointer to ADR-0027.
+
+**Validation needed (maintainer):**
+1. Audio: clean sound from both YouTube sources, several minutes, across a reconnect.
+   No burst, no cycling. Log `[net-clock] switched to audio hardware clock on UDP :PORT`
+   and `[net-clock] pipeline clock type after PLAYING: GstPulseSinkClock` (or similar)
+   should appear in the session log.
+2. Video alignment: sources align at offset 0; offsets still settable; compositor and
+   GPU paths unchanged. Alignment is the regression risk — adapters now ride the audio
+   clock instead of the system clock.
 
 ## Performance snapshot (session PID 31442, measured ~20 min in)

@@ -7,18 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **`fm-youtube-adapter` audio silence — segment timing and burst (revised):** Previous fix
-  used `b.duration()` to throttle audio, but `avdec_aac` leaves that field unset
-  (`GST_CLOCK_TIME_NONE`), so every probe call skipped the sleep and audio still burst.
-  Two additional root causes identified: (1) even with throttling, PTS=0 audio frames arrive
-  at the core at `running_time=0` while the pipeline is already at `T_startup` — the
-  audiomixer drops them as late for the entire clip; (2) the reconnect seek that re-anchors
-  `segment.base` only fired on caps changes, so yt-fc (same caps each EOS loop) went silent
-  again after the first 4:38.  Fixes: (a) probe moved to `aunixfdsink.sink` where format is
-  guaranteed S16LE 48 kHz 2ch; duration computed from `buf.size() / 192000` (exact, no
-  metadata needed); (b) startup seek issued on first `Command::Play` to set
-  `segment.base = T_play`, mapping PTS=0 to `running_time ≈ T_play`; (c) reconnect seek
-  now unconditional — fires on every EOS loop regardless of caps change.
+- **YouTube audio silence — root cause: PTS=0 buffers dropped by audiomixer (third attempt):**
+  Previous fixes (throttle probe, startup seek, reconnect seek) were all in the wrong layer.
+  `unixfdsink`/`unixfdsrc` transfer raw buffer PTS values only — segment events with the
+  adjusted `segment.base` never cross the process boundary.  So PTS=0 audio always arrived
+  at the core with `running_time=0`, which audiomixer (latency=0) drops as late when the
+  pipeline is already at `T_startup`.  `alevel` is upstream of audiomixer, explaining why
+  audio meters showed activity while no sound was heard.  Fix: `aunixfdsrc` elements in
+  `fm-core` for audio chains now use `do-timestamp=true`, replacing the adapter's PTS with
+  the current pipeline clock arrival time.  Since the audio throttle probe ensures delivery
+  at real-time pace, arrival time ≈ current running_time → audiomixer accepts the buffers.
+- **yt-fc audio cycling (add/remove audio chain loop):** The reconnect seek
+  (`seek_simple(FLUSH|KEY_UNIT, ZERO)` on `uridecodebin3`) was firing after each
+  successful reconnect.  A FLUSH seek on an HTTP-backed source triggers an EOS bus message,
+  which called `spawn_reconnect_thread` again, which emitted `StreamsChanged(false,false)`,
+  which tore down the just-added audio chain — then the cycle repeated.  The seeks were
+  predicated on fixing the PTS issue in the adapter (where they had no effect anyway since
+  the boundary doesn't transmit segments); now that the core fixes timing with
+  `do-timestamp=true`, both the startup seek and the reconnect seek are removed entirely.
+- **`fm-youtube-adapter` audio silence — segment timing and burst (prior attempt, superseded):**
+  Previous entry described the throttle probe and seek approach; the above entry is the
+  definitive fix.
 - **`fm-youtube-adapter` HTTP burst — wall-clock throttle probe on `vconv.sink`:**
   `uridecodebin3` decodes HTTP progressive MP4 streams 10–21× faster than real-time,
   burning 300fps+ of CPU per YouTube source and starving other compositor sources (observed:

@@ -177,7 +177,6 @@ fn main() {
         ready_sent: false,
         post_reconnect_check_at: None,
         last_reported_caps: None,
-        play_seek_done: false,
     }));
 
     let reconnect_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -300,29 +299,6 @@ fn main() {
                 Command::Play => {
                     eprintln!("[yt-adapter] Play");
                     let _ = pipeline.set_state(gstreamer::State::Playing);
-                    // On the very first Play (startup), seek to position 0 so the
-                    // new segment carries base = current_running_time.  This maps
-                    // PTS=0 frames to running_time ≈ T_play, making them "on time"
-                    // at the core's audiomixer (which otherwise sees running_time=0
-                    // as late and drops all audio for the whole clip).
-                    // Skipped on subsequent Play calls (Pause → Play cycles) so the
-                    // user doesn't jump back to the start when unpausing.
-                    let should_seek = {
-                        let mut s = shared.lock().unwrap();
-                        if !s.play_seek_done {
-                            s.play_seek_done = true;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if should_seek {
-                        let _ = uridecodebin.seek_simple(
-                            gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
-                            gstreamer::ClockTime::ZERO,
-                        );
-                        eprintln!("[yt-adapter] startup seek: anchored segment.base to T_play");
-                    }
                     ingest_state = IngestState::Running;
                 }
                 Command::Pause => {
@@ -483,14 +459,6 @@ fn main() {
                         let has_audio =
                             s.audio_chain.as_ref().map_or(false, |c| c.sink.is_linked());
                         let current = (has_video, has_audio);
-                        // Always seek on reconnect: anchors segment.base to the
-                        // current running_time so PTS=0 audio arrives at the core
-                        // as "on time" after every EOS loop, not just on caps changes.
-                        // Also resets the demuxer position after HTTP burst (black tile fix).
-                        let _ = uridecodebin.seek_simple(
-                            gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
-                            gstreamer::ClockTime::ZERO,
-                        );
                         if Some(current) != s.last_reported_caps {
                             eprintln!(
                                 "[yt-adapter] StreamsChanged (video={has_video} audio={has_audio})"
@@ -692,9 +660,6 @@ struct Shared {
     /// window for StreamsChanged.  Reset by pad-added (extends window on pads).
     post_reconnect_check_at: Option<Instant>,
     last_reported_caps: Option<(bool, bool)>,
-    /// True after the first Command::Play seek has been issued.  Prevents the
-    /// startup seek from firing again on Pause → Play cycles.
-    play_seek_done: bool,
 }
 
 struct Chain {

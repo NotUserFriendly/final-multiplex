@@ -576,14 +576,46 @@ over 15 min) was event-loop pressure and thermal, not a memory-backed leak.
    EOS only fired when caps changed.  yt-fc loops with identical video+audio caps every
    4:38, so no seek → audio goes silent again after the first loop.
 
-**Final fix (CC, 2026-06-29 — commit 96ce048):**
+**Attempt 2 fix (CC, 2026-06-29 — commit 96ce048):**
 - Probe moved to `aunixfdsink.sink` where format is fixed S16LE 48 kHz 2ch.
   Duration computed as `buf.size() / 192000` (exact; no metadata dependency).
 - `Command::Play` handler issues `seek_simple(FLUSH|KEY_UNIT, 0)` on the first Play
-  only (`play_seek_done` flag prevents firing on Pause→Play cycles).  This sets
-  `segment.base = T_play`, mapping PTS=0 to `running_time ≈ T_play`.
-- Reconnect seek in `post_reconnect_check_at` made unconditional; `StreamsChanged`
-  still only emitted on caps change.
+  only (`play_seek_done` flag prevents firing on Pause→Play cycles).
+- Reconnect seek in `post_reconnect_check_at` made unconditional.
 
-**Awaiting maintainer validation:** audio audible when unmuted from both YouTube sources;
-fnaf2 approaching ~24fps with 6-source scene running.
+**Attempt 2 result (maintainer-reported, 2026-06-30):** "fnaf2 is still playing at
+low fps.  Neither yt source has audio still, even though their audio meters are
+showing sound."  The audio meters fire on `alevel`, which is BEFORE audiomixer —
+this was a new diagnostic clue: audio IS reaching the core chain, but audiomixer is
+dropping it.
+
+**Root cause revision (CC, 2026-06-30):** The seek approach was wrong-layer.
+`unixfdsink`/`unixfdsrc` transfer raw buffer PTS values only — segment events
+(including the adjusted `segment.base`) do NOT cross the process boundary.  So
+PTS=0 audio always arrived at the core's audiomixer with `running_time=0`, which
+audiomixer drops as late regardless of seeks in the adapter.  Additionally, the
+reconnect seek (`FLUSH|KEY_UNIT, 0` on the HTTP source) was causing an EOS message
+to be posted on the bus, triggering another `spawn_reconnect_thread`, which emitted
+`StreamsChanged(false,false)` → core tears down the just-added audio chain → cycle
+repeats.  This was confirmed in the session log: repeated
+`added audio chain for 'yt-fc'` followed immediately by
+`StreamsChanged (video=false audio=false)` → `removed audio chain for 'yt-fc'`.
+
+**Final fix (CC, 2026-06-30):**
+- `fm-core`: `aunixfdsrc` elements for audio chains now use `do-timestamp=true`.
+  The adapter's raw PTS values are discarded; the core re-stamps each arriving audio
+  buffer with the current pipeline clock time (arrival time).  Since the audio
+  throttle probe (in the adapter) ensures buffers arrive at real-time pace,
+  arrival time ≈ current running_time → audiomixer accepts them.
+- `fm-youtube-adapter`: removed startup seek from `Command::Play` (was a no-op
+  across the process boundary).  Removed reconnect seek from `post_reconnect_check`
+  (was causing EOS→reconnect cycling).  Removed `play_seek_done` field.
+- CC-verified (2026-06-30): yt-fc reconnected cleanly after ~4:38 (first clip EOS),
+  `added audio chain for 'yt-fc'` without immediate removal.  20 transient
+  `offset-canary` WARN entries during reconnect PTS=0 transition (expected; stopped
+  after compositor stabilized).  No cycling observed.
+
+**Awaiting maintainer validation (2026-06-30):** audio audible when unmuted from
+both YouTube sources (yt-fc, yt-nature); fnaf2 fps near ~24fps.  Note: fnaf2 slow
+fps hypothesis is that yt-fc cycling was consuming CPU (constant yt-dlp subprocess
+spawning); with cycling removed, fnaf2 should recover.

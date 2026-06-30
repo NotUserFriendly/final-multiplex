@@ -138,11 +138,25 @@ fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
 /// passes through unmodified rather than being overwritten with arrival time.
 /// Adding a new platform means adding a new `cfg` branch here and in
 /// `fm-adapter-sdk/src/transport.rs`.
+///
+/// Audio transport uses `do-timestamp=true` (see `make_audio_transport_src`):
+/// YouTube/file sources produce buffers starting at PTS≈0 which map to
+/// running_time=0 in the core and get dropped as late by audiomixer.
+/// Re-stamping with arrival time makes any real-time-throttled audio stream
+/// appear on-time regardless of its internal PTS origin.
 #[cfg(target_os = "linux")]
 fn make_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Element> {
     let src = make("unixfdsrc", name)?;
     src.set_property_from_str("socket-path", socket_path);
     src.set_property("do-timestamp", false);
+    Ok(src)
+}
+
+#[cfg(target_os = "linux")]
+fn make_audio_transport_src(name: &str, socket_path: &str) -> Result<gstreamer::Element> {
+    let src = make("unixfdsrc", name)?;
+    src.set_property_from_str("socket-path", socket_path);
+    src.set_property("do-timestamp", true);
     Ok(src)
 }
 
@@ -754,8 +768,10 @@ impl Pipeline {
                     }
 
                     if has_audio {
-                        let aunixfdsrc =
-                            make_transport_src(&format!("aunixfdsrc_{}", source.id), &audio_sock)?;
+                        let aunixfdsrc = make_audio_transport_src(
+                            &format!("aunixfdsrc_{}", source.id),
+                            &audio_sock,
+                        )?;
 
                         let ashmcaps: gstreamer::Element =
                             gstreamer::ElementFactory::make("capsfilter")
@@ -1205,7 +1221,7 @@ impl Pipeline {
 
         let (_, audio_sock) = runtime::shm_paths(source_id);
 
-        let aunixfdsrc = make_transport_src(&format!("aunixfdsrc_{source_id}"), &audio_sock)?;
+        let aunixfdsrc = make_audio_transport_src(&format!("aunixfdsrc_{source_id}"), &audio_sock)?;
 
         let ashmcaps = make("capsfilter", &format!("ashmcaps_{source_id}"))?;
         ashmcaps.set_property(

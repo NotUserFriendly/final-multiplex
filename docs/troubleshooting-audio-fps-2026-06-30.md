@@ -820,4 +820,94 @@ identical load, that confirms CPU/scheduling starvation as the residual root cau
 a remaining pipeline bug. This is Pending Task #2 (build release binary, measure fps + CPU) —
 now doubles as the audio validation step.
 
+---
+
+## Session 201265 — mission-clock-timed report; choppy episode 2 correlates with reconnect (2026-06-30)
+
+**Mission clock added** (`HH:MM:SS` since launch, chrome bar, bottom right — see CHANGELOG)
+specifically so timing reports like the one below don't need cross-referencing against raw
+session-log timestamps.
+
+**Maintainer report (session 201265, timestamps from the new mission clock):**
+> First second was slightly choppy but not bad. Good audio at 1s, choppy at 33s, silent at 50s.
+> Then, good audio at 4:44, choppy almost immediately, then silent at 5:02.
+
+**Episode 2 correlates directly with the yt-fc URL-expiry reconnect.** Session log confirms:
+```
+[reconnect-pts-audio] 'yt-fc' PTS correction +283.560s applied at build time
+```
+283.6s = 4:43.6 — matches "good audio at 4:44" almost to the second (the maintainer is
+describing the *last good moment before* the reconnect, which lines up with when the old
+chain was still playing cleanly right up to teardown).
+
+**abs-probe at the reconnect (new add_audio_chain instance):** A burst-catch-up pattern
+identical to the startup-burst mechanism (many buffers at `wall_interval=0ms` immediately
+after the new chain links — expected, matches the historical socket-catch-up signature),
+followed by **one single gap of 1907ms**, then clean `wall_interval≈0-7ms` for the rest of
+the searched window (3700+ lines / hundreds of buffers past that point, no further spikes
+found). That one 1907ms gap is the only GStreamer-level anomaly in the entire post-reconnect
+window.
+
+**This does not match the reported symptom duration.** The maintainer reports audible
+silence persisting to 5:02 — roughly **18 seconds** after the 4:43.6 reconnect — but the
+GStreamer-level data shows recovery within ~2 seconds (the single 1907ms gap) and clean
+delivery afterward. If `abuffersplit.src` were still starved or bursting for 18 seconds,
+that would show up as a long run of large `wall_interval` values; it doesn't. **The 16+
+second gap between "GStreamer recovered" and "audio comes back audibly" is unaccounted for
+by anything in the instrumented pipeline** — reinforcing the Session 198727 conclusion that
+the residual symptom lives downstream of GStreamer, in the PipeWire/PulseAudio/ALSA layer,
+most plausibly as a consequence of the CPU/scheduling pressure already noted (load average
+20.78, `final-multiplex` debug build alone at ~1127% CPU).
+
+**Episode 1 (33s choppy, 50s silent) has no corresponding reconnect** — `grep` for
+Reconnecting/StreamsChanged in the session log shows only the one reconnect at 283.6s.
+Episode 1 is therefore *not* explained by any known PTS/reconnect mechanism at all; it's
+either the tail of the startup-clock-sync convergence lasting far longer than the ~9s
+measured in session 198727 (session-to-session variance under different system load), or a
+second, distinct downstream dropout with no pipeline-level signature — same category as
+episode 2's unaccounted 16 seconds.
+
+---
+
+## Potential next steps (for review chat)
+
+Three consecutive sessions (198727, 201265, and the 191762/194075 pair before the startup fix)
+all show the same pattern: **every layer of the GStreamer pipeline that can be instrumented
+comes back clean**, yet audible choppy-to-silence episodes persist, including one now directly
+correlated with a real event (URL-expiry reconnect) but *outlasting* that event's
+GStreamer-visible disruption by roughly 8-9×.  This is the point where further probing inside
+`fm-core`/`fm-youtube-adapter` has diminishing returns — the evidence increasingly implicates
+a layer this codebase does not instrument at all.
+
+1. **Release-build CPU test (mechanical, cheap, do first).** Debug build alone is running at
+   ~1127% CPU with a system load average of 20.78 on a 6-source scene.  Building `--release`
+   and re-running the identical scene would either confirm or rule out CPU/scheduling
+   starvation as the residual cause in one pass.  This is already Pending Task #2 in the
+   working task list; running it now would directly settle or eliminate the leading hypothesis
+   before any further architectural work is considered.
+
+2. **Instrument the PipeWire/ALSA layer directly, if the release build doesn't resolve it.**
+   Nothing in this investigation currently observes what PipeWire's audio thread is doing —
+   only what GStreamer hands it.  `pw-top` or `pactl list sink-inputs` during a live episode,
+   or checking `journalctl --user -u pipewire` / `dmesg` for xrun/underrun messages timed
+   against a mission-clock-reported episode, would confirm or rule out sink-side starvation
+   directly rather than by exclusion.
+
+3. **If CPU load is confirmed as the cause, this raises a scoping question for the project's
+   stated priority use case** (per `CLAUDE.md`: "an individual watching many streams + their
+   own security cameras at once — assume a dedicated or high-end box with a discrete GPU").
+   A 6-source scene pushing a debug build to 1127% CPU and load average 20+ is a stress case
+   this project's target hardware may not hit in practice — but it's worth review chat
+   deciding whether audio robustness under CPU pressure (e.g., giving PipeWire/the audio
+   thread real-time scheduling priority via `rtkit`, or bounding source count against
+   available cores) deserves its own ADR, or whether "use a release build on the target
+   hardware" is a sufficient answer and this line of investigation should close once the
+   release-build test confirms the hypothesis.
+
+4. **If the release-build test does *not* resolve it**, the next diagnostic layer is PipeWire
+   itself (item 2 above) rather than more GStreamer-side probes — three separate probe
+   layers (adapter write-pacing, core `abuffersplit.src`, `audiomixer.src`) have each come
+   back clean in turn, and a fourth GStreamer-side probe is unlikely to find what the first
+   three didn't.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)

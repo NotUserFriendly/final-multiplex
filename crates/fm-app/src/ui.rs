@@ -741,8 +741,12 @@ impl App {
             (elapsed % 3600) / 60,
             elapsed % 60,
         ))
-        .size(14)
+        .size(20)
         .color(Color::WHITE);
+        let chrome_bg = |_: &iced::Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.2))),
+            ..Default::default()
+        };
         let chrome = container(
             row![
                 button(play_label).on_press(Message::TogglePlay),
@@ -754,6 +758,7 @@ impl App {
             .spacing(8)
             .align_y(iced::alignment::Vertical::Center),
         )
+        .style(chrome_bg)
         .padding(8);
 
         column![video_area, chrome].into()

@@ -747,6 +747,19 @@ impl App {
             background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.2))),
             ..Default::default()
         };
+        // Fixed height, exactly matching CHROME_H (the constant `avail_h` above
+        // subtracts to budget video_area's height).  Previously this container
+        // had no explicit height and shrank to its content's natural size,
+        // which didn't exactly equal CHROME_H — the few px of slop showed up as
+        // a transparent seam between video_area and chrome (the window is
+        // .transparent(true) so the Wayland video subsurface can show through,
+        // so any unaccounted gap in the column shows that transparency rather
+        // than a visible line).  A black background container is NOT a safe
+        // fix here: wrapping video_area in one blocks the subsurface passthrough
+        // entirely, since it sits on a separate Wayland surface *below* iced's
+        // and can't show through an opaque pixel in the surface above it.
+        // Pinning chrome's height to match the budget exactly removes the gap
+        // arithmetically instead.
         let chrome = container(
             row![
                 button(play_label).on_press(Message::TogglePlay),
@@ -759,23 +772,10 @@ impl App {
             .align_y(iced::alignment::Vertical::Center),
         )
         .style(chrome_bg)
-        .padding(8);
+        .padding(8)
+        .height(Length::Fixed(CHROME_H));
 
-        // Root container with an opaque black background: the window itself is
-        // transparent (needed so the Wayland video subsurface shows through the
-        // video area), so any sub-pixel rounding gap between video_area and
-        // chrome would otherwise show the transparent window background as a
-        // thin seam.  Black here means any such gap reads as background, not
-        // as a visible line.
-        let root_bg = |_: &iced::Theme| container::Style {
-            background: Some(Background::Color(Color::BLACK)),
-            ..Default::default()
-        };
-        container(column![video_area, chrome])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(root_bg)
-            .into()
+        column![video_area, chrome].into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

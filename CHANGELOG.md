@@ -22,11 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path will actually use once active, rather than from the narrower compositor-only width.
   Non-Linux platforms (no subsurface path) keep the original calculation.
 - **Transparent seam between video area and chrome bar:** the window is `.transparent(true)`
-  (needed so the Wayland video subsurface shows through the video area); any sub-pixel
-  rounding gap between `video_area` and `chrome` in the root `column!` therefore showed the
-  transparent window background as a thin line.  Fix: wrap the view's root in a container
-  with an opaque black, fill-sized background, so any such gap reads as background rather
-  than a visible seam.
+  (needed so the Wayland video subsurface shows through the video area); the chrome bar
+  container had no explicit height and shrank to its content's natural size, which didn't
+  exactly equal `CHROME_H` (the constant `avail_h` subtracts to budget video_area's height) —
+  the few px of slop showed up as a thin transparent seam between `video_area` and `chrome`.
+  First attempt wrapped the view's root in an opaque black background container, which fixed
+  the seam but broke video entirely: the subsurface renders on a separate Wayland surface
+  *below* iced's own surface, and an opaque pixel anywhere in iced's surface (including over
+  the deliberately-transparent video area) blocks that layer from showing through. Corrected
+  fix: pin `chrome`'s height to `Length::Fixed(CHROME_H)` so it always consumes exactly the
+  budgeted space — removes the gap arithmetically, no background needed, video area stays
+  fully transparent.
 - **YouTube video reconnect-PTS: build-time correction, remove late probe:**
   The prior one-shot probe on `voff_src` (output of `voff_q` delay buffer) fired too late —
   by the time the first frame exited `voff_q`, all subsequent frames from the new stream epoch

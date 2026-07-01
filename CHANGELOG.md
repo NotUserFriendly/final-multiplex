@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Initial window opens with black bars around every tile on Linux (subsurface path):**
+  The Wayland subsurface (ADR-0026) activates within the first couple of frames and takes
+  over the full window width for video (no GPU side panel reserved).  The initial window
+  size computed in `main.rs` assumed the GPU panel was permanent — it derived height from a
+  1280px-wide compositor area but sized total window width at `1280 + GPU_PANEL_W`, so once
+  the subsurface took over, the window's actual aspect ratio (e.g. 3.667 for a 1760×480
+  window) no longer matched the grid's intended aspect ratio (2.667 for a 3×2 grid of
+  1920×1080 tiles).  Since each tile's cell is an equal NDC split of that mismatched window
+  and each source is individually letterboxed to preserve its own aspect ratio within its
+  cell, the AR mismatch showed up as a black bar around every tile — invisible until the user
+  manually resized the window to the correct ratio.  Fix: on Linux, size the initial window
+  height from the *full* window width (`1280 + GPU_PANEL_W`), matching what the subsurface
+  path will actually use once active, rather than from the narrower compositor-only width.
+  Non-Linux platforms (no subsurface path) keep the original calculation.
+- **Transparent seam between video area and chrome bar:** the window is `.transparent(true)`
+  (needed so the Wayland video subsurface shows through the video area); any sub-pixel
+  rounding gap between `video_area` and `chrome` in the root `column!` therefore showed the
+  transparent window background as a thin line.  Fix: wrap the view's root in a container
+  with an opaque black, fill-sized background, so any such gap reads as background rather
+  than a visible seam.
 - **YouTube video reconnect-PTS: build-time correction, remove late probe:**
   The prior one-shot probe on `voff_src` (output of `voff_q` delay buffer) fired too late —
   by the time the first frame exited `voff_q`, all subsequent frames from the new stream epoch

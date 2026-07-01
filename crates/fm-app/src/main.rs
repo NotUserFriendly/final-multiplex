@@ -61,6 +61,33 @@ fn main() -> iced::Result {
         .unwrap_or_else(|| "scene.toml".to_string());
 
     // Pre-read config just to size the window; the full build happens in boot().
+    //
+    // On Linux the dedicated Wayland subsurface (ADR-0026) activates within the
+    // first couple of frames and takes over the *entire* window width for video
+    // (no GPU side panel reserved — see `sub_active` in ui.rs).  Sizing the
+    // initial window as if the GPU panel were permanent (compositor_w +
+    // GPU_PANEL_W total width, but height computed only from compositor_w)
+    // leaves the window's actual aspect ratio wider than the grid's once the
+    // subsurface takes over, so every tile's per-source letterbox shows a
+    // visible black bar until the user manually resizes.  Size purely off the
+    // full window width on Linux so the window opens already at the right AR.
+    #[cfg(target_os = "linux")]
+    let initial_size = fm_core::config::load(std::path::Path::new(&config_path))
+        .map(|scene| {
+            let n = scene.source.len() as u32;
+            let cols = scene.grid.columns.max(1).min(n.max(1));
+            let rows = (n.max(1) + cols - 1) / cols;
+            let ar =
+                (cols as f32 * scene.grid.width as f32) / (rows as f32 * scene.grid.height as f32);
+            let w = 1280.0f32 + ui::GPU_PANEL_W;
+            let h = (w / ar).round() + ui::CHROME_H;
+            iced::Size::new(w, h)
+        })
+        .unwrap_or(iced::Size::new(
+            1280.0 + ui::GPU_PANEL_W,
+            720.0 + ui::CHROME_H,
+        ));
+    #[cfg(not(target_os = "linux"))]
     let initial_size = fm_core::config::load(std::path::Path::new(&config_path))
         .map(|scene| {
             let n = scene.source.len() as u32;

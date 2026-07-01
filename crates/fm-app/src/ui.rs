@@ -761,7 +761,21 @@ impl App {
         .style(chrome_bg)
         .padding(8);
 
-        column![video_area, chrome].into()
+        // Root container with an opaque black background: the window itself is
+        // transparent (needed so the Wayland video subsurface shows through the
+        // video area), so any sub-pixel rounding gap between video_area and
+        // chrome would otherwise show the transparent window background as a
+        // thin seam.  Black here means any such gap reads as background, not
+        // as a visible line.
+        let root_bg = |_: &iced::Theme| container::Style {
+            background: Some(Background::Color(Color::BLACK)),
+            ..Default::default()
+        };
+        container(column![video_area, chrome])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(root_bg)
+            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

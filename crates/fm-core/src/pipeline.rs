@@ -696,6 +696,39 @@ impl Pipeline {
                 mix_sink.set_property("mute", source.muted);
                 mixer_sink_pads.insert(source.id.clone(), mix_sink);
 
+                // One-shot probe: correct abuffersplit's zero-based PTS when the
+                // first buffer arrives.  audiobuffersplit ignores input PTS and
+                // starts from segment base ≈ 0; external sources take several
+                // seconds to connect, by which point audiomixer has advanced and
+                // drops PTS≈0 buffers as late → startup audio choppiness.
+                // Fires once, reads the live running_time, updates the pad offset.
+                // remove_audio_chain removes this element before add_audio_chain
+                // creates a corrected replacement, so there is no double-correction
+                // at reconnect.
+                {
+                    let pipeline_weak = pipeline.downgrade();
+                    let offset_base = offset_ns;
+                    let sid = source.id.clone();
+                    abs_src.add_probe(gstreamer::PadProbeType::BUFFER, move |pad, _| {
+                        let Some(pl) = pipeline_weak.upgrade() else {
+                            return gstreamer::PadProbeReturn::Remove;
+                        };
+                        let rt_ns = pl
+                            .current_running_time()
+                            .map(|rt| rt.nseconds() as i64)
+                            .unwrap_or(0);
+                        let correction = if rt_ns > 500_000_000 { rt_ns } else { 0 };
+                        if correction != 0 {
+                            pad.set_offset(offset_base + correction);
+                            eprintln!(
+                                "[startup-pts-audio] '{sid}' correction {:+.3}s on first buffer",
+                                correction as f64 / 1e9,
+                            );
+                        }
+                        gstreamer::PadProbeReturn::Remove
+                    });
+                }
+
                 aconv_sink_for_cb = Some(aconv.static_pad("sink").ok_or("aconv: no sink pad")?);
                 acaps_src = Some(abs_src);
             }
@@ -1312,21 +1345,33 @@ impl Pipeline {
         let abs_src = abuffersplit
             .static_pad("src")
             .ok_or("abuffersplit: no src")?;
-        // Audio uses do-timestamp=true on aunixfdsrc, which stamps each buffer
-        // with the pipeline running_time at read time.  The source PTS is
-        // therefore already ≈ running_time after a reconnect; applying
-        // running_time as an additional pad offset would double it.  Only the
-        // user-configured offset is applied here.
-        abs_src.set_offset(layout.offset_ns);
-        if let Some(rt) = self.inner.current_running_time() {
-            if rt.nseconds() > 500_000_000 {
-                eprintln!(
-                    "[reconnect-pts-audio] '{}' reconnect at {:.3}s; \
-                     do-timestamp=true provides correct PTS",
-                    source_id,
-                    rt.nseconds() as f64 / 1e9,
-                );
-            }
+        // audiobuffersplit computes output PTS from its segment start (0 for a
+        // fresh element) plus running sample count — it ignores the input
+        // buffer's PTS from do-timestamp.  After a URL-expiry reconnect the
+        // pipeline running_time is minutes ahead while abuffersplit restarts
+        // from PTS≈0; the audiomixer drops every buffer as hundreds of seconds
+        // late → silence.  Apply the same build-time correction as video:
+        // abs_src.set_offset shifts each buffer's running_time by correction_ns
+        // so audiomixer sees running_time ≈ current_pipeline_time.
+        let audio_correction_ns = self
+            .inner
+            .current_running_time()
+            .map(|rt| {
+                let ns = rt.nseconds() as i64;
+                if ns > 500_000_000 {
+                    ns
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        abs_src.set_offset(layout.offset_ns + audio_correction_ns);
+        if audio_correction_ns != 0 {
+            eprintln!(
+                "[reconnect-pts-audio] '{}' PTS correction {:+.3}s applied at build time",
+                source_id,
+                audio_correction_ns as f64 / 1e9,
+            );
         }
         abs_src.link(&mix_sink)?;
         mix_sink.set_property("volume", layout.volume);

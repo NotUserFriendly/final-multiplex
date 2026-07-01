@@ -17,13 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correction)` before any frame enters `voff_q`.  At initial startup both values are near zero
   so the threshold is not crossed.  The canary's expected offset is updated to include the
   correction so it remains accurate.
-- **Audio reconnect-PTS: diagnostic probe on abuffersplit.src added:**
-  `aunixfdsrc` uses `do-timestamp=true` which already stamps each audio buffer with pipeline
-  `running_time` at read time, so no numeric pad-offset correction is needed for audio.
-  Added a `[reconnect-pts-audio]` log at chain-build time to confirm reconnect detection, and
-  a permanent `[abs-probe]` probe on `abuffersplit.src` that logs PTS and wall-clock interval
-  for any buffer outside the [10, 100] ms window — making the crunch cause observable in the
-  session log.
+- **Audio reconnect-PTS: build-time correction on abuffersplit.src (reconnect and startup):**
+  `audiobuffersplit` ignores input buffer PTS (including `do-timestamp=true` timestamps from
+  `aunixfdsrc`) and computes output PTS from its segment base (≈0 for a fresh element) plus
+  accumulated sample count.  After a URL-expiry reconnect the pipeline running_time is minutes
+  ahead while a new `abuffersplit` restarts from PTS≈0 — audiomixer drops every buffer as
+  hundreds of seconds late → silence.  Root cause confirmed by `[abs-probe]` diagnostic (PTS≈
+  2.6 s at pipeline T≈418 s).  Fix: `add_audio_chain` now queries `current_running_time()` at
+  build time and calls `abs_src.set_offset(user_offset + correction_ns)` (same pattern as the
+  video fix, ≥ 500 ms threshold).  Verified: three successful reconnects at T≈283 s, T≈568 s,
+  T≈854 s with `[reconnect-pts-audio]` log lines and steady `[abs-probe]` 21 ms increments
+  after each.
+  Startup path: `Pipeline::build()` also installs a one-shot BUFFER probe on `abs_src`.  On
+  the first buffer it reads the live `current_running_time()` and applies the same correction —
+  fixing sources (e.g. yt-nature) that never reconnect but whose adapter takes several seconds
+  to connect.  `[startup-pts-audio]` is logged when a non-zero correction is applied.
+  Diagnostic probe `[abs-probe]` retained temporarily for reconnect-interval monitoring.
 
 ### Added
 - **YouTube audio burst/silence — root cause: net-clock ≠ audio hardware clock (ADR-0027):**

@@ -685,4 +685,88 @@ Flag this for a new ADR before implementing — it supersedes part of ADR-0005.
    GPU paths unchanged. Alignment is the regression risk — adapters now ride the audio
    clock instead of the system clock.
 
+---
+
+## Session 122324 — abs-probe analysis (2026-06-30)
+
+**Session started after the voff_src probe was removed (video build-time correction in place).**
+
+**abuffersplit.src probe (new in this session):** Fires when wall_interval outside [10, 100] ms.
+At reconnect (T≈418s), the probe fired on rapid-burst buffers (wall_interval≈0ms).
+
+**Key data point from probe:**
+```
+[abs-probe] 'yt-fc' pts=2.624s pts_delta=+21ms wall_interval=0ms
+```
+Pipeline was at T≈418s. abuffersplit output PTS=2.624s (not 418s). Confirmed root cause:
+`audiobuffersplit` ignores `do-timestamp=true` input PTS and computes output from segment
+base (≈0) plus accumulated sample count. After reconnect: new abuffersplit starts from PTS=0;
+at T_reconnect+2.6s the probe shows PTS=2.6s — exactly 2.6s elapsed since element was
+created. The audiomixer (at T=420.6s) drops these as hundreds of seconds late → silence.
+
+---
+
+## Attempt 16 — Audio reconnect-PTS: build-time correction on abuffersplit.src (2026-06-30)
+
+**Fix (`add_audio_chain`, reconnect path):**
+In `add_audio_chain`, after building the new abuffersplit chain, apply:
+```rust
+let audio_correction_ns = pipeline.current_running_time()
+    .map(|rt| { let ns = rt.nseconds() as i64; if ns > 500_000_000 { ns } else { 0 } })
+    .unwrap_or(0);
+abs_src.set_offset(layout.offset_ns + audio_correction_ns);
+```
+Same pattern as video build-time correction. With `set_offset(T_reconnect)`, abuffersplit's
+PTS=0 → running_time = 0 + T_reconnect ≈ audiomixer's current position → accepted.
+
+**Fix (`Pipeline::build()`, startup path):**
+A one-shot BUFFER probe on `abs_src` fires on the first audio buffer from each source.
+At that point the pipeline is already running; `current_running_time()` gives the elapsed
+time since start. Applies `pad.set_offset(offset_base + correction)` and removes itself.
+Logged as `[startup-pts-audio]`. This covers sources (yt-nature) that never reconnect
+but whose adapter takes several seconds to produce audio after pipeline start.
+
+**CC-measured validation — session 165845 (165 min run, 2026-06-30):**
+
+| Event | Pipeline time | `[reconnect-pts-audio]` correction |
+|---|---|---|
+| yt-fc reconnect 1 | T≈283s | +283.577s ✓ |
+| yt-fc reconnect 2 | T≈568s | +568.082s ✓ |
+| yt-fc reconnect 3 | T≈854s | +854.558s ✓ |
+
+After each reconnect: abs-probe shows steady `pts_delta=+21ms` increments — no crunch,
+no silence cascade. yt-nature had no reconnects in 165 min (stable initial-build path).
+
+**Startup probe — session 172498 (2026-06-30):**
+```
+[startup-pts-audio] 'dummy' correction +2.077s on first buffer
+```
+`dummy` connected at T≈2.1s; probe applied correction immediately.
+
+`yt-fc` and `yt-nature`: adapter had URL ready before pipeline reached PLAYING (yt-dlp
+resolved during the Ready handshake). First audio buffer arrived at T<0.5s (pipeline had
+just started). Probe fired silently (correction=0, below 500ms threshold), removed itself.
+No correction needed — audiomixer also near T=0, no dropout. The 0.5s gate correctly
+distinguishes "startup at T≈0" from "reconnect at T=minutes."
+
+**CC-measured validation — session 172498 (2026-06-30):**
+
+Offset-canary: 60 WARN lines total = 3 reconnects × 20 samples each. All transient
+(canary silences after 20 samples per reconnect). Pattern is expected: during the ~2.5s
+window after a reconnect, the compositor briefly repeats the last frame (EOS); canary
+fires on repeated frames and silences once new frames flow. Not an audio issue.
+
+| Event | Pipeline time | `[reconnect-pts-audio]` correction |
+|---|---|---|
+| yt-fc reconnect 1 | T≈284.5s | +284.583s ✓ |
+| yt-fc reconnect 2 | T≈571.1s | +571.079s ✓ |
+| yt-fc reconnect 3 | T≈861.1s | +861.062s ✓ |
+
+**Gates (maintainer validation needed):**
+1. After URL-expiry reconnect (~5 min): `[reconnect-pts-audio]` appears in log; yt-fc audio
+   resumes clean (no crunch→stutter→silence). `[offset-canary]` deviation ≈0.
+2. At startup: yt-fc and yt-nature audio clean from first playback (no initial choppy period).
+   `[startup-pts-audio]` lines appear for all sources in session log.
+3. Steady-state audio for full session (pre-expiry and post-reconnect): no burstiness.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)

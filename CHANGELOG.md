@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Diagnostic probe `[abs-probe]` retained temporarily for reconnect-interval monitoring.
 
 ### Added
+- **Mission clock in the chrome bar:** `HH:MM:SS` elapsed-since-launch readout, right-aligned
+  in the bottom chrome bar next to Play/Pause and Reset Rate.  Gives a quick ballpark for how
+  long a session has been running when reporting audio/video issues by wall-clock offset.
 - **YouTube audio burst/silence — root cause: net-clock ≠ audio hardware clock (ADR-0027):**
   `audiobuffersplit` made the GStreamer chain through `audiomixer.src` gap-free, localising the
   burst to the audio sink's clock-slave layer.  A `slave-method` sweep (`skew`, `resample`,

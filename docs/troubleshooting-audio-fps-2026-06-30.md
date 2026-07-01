@@ -769,4 +769,55 @@ fires on repeated frames and silences once new frames flow. Not an audio issue.
    `[startup-pts-audio]` lines appear for all sources in session log.
 3. Steady-state audio for full session (pre-expiry and post-reconnect): no burstiness.
 
+---
+
+## Session 198727/197232 — startup choppy→clean→choppy→silent persists (2026-06-30)
+
+**Maintainer report (session 191762/194075, before startup fix landed):** "Inside of a minute,
+yt-fc ran through the same choppy>clean>choppy>silent pattern. yt-nature was either never made
+any sound, or did the same thing as yt-fc earlier than it did." No reconnect occurred in either
+session — this is purely the steady-state/startup case, independent of the reconnect-PTS fix.
+
+**abs-probe added to the initial-build audio chain** (previously only existed in the reconnect
+path `add_audio_chain`, so the initial-build chain — which most sessions run on for the first
+several minutes — had zero diagnostic coverage). Mirrors the existing probe exactly.
+
+**Session 198727 (after startup-pts-audio + initial-build abs-probe landed):**
+Maintainer report: "Choppiness at the start seemed reduced. Good audio went for longer than
+previously. Then choppy to silent seemed like previous attempts."
+
+**abs-probe data for yt-fc, full session:** Only 8 wall_interval spikes >100ms, all in the
+first ~9 seconds (buffers #1, #61, #118, #175, #228, #284, #338, #388), monotonically
+*decreasing* in magnitude (1956ms → 344ms → 297ms → 263ms → 234ms → 215ms → 177ms → 155ms) —
+a classic damped convergence pattern, consistent with `GstNetClientClock`'s periodic resync
+settling in.  **Zero spikes after buffer #388** for the rest of the session (1223+ buffers,
+~28+ seconds and counting) — the GStreamer chain at `abuffersplit.src` was completely clean
+for the entire window during which the maintainer reported hearing choppy-to-silent audio.
+
+**Conclusion: the GStreamer pipeline is not the source of the residual choppy-to-silent
+pattern.** Three layers now confirmed clean:
+1. Adapter write pacing (`aunixfdsink.sink` throttle probe): confirmed via temporary
+   `[yt-audio-size]` diagnostic — buffer sizes uniform (4316–4460 bytes, ~23ms each), real
+   wall-clock gaps between probe firings matched the intended ~23ms duration almost exactly
+   (23.0–23.6ms observed across 150 buffers). Ruled out "irregular small chunks under-pacing
+   the throttle" as a cause. Diagnostic removed after confirming (no net diff vs. prior state).
+2. Core `abuffersplit.src` (input to audiomixer): clean per above.
+3. `audiomixer.src` → sink chain: previously confirmed gapless in Attempts 10-14.
+
+**New lead — system CPU load.** `top` during session 198727 showed **load average 20.78**
+with `final-multiplex` (debug build) alone at **1127% CPU** (~11 cores), plus
+`fm-rtsp-adapter` processes at 90%/45%, plus unrelated desktop processes (ffplay 181%,
+gnome-shell 45%, Discord, etc.) all contending for CPU. This is a strong candidate for the
+residual symptom: even with ADR-0027's audio-hardware-clock-as-master fix in place and a
+provably gapless GStreamer graph, PipeWire/PulseAudio's own real-time audio thread can still
+underrun if starved of CPU scheduling under this level of system-wide contention — a failure
+mode entirely outside GStreamer's control.
+
+**Next step (not yet done): test with a release build.** A release build should cut
+`final-multiplex`'s CPU usage dramatically (debug builds commonly run 5-10× hotter). If the
+choppy-to-silent pattern disappears or is greatly reduced under a release build with otherwise
+identical load, that confirms CPU/scheduling starvation as the residual root cause rather than
+a remaining pipeline bug. This is Pending Task #2 (build release binary, measure fps + CPU) —
+now doubles as the audio validation step.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)

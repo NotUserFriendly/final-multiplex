@@ -729,6 +729,47 @@ impl Pipeline {
                     });
                 }
 
+                // Diagnostic: log PTS and wall-clock intervals at abuffersplit.src.
+                // Warns on intervals outside [10, 100] ms — outside that band
+                // indicates a burst (crunch) or a gap (silence).  Mirrors the probe
+                // in add_audio_chain so the initial-build chain (which never goes
+                // through add_audio_chain unless a reconnect occurs) is also
+                // observable.  Remove once the crunch cause is confirmed and fixed.
+                {
+                    let sid = source.id.clone();
+                    let last_wall =
+                        std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+                    let last_pts_ns = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+                    abs_src.add_probe(gstreamer::PadProbeType::BUFFER, move |_, info| {
+                        let Some(gstreamer::PadProbeData::Buffer(buf)) = &info.data else {
+                            return gstreamer::PadProbeReturn::Ok;
+                        };
+                        let Some(pts) = buf.pts() else {
+                            return gstreamer::PadProbeReturn::Ok;
+                        };
+                        let pts_ns = pts.nseconds() as i64;
+                        let now = std::time::Instant::now();
+                        let wall_ms = {
+                            let mut g = last_wall.lock().unwrap();
+                            let ms = g.elapsed().as_millis() as i64;
+                            *g = now;
+                            ms
+                        };
+                        let prev = last_pts_ns.swap(pts_ns, std::sync::atomic::Ordering::Relaxed);
+                        if prev >= 0 && (wall_ms < 10 || wall_ms > 100) {
+                            let pts_interval_ms = (pts_ns - prev) / 1_000_000;
+                            eprintln!(
+                                "[abs-probe] '{}' pts={:.3}s pts_delta={:+}ms wall_interval={}ms",
+                                sid,
+                                pts_ns as f64 / 1e9,
+                                pts_interval_ms,
+                                wall_ms,
+                            );
+                        }
+                        gstreamer::PadProbeReturn::Ok
+                    });
+                }
+
                 aconv_sink_for_cb = Some(aconv.static_pad("sink").ok_or("aconv: no sink pad")?);
                 acaps_src = Some(abs_src);
             }

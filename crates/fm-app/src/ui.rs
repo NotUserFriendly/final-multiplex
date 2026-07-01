@@ -87,6 +87,8 @@ pub struct App {
     /// Window pixel dims (packed u64) fed to the render thread on each resize.
     #[cfg(target_os = "linux")]
     window_size: Option<crate::wayland_sub::WindowSize>,
+    /// Process start time — drives the mission clock in the chrome bar.
+    start_time: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +179,7 @@ impl App {
                     render_running_time: None,
                     #[cfg(target_os = "linux")]
                     window_size: None,
+                    start_time: Instant::now(),
                 }
             }
         }
@@ -731,12 +734,25 @@ impl App {
         } else {
             "▶  Play"
         };
+        let elapsed = self.start_time.elapsed().as_secs();
+        let mission_clock = text(format!(
+            "{:02}:{:02}:{:02}",
+            elapsed / 3600,
+            (elapsed % 3600) / 60,
+            elapsed % 60,
+        ))
+        .size(14)
+        .color(Color::WHITE);
         let chrome = container(
             row![
                 button(play_label).on_press(Message::TogglePlay),
                 button("↺  Reset Rate").on_press(Message::ResetRatchet),
+                container(mission_clock)
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right),
             ]
-            .spacing(8),
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center),
         )
         .padding(8);
 
@@ -1357,6 +1373,7 @@ fn try_init(
         render_running_time: None,
         #[cfg(target_os = "linux")]
         window_size: None,
+        start_time: Instant::now(),
     })
 }
 

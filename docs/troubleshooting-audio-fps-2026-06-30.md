@@ -1201,4 +1201,98 @@ state, no code change resulted from this investigation.
    translate to a *full* drain-to-zero. Cheap to test, doesn't address the root cause, but worth
    knowing whether it changes the audible symptom's severity.
 
+---
+
+## TaskBlock-Phase4Block2e — deeper queue clears mid-stream symptom, breaks reconnect (2026-07-02)
+
+Ran both tasks. **Neither fork outcome applies cleanly** — the deeper-queue fix introduced a
+new, more severe regression rather than clearing or merely persisting. Reverted; not shipped.
+
+### Task 1 — release-build re-confirmation
+
+Re-ran the unmodified committed build (`max-size-buffers=20`) on release, confirmed via the
+permanent `abs-probe` diagnostic (no new instrumentation needed — it's committed code):
+43 anomalies >100ms, **25 of which exceeded 1000ms** (near-full or full drains). Matches the
+severity found in Phase4Block2d. Starvation confirmed present at release CPU levels, not a
+debug-build artifact. `ffplay` was again running independently during this measurement
+(141.7% CPU) — noted as a caveat, but system load average (8.23) was well below the original
+1127%/20.78 debug baseline even with it present, so it doesn't change the qualitative
+conclusion.
+
+### Task 2 — deeper aqueue (20 → 80 buffers, ~460ms → ~1.8s)
+
+Applied to both `Pipeline::build()`'s initial-build path and `add_audio_chain` (the reconnect
+path), so every source's queue — new connections and reconnects alike — gets the deeper
+buffer.
+
+**Mid-stream data: dramatic improvement.** Pre-reconnect, `abs-probe` for `yt-fc` showed 49
+anomalies >100ms but **only 1 exceeding 500ms** (a single 2004ms entry matching the normal
+first-buffer startup gap, not a mid-stream stall) — versus 25/43 exceeding 1000ms at the old
+depth. Nearly every remaining anomaly clustered in the 100–230ms range: small hiccups, not
+drains.
+
+**Maintainer's audible report contradicts the data's optimism.** Rather than "clears":
+> Choppy, then 5 to 10 seconds of clear audio, then choppy for 30-ish seconds, then clear for
+> 5-ish — repeating pattern. Audio seems to go entirely silent after reconnect.
+
+The ~30-40s choppy/clear cycle is a *longer period* than anything `abs-probe` was measuring in
+short capture windows (15-25s) — the data collected didn't span enough real time to see it.
+This remains unexplained; worth noting for whoever picks this thread up next, but overshadowed
+by the more serious finding below.
+
+**Serious regression: complete, persistent silence after URL-expiry reconnect.** After the
+reconnect at T≈283s:
+- `[reconnect-pts]` and `[reconnect-pts-audio]` both logged correctly (video and audio
+  corrections applied, same as every prior successful reconnect).
+- The adapter's own reconnect path succeeded cleanly: `[yt-adapter] audio reconnected`,
+  `[audio-sync] ... → Ok(())` for every element, `[pipeline] added audio chain for 'yt-fc'`.
+- **Zero `abs-probe` entries for `yt-fc` for the remainder of the session — 45+ minutes.**
+  Confirmed the session was still alive and other sources continued producing `abs-probe`
+  output throughout (`fnaf2`, `cam-77`) — this is source-specific, not a global hang.
+  Also confirmed **zero further `[yt-adapter]` log lines of any kind** for the rest of the
+  session, though the adapter process itself remained alive at ~9% CPU (consistent with
+  normal steady-state video decode, not a crash or deadlock) — video presumably continued;
+  audio did not.
+
+**This did not happen with the same test at the old queue depth.** Session 172498 (Phase4Block2b,
+`max-size-buffers=20`) confirmed three separate clean reconnects with continued clean audio
+afterward, no silence. The regression is specific to the deeper queue.
+
+**Working hypothesis, not investigated further:** `GstQueue` reports its buffering capacity as
+part of the pipeline's latency negotiation. A dynamically-added sink pad (created fresh on
+every reconnect via `audiomixer.request_pad_simple`) re-triggers that negotiation, and a much
+larger upstream queue depth (now ~1.8s vs ~460ms) could shift what `audiomixer` (a
+`GstAggregator` subclass) computes as the pad's expected/valid timing window in a way the
+existing `audio_correction_ns` fix — a fixed, one-time offset computed from
+`current_running_time()` at chain-build time — doesn't account for, causing every subsequent
+buffer to land outside whatever window `audiomixer` now expects and get silently discarded
+forever. **Not confirmed** — this is exactly the kind of interaction that requires understanding
+`audiomixer`'s internal latency/pad-servicing behavior, i.e., the investigation the taskblock's
+notes explicitly said not to open at this stage.
+
+### Outcome: reverted, not shipped
+
+Neither fork applies: this isn't "clears" (mid-stream data improved dramatically, but the
+maintainer's audible report shows a persisting ~30-40s cycle, and there's a new severe
+regression) and it isn't simply "persists" either (a *worse*, different-shaped symptom
+appeared). `pipeline.rs` reverted to its committed state (`max-size-buffers=20` in both
+locations); release binary rebuilt from the clean tree. No code change shipped from this
+taskblock.
+
+### Recommendation for review chat
+
+The queue-depth lever is not safe to pull without touching `audiomixer`'s internals — the
+regression found here effectively promotes "understand `audiomixer`'s latency/pad-servicing
+behavior" from an optional follow-up (per Phase4Block2d's notes) to a **prerequisite** for any
+further queue-depth change, not merely an enhancement to consider later. Two paths from here,
+both larger than a quick taskblock:
+1. Investigate why a deeper upstream queue breaks reconnect specifically (the hypothesis
+   above is a starting point, not a confirmed cause) — this is the "open `audiomixer`
+   internals" work the taskblock said to avoid, now seemingly unavoidable if queue depth is
+   to be revisited.
+2. Treat the *original* (pre-Block2e) starvation finding as a known capacity limit on the
+   6-source stress case and close this line of investigation without changing the queue depth
+   — per the taskblock's "Persists" fork guidance, which is closer to what actually happened
+   here than "Clears," even though the specific symptom shape changed.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)

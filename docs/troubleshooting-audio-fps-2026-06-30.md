@@ -1105,4 +1105,100 @@ else not yet identified).
    — their premise (demuxer-side fragment starvation) is refuted; revisit only if the core-side
    probe in (1) somehow implicates the adapter's write pattern after all.
 
+---
+
+## TaskBlock-Phase4Block2d — stall localized to aqueue drain/fill cycling (2026-07-02)
+
+Ran both tasks. Gate met: the ~1.6s period is now attributed to a concrete mechanism.
+
+### Task 1 — RTSP-vs-YouTube path diff
+
+`fm-rtsp-adapter`'s `build_audio_chain` (aconv → aresamp → acaps → aunixfdsink) uses the
+identical transport (`fm_adapter_sdk::transport::make_output_sink`, i.e. `unixfdsink`) as
+`fm-youtube-adapter`. **The one structural difference: RTSP has no throttle probe at all** —
+RTP timing paces it naturally, so there's nothing analogous to YouTube adapter's sleep-based
+real-time throttle on `aunixfdsink.sink`. Same transport, different pacing — the "adapter
+buffer cadence" variable the taskblock anticipated, though this alone doesn't yet explain the
+core-side finding below.
+
+### Task 2 — core-boundary probe
+
+Added a probe on `aunixfdsrc.src` (before `aqueue`) plus per-buffer `aqueue` fill-level
+logging (`current-level-buffers`/`current-level-time`, confirmed correct property names via
+`gst-inspect-1.0 queue`), logging on any level *change* (captures the full fill/drain
+trajectory efficiently) or wall-clock anomaly at the socket-read point itself.
+
+**Hit a false alarm first:** the original threshold-only version (log only on
+`wall_ms < 10 || wall_ms > 100`) produced **zero** log lines for `yt-fc`/`yt-nature` despite
+firing correctly for `cam-77`/`dummy` on the identical code path. Added unconditional
+first-N-calls logging to confirm the probe *was* attached and firing — it was; `wall_interval`
+at the socket-read boundary is **rock steady at ~23ms**, never triggering the anomaly
+threshold. The zero-entries result was a true negative, not a bug.
+
+**Socket read is clean; the queue is not:**
+```
+'yt-fc' #0  wall_interval=29ms  aqueue_level_buffers=0
+'yt-fc' #6  wall_interval=23ms  aqueue_level_buffers=1
+'yt-fc' #7  wall_interval=23ms  aqueue_level_buffers=2
+...                                    (steady +1 per buffer, 23ms cadence throughout)
+'yt-fc' #25 wall_interval=23ms  aqueue_level_buffers=20   ← cap reached, holds here
+'yt-fc' #89 wall_interval=23ms  aqueue_level_buffers=18   ← ~1.47s later (64 buffers), small dip
+'yt-fc' #90-91                  aqueue_level_buffers=19,20 ← refills in 2 buffers, back at cap
+'yt-fc' #96, #158                                          ← repeats: small 2-3 buffer dips
+'yt-fc' #213                    aqueue_level_buffers=0    ← FULL DRAIN (52 buffers ≈ 1.2s after last cap)
+'yt-fc' #216-235                                           ← refills 0→20 over next ~19 buffers
+```
+`wall_interval` at the socket read never deviates from ~23ms across this entire trace —
+**the queue's input side is perfectly smooth throughout**. The level trajectory shows the
+queue filling to its 20-buffer cap (`max-size-buffers=20`, ~460ms) within ~575ms of startup,
+then cycling: mostly holding at/near cap with small 2-3-buffer nibbles taken every several
+hundred ms, punctuated by periodic much larger drains — including a **full drain to 0**
+roughly every ~1.5-2s. A full drain to 0 means the audiomixer's input for this source goes
+completely dry — literal silence — until the queue refills, which is exactly the audible
+symptom.
+
+**`cam-77` shows the same cap-hugging behavior but never a full drain:** its `aqueue` also
+climbs to and holds near 20 for most of the trace, wobbling by 1-2 buffers (20→18→19→20→...),
+but in the entire captured window it never once reaches 0. This is a real, measured
+difference, not just an impression from the downstream symptom: **all audio sources in this
+process show some degree of downstream under-servicing** (every queue trends toward its cap),
+but only `yt-fc`/`yt-nature` periodically hit *complete* starvation. `cam-77`'s milder,
+irregular jitter (documented in earlier sessions) and the YouTube sources' clean periodic
+silence are two severities of the same underlying mechanism, not two different mechanisms.
+
+### Localization (satisfies the gate)
+
+**The stall is in the `aqueue` drain/fill cycle** — specifically, whatever pulls data out of
+`aqueue` downstream (driving `aconv → aresamp → alevel → acaps → abuffersplit`, ultimately
+serviced by `audiomixer`'s pull-based aggregation) is not being scheduled/serviced consistently
+enough to keep pace with the queue's steady ~23ms input rate. It is *not* the socket read
+(confirmed clean), *not* qtdemux (Phase4Block2c), and *not* the adapter's write pacing
+(Phase4Block2b). All sources' downstream consumption is under-paced to some degree in this
+busy multi-source process; YouTube's chain crosses into complete periodic starvation while
+RTSP's does not — the reason for that severity difference (decode cost, element scheduling
+order, `audiomixer`'s per-pad servicing pattern, or something else) is not yet determined and
+would be the next question if this is pursued further.
+
+Diagnostic code reverted after capturing the finding — `pipeline.rs` is back to its committed
+state, no code change resulted from this investigation.
+
+### Recommended next steps
+
+1. **This may not need chasing further as a bug** — it increasingly looks like a genuine
+   downstream-servicing capacity question (this process is running 5 GStreamer decode chains +
+   compositor + GPU capture + iced UI in one process; see the Phase4Block2b CPU/load figures).
+   Whether to pursue a GStreamer-scheduling-level fix (e.g., understanding why YouTube's chain
+   specifically starves while RTSP's doesn't) or treat this as a capacity/hardware-scoping
+   question (per `CLAUDE.md`'s target-hardware assumption) is a call for review chat.
+2. **If pursued further**: the next diagnostic layer is `audiomixer`'s own pad-servicing —
+   specifically whether it pulls from all 4 audio-bearing sink pads evenly per aggregate cycle,
+   or whether something about pad registration order / per-source processing cost causes uneven
+   servicing. This would need instrumentation inside `audiomixer`'s aggregate cycle itself
+   (likely via `GST_DEBUG=audioaggregator:5` or similar) rather than another per-source probe.
+3. **`aqueue`'s `max-size-buffers=20` (~460ms) may simply be too small** for the servicing
+   irregularity actually present in this process — a deeper queue wouldn't fix uneven servicing,
+   but might raise the bar high enough that "occasionally lags for over a second" doesn't
+   translate to a *full* drain-to-zero. Cheap to test, doesn't address the root cause, but worth
+   knowing whether it changes the audible symptom's severity.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)

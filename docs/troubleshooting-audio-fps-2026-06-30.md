@@ -910,4 +910,121 @@ a layer this codebase does not instrument at all.
    back clean in turn, and a fourth GStreamer-side probe is unlikely to find what the first
    three didn't.
 
+---
+
+## TaskBlock-Phase4Block2b — release-build CPU test (2026-07-01/02)
+
+Ran item 1 from the list above. Result contradicts the CPU-starvation hypothesis and surfaces
+a new, more specific lead.
+
+### CPU/load: modest improvement, not a fix
+
+| | Debug baseline (session 198727) | Release, clean (session 214166, ffplay closed) |
+|---|---|---|
+| `final-multiplex` CPU | ~1127% | ~1120% |
+| System load average | 20.78 | 15.16 |
+
+`final-multiplex`'s own CPU usage is essentially **unchanged** between debug and release
+builds. In hindsight this makes sense: this workload's cost is dominated by GStreamer's
+native decode/compositing (pre-compiled C libraries) and GPU work, not our own Rust glue —
+compiling *our* code in release mode doesn't touch the hot path. Load average dropped
+moderately (20.78 → 15.16), plausibly just less Rust-side overhead layered on top, not a
+meaningful reduction in the underlying pressure.
+
+**Confound caught mid-test:** an `ffplay` window was independently decoding the same cam-27
+RTSP stream throughout earlier sessions (including, likely, the debug baseline) — redundant
+CPU/GPU decode load competing with the measured process. The maintainer closed it and the
+figures above are the clean, post-closure reading. **This means the original 1127%/20.78
+debug baseline may itself have been confounded** — it was not re-measured without ffplay, so
+the true debug-vs-release CPU delta is unknown. Recommend re-measuring the debug baseline
+clean before treating any debug/release CPU comparison as authoritative.
+
+### New finding: a highly regular ~1.6s periodic stall, specific to YouTube sources
+
+With `ffplay` closed (release, session 214166), the `abs-probe` diagnostic showed a **much
+more severe and continuous** pattern than any debug-build session had shown — not sparse
+startup noise, but a **recurring cycle every ~1.6 seconds for the entire session** (797+
+occurrences logged for `yt-fc` alone in the first few minutes):
+
+```
+[abs-probe] 'yt-fc' pts=1.773s ... wall_interval=1609ms   ← ~1.6s dead stop
+[abs-probe] 'yt-fc' pts=3.242s pts_delta=+1469ms ...      ← burst catch-up (~1.5s of audio in one jump)
+[abs-probe] 'yt-fc' pts=3.264s ... (6-7 buffers at clean 21ms cadence)
+[abs-probe] 'yt-fc' pts=3.392s ... wall_interval=1609ms   ← next stall, ~1.62s later
+```
+
+**Isolating the cause — three comparisons, all pointing the same direction:**
+
+1. **`yt-nature` shows the identical pattern, synchronized to within tens of ms of `yt-fc`**
+   (1.637s/1.645s, 3.250s/3.242s, 4.859s/4.801s — both YouTube sources cycling in lockstep,
+   drifting apart only slightly over time). Two independent adapter processes, two different
+   videos, same ~1.6s period.
+2. **`cam-77` (RTSP, same core process, same machine) shows a completely different,
+   irregular pattern** — gaps of 1897ms, 239ms, 570ms, 222ms, 739ms, no fixed period. If this
+   were general core-process CPU starvation, all sources sharing the process should show
+   correlated stalls; they don't.
+3. **This rules out a core-process-wide or system-wide scheduling cause** and points at
+   something specific to the YouTube HTTP/MP4 ingestion path shared by both adapters.
+
+**Two targeted interventions tried, both had zero effect:**
+
+- **`use-buffering=true` + `buffer-duration=3s` on `uridecodebin3`** (with `MessageView::Buffering`
+  handling added to safely pause/resume around it). No `[yt-adapter] buffering …%` log lines
+  ever appeared — `queue2`'s raw-byte buffering percentage never dropped below 100%, meaning
+  raw HTTP throughput is not the bottleneck (the CDN delivers bytes fast enough that queue2
+  never runs low). The periodic stall was identical with this in place.
+- **A 3-second `queue` (`max-size-time`, buffers/bytes unbounded) inserted between the decode
+  chain and the adapter's existing real-time throttle probe**, intended to let the decoder/demuxer
+  race ahead of real-time and give decoded audio somewhere to land so a fragment-boundary burst
+  wouldn't propagate as a stall. Also had zero effect — pattern identical.
+
+**Working hypothesis:** YouTube's progressive-download MP4 URLs are commonly internally
+fragmented (fMP4/segment structure) even when served as a single "progressive" URL.
+`qtdemux` (or whichever demuxer parses the container) may only release a fragment's worth of
+demuxed audio samples once that fragment has been fully parsed, producing burst-then-wait
+output at the *demuxer* level — independent of raw network throughput (which is why
+`use-buffering`, a `queue2`/byte-level knob, didn't touch it) and independent of downstream
+buffering depth (which is why the extra `queue` didn't help either, if the source isn't
+racing ahead of real-time to begin with — a rate-matched fragment-arrival-vs-consumption
+cycle can't be smoothed by buffer size alone). **Not yet confirmed** — would need either a
+correlated video-side timing check (does yt-fc's video output show the same ~1.6s cadence?)
+or direct GStreamer-level inspection (`GST_DEBUG=qtdemux:5` during a live episode, or trying
+an alternate demux path) to verify.
+
+Both speculative code changes (`use-buffering`/`buffer-duration`, the extra `queue`) were
+reverted after confirming zero effect — `fm-youtube-adapter/src/main.rs` is back to its
+pre-session committed state; no code change resulted from this investigation.
+
+### Fork outcome
+
+Neither branch of the taskblock's anticipated fork applies cleanly:
+- **Not "Resolved"** — audio is not clean; the release build did not fix it.
+- **Not simply "instrument PipeWire"** — the new evidence (YouTube-specific, highly regular
+  period, unaffected by GStreamer-level buffering changes, RTSP source on the same process
+  behaving differently) points *upstream* of PipeWire, at the YouTube ingestion path
+  specifically, not at general audio-sink starvation. Instrumenting PipeWire next would likely
+  find nothing, since the stall is demuxer/adapter-side already, well before PulseAudio.
+
+### Recommended next steps (updated, supersedes items 2-4 above for the YouTube-specific finding)
+
+1. **Confirm or refute the fragment-boundary hypothesis directly**, cheaply: `GST_DEBUG=qtdemux:5
+   GST_DEBUG_NO_COLOR=1` on a `fm-youtube-adapter` invocation during a live ~10s window, looking
+   for periodic ~1.6s-spaced fragment/moof parsing log lines that line up with the abs-probe
+   stall timestamps. This directly tests the hypothesis instead of continuing to guess via
+   buffering-property trial and error.
+2. **If confirmed**, the real fix is architectural: either pre-buffer many seconds of decoded
+   audio *before* any real-time throttling is applied (so the demuxer is free to race arbitrarily
+   far ahead of playback, giving downstream enough of a lead that individual fragment gaps never
+   starve the output), or investigate whether `uridecodebin3`'s `download=true` mode (full
+   download-to-disk buffering, distinct from `use-buffering`) sidesteps the fragment-pacing
+   behavior entirely by decoupling demuxing from live HTTP delivery altogether.
+3. **The debug-build CPU/load baseline (1127%/20.78) should be treated as unconfirmed** — it may
+   have included the same `ffplay` confound found mid-session. If CPU/load figures are needed for
+   an ADR decision later, re-measure both debug and release cleanly, back to back, with no other
+   GPU/CPU-heavy processes running.
+4. **RTSP-side irregular jitter (cam-77: 1897/239/570/222/739ms gaps) is a separate, lower-priority
+   observation** — worth a note for whoever picks this up, but not chased further in this session
+   since it doesn't share the YouTube sources' clear periodic signature and wasn't the reported
+   symptom.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)

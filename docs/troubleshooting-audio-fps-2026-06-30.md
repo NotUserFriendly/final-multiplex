@@ -1027,4 +1027,82 @@ Neither branch of the taskblock's anticipated fork applies cleanly:
    since it doesn't share the YouTube sources' clear periodic signature and wasn't the reported
    symptom.
 
+---
+
+## TaskBlock-Phase4Block2c — fragment-boundary hypothesis refuted (2026-07-02)
+
+Ran task 1 (confirm fragment cadence via `GST_DEBUG=qtdemux:5`). **Gate failed — cadence does
+not line up.** Per the taskblock's explicit instruction ("Doesn't → stop, reconsider (don't
+proceed to fix)"), stopped before tasks 2/3 (throttle removal, `download=true` fallback).
+
+### Method
+
+Launched the release build with `GST_DEBUG=qtdemux:5 GST_DEBUG_NO_COLOR=1` (env var inherited
+by all adapter child processes via `Stdio::inherit()`), captured ~34s of a live 6-source run.
+
+**Logging gotcha hit and worked around:** `Supervisor::shutdown_all()` calls `runtime::cleanup()`
+on graceful exit (`Message::Exit`, triggered by `SIGTERM`/window close), which removes the
+process's own run directory — including `session.log` — as part of normal teardown. A plain
+`kill` (SIGTERM) on the first capture attempt destroyed the log before it could be read. Redid
+the capture and killed with `kill -9` (SIGKILL) instead, which bypasses the Rust-side cleanup
+path entirely (the kernel never runs it), then copied the log out of the tmpfs run directory
+immediately — before launching anything else, since the *next* process's `reap_orphans()` would
+delete any dead-PID directory it finds on its own startup. No orphaned adapter processes
+resulted (`PR_SET_PDEATHSIG` correctly terminated all children when the core was SIGKILL'd).
+**For any future diagnostic capture that must survive process teardown: SIGKILL, then copy the
+log out before the next launch.**
+
+### Result: no fragment structure, no correlated stall in qtdemux
+
+- **Zero `moof` (movie fragment box) references anywhere in the ~33s capture**, for either
+  YouTube source. The only fragment-related line at all was a single `qtdemux_parse_trex:
+  "failed to find fragment defaults for stream N"` at startup (both sources) — i.e., `qtdemux`
+  looked for fragmentation markers (the `trex`/`mvex` boxes fragmented MP4 requires) and found
+  none. **The container is a standard progressive moov/mdat MP4, not fragmented.** The
+  fragment-boundary hypothesis from Phase4Block2b's writeup was architecturally wrong.
+- **`qtdemux`'s own debug output shows no periodic stall.** Isolated each YouTube adapter's
+  `qtdemux` instance by PID and measured gaps between consecutive LOG-level trace lines
+  (GStreamer's own high-resolution debug timestamps, not wall-clock guessing):
+  - `yt-fc` (PID 448674): 14,621 lines over 1.5s–35.3s span, only **4 gaps >100ms**, all small
+    and irregular (116ms, 154ms, 168ms, 561ms) — no ~1.6s periodicity.
+  - `yt-nature` (PID 448676): 16,186 lines over 1.7s–35.3s span, only **3 gaps >100ms**
+    (130ms, 309ms, 469ms) — same, no periodicity.
+- **Confirmed the abs-probe stall was present in this exact same session** (18 spikes >100ms
+  for `yt-fc`, same ~1.6s cadence as every prior session) — so this isn't a case of the stall
+  simply not occurring during the capture window; `qtdemux` is provably clean while
+  `abuffersplit.src` (core side) is provably not, in the same run, at the same time.
+
+### Synthesis: the stall is not in the adapter's pipeline at all
+
+Combined with the Phase4Block2b finding (adapter's own real-time write-throttle probe on
+`aunixfdsink.sink` showed rock-steady ~23ms real-time spacing with zero gaps across 150
+buffers, ~3.45s — session 197232), **three independent measurement points across the
+adapter's full pipeline (demux → decode/convert/resample → throttled write to socket) are
+all clean**. The ~1.6s periodic stall only appears at `abuffersplit.src`, which is on the
+**core** side, downstream of `aunixfdsrc` reading from the Unix socket. This relocates the
+search: the gap is somewhere in the socket/transport layer itself, or in the core's own
+`aqueue`/`aconv`/`aresamp`/`alevel`/`acaps`/`abuffersplit` chain — not in anything the
+YouTube adapter's own pipeline is doing.
+
+This doesn't yet explain why RTSP (`cam-77`, same core process, structurally similar
+core-side chain) shows a different, irregular pattern instead of the same one — a real
+difference must exist either in the transport (YouTube uses `unixfdsink`/`unixfdsrc`
+fd-passing; need to confirm RTSP's audio path uses the identical mechanism) or in how the
+two adapters' write patterns interact with it (buffer sizing, write cadence, or something
+else not yet identified).
+
+### Recommended next steps (supersedes Phase4Block2b's items 1-2 for the YouTube-specific finding)
+
+1. **Instrument the core side of the boundary directly**: a probe on `aunixfdsrc.src` (before
+   `aqueue`) with the same real-time-gap methodology used on the adapter's write-throttle probe,
+   to determine whether the stall is at the socket read itself or further down the core's chain
+   (`aqueue` → `aconv` → `aresamp` → `abuffersplit`).
+2. **Confirm RTSP's audio path structurally**: check whether `fm-rtsp-adapter` writes to its
+   audio socket via the same `unixfdsink`/pacing mechanism as `fm-youtube-adapter`, or something
+   different — needed to know whether the YouTube-vs-RTSP difference is a transport-layer
+   variable or a core-side one.
+3. `download=true` mode and throttle-removal (Phase4Block2c's original tasks 2-3) are **on hold**
+   — their premise (demuxer-side fragment starvation) is refuted; revisit only if the core-side
+   probe in (1) somehow implicates the adapter's write pattern after all.
+
 ## Performance snapshot (session PID 31442, measured ~20 min in)
